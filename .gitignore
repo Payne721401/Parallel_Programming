@@ -1,3 +1,5 @@
+*.pdf
+
 # Compiled object files
 *.o
 *.obj
