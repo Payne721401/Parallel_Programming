@@ -1,0 +1,36 @@
+# Compiled object files
+*.o
+*.obj
+
+# Compiled executables
+*.out
+*.exe
+
+# Libraries
+*.a
+*.so
+*.dll
+*.dylib
+
+# Build directories
+build/
+bin/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# CMake generated files
+compile_commands.json
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Compiled executables
+lab1/lab1
+hw1/hw1-1
+hw1/hw1-2
+hw1/hw1-3
+
+# Course-provided shared test data / symlinks
+cases
