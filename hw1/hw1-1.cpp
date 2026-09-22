@@ -275,10 +275,10 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    // auto start_all = std::chrono::high_resolution_clock::now();
-
     char* input_file = argv[1];
     char* output_file = argv[2];
+
+    auto t0 = std::chrono::high_resolution_clock::now();
 
     std::vector<std::vector<RGB>> inputImage;
     read_png_file(input_file, inputImage);
@@ -286,23 +286,31 @@ int main(int argc, char** argv) {
     int height = inputImage.size();
     int width = inputImage[0].size();
 
+    auto t1 = std::chrono::high_resolution_clock::now();
+
     std::vector<std::vector<RGB>> outputImage(height, std::vector<RGB>(width));
 
-    // auto start = std::chrono::high_resolution_clock::now();
+    auto t2 = std::chrono::high_resolution_clock::now();
 
     adaptiveFilterRGB(inputImage, outputImage, height, width);
-    // adaptiveFilterRGB_parallel(inputImage, outputImage, height, width);
 
-    // auto end = std::chrono::high_resolution_clock::now();
-
-    // std::chrono::duration<double> elapsed_seconds = end - start;
-    // std::cout << "Main Program Time: " << elapsed_seconds.count() * 1000.0 << " ms" << std::endl;
+    auto t3 = std::chrono::high_resolution_clock::now();
 
     write_png_file(output_file, outputImage);
 
-    // auto end_all = std::chrono::high_resolution_clock::now();
-    // elapsed_seconds = end_all - start_all;
-    // std::cout << "Total Program Time: " << elapsed_seconds.count() * 1000.0 << " ms" << std::endl;
+    auto t4 = std::chrono::high_resolution_clock::now();
+
+    // Gated on an env var so the judge run stays clean and these lines never
+    // have to be commented back out: PP_TIMING=1 srun ... ./hw1-1 in.png out.png
+    if (getenv("PP_TIMING")) {
+        auto ms = [](std::chrono::high_resolution_clock::time_point a,
+                     std::chrono::high_resolution_clock::time_point b) {
+            return std::chrono::duration<double>(b - a).count() * 1000.0;
+        };
+        fprintf(stderr,
+                "threads %2d | read %7.1f | alloc %7.1f | filter %8.1f | write %7.1f | total %8.1f  (ms)\n",
+                omp_get_max_threads(), ms(t0, t1), ms(t1, t2), ms(t2, t3), ms(t3, t4), ms(t0, t4));
+    }
 
     return 0;
 }
