@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <chrono>
 #include <omp.h>
+#include <sched.h>
 // #include <pthread.h>
 
 // Row-block size for the dynamic schedules below. Retune without editing the
@@ -13,6 +14,19 @@
 #ifndef FILTER_CHUNK
 #define FILTER_CHUNK 4
 #endif
+
+// The judge runs us as `srun -c N ./hw1-1 ...` and does not set
+// OMP_NUM_THREADS, and this cluster overwrites it to 1 anyway. The CPU
+// affinity mask is what srun actually handed us, so size the pool from that
+// rather than trusting the environment.
+static int usableCpus() {
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        int n = CPU_COUNT(&set);
+        if (n > 0) return n;
+    }
+    return omp_get_max_threads();
+}
 
 // ---------- adaptive filtering ----------
 
@@ -277,6 +291,13 @@ int main(int argc, char** argv) {
 
     char* input_file = argv[1];
     char* output_file = argv[2];
+
+    int nthreads = usableCpus();
+    if (const char* e = getenv("PP_THREADS")) {   // our own knob, for sweeps
+        int v = atoi(e);
+        if (v > 0) nthreads = v;
+    }
+    omp_set_num_threads(nthreads);
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
