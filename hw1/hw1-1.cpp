@@ -5,7 +5,14 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <chrono>
+#include <omp.h>
 // #include <pthread.h>
+
+// Row-block size for the dynamic schedules below. Retune without editing the
+// source: make CXXFLAGS="-std=c++11 -O3 -pthread -fopenmp -DFILTER_CHUNK=16"
+#ifndef FILTER_CHUNK
+#define FILTER_CHUNK 4
+#endif
 
 // ---------- adaptive filtering ----------
 
@@ -29,6 +36,11 @@ void applyFilterToChannel(
     int height,
     int width
 ) {
+    // Each output row is written by exactly one thread and `input` is only
+    // read, so rows are independent. dynamic, not static: a bright pixel costs
+    // 11x11 = 121 taps and a dark one 5x5 = 25, so a fixed split of an image
+    // with a bright sky over a dark foreground leaves threads idle.
+    #pragma omp parallel for schedule(dynamic, FILTER_CHUNK)
     for (int x = 0; x < height; x++) {
         for (int y = 0; y < width; y++) {
             int kernelSize = kernelSizes[x][y];
@@ -60,6 +72,7 @@ void adaptiveFilterRGB(
     std::vector<std::vector<int>> greenChannel(height, std::vector<int>(width));
     std::vector<std::vector<int>> blueChannel(height, std::vector<int>(width));
 
+    #pragma omp parallel for schedule(static)
     for (int x = 0; x < height; x++) {
         for (int y = 0; y < width; y++) {
             redChannel[x][y] = inputImage[x][y].r;
@@ -70,6 +83,7 @@ void adaptiveFilterRGB(
 
     std::vector<std::vector<int>> kernelSizes(height, std::vector<int>(width));
 
+    #pragma omp parallel for schedule(static)
     for (int x = 0; x < height; x++) {
         for (int y = 0; y < width; y++) {
             double brightness = calculateLuminance(inputImage[x][y]);
@@ -85,6 +99,7 @@ void adaptiveFilterRGB(
     applyFilterToChannel(greenChannel, tempGreen, kernelSizes, height, width);
     applyFilterToChannel(blueChannel, tempBlue, kernelSizes, height, width);
 
+    #pragma omp parallel for schedule(static)
     for (int x = 0; x < height; x++) {
         for (int y = 0; y < width; y++) {
             outputImage[x][y].r = tempRed[x][y];
@@ -166,6 +181,7 @@ void read_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
     fclose(fp);
 
     image.resize(height, std::vector<RGB>(width));
+    #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
         png_bytep row = row_pointers[y];
         for (int x = 0; x < width; x++) {
@@ -228,8 +244,10 @@ void write_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
     png_write_info(png, info);
 
     png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
+    size_t rowbytes = png_get_rowbytes(png, info);
+    #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
-        row_pointers[y] = (png_byte*)malloc(png_get_rowbytes(png,info));
+        row_pointers[y] = (png_byte*)malloc(rowbytes);
         for (int x = 0; x < width; x++) {
             row_pointers[y][x * 3] = image[y][x].r;
             row_pointers[y][x * 3 + 1] = image[y][x].g;
