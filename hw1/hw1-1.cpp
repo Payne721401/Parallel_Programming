@@ -9,11 +9,9 @@
 #include <sched.h>
 // #include <pthread.h>
 
-// Row-block size for the dynamic schedules below. Retune without editing the
-// source: make CXXFLAGS="-std=c++11 -O3 -pthread -fopenmp -DFILTER_CHUNK=16"
-#ifndef FILTER_CHUNK
-#define FILTER_CHUNK 4
-#endif
+// The filter loop below uses schedule(runtime) so its schedule can be swept
+// with OMP_SCHEDULE="guided,4" etc. without recompiling. main() picks a
+// default when OMP_SCHEDULE is unset, which is how the judge runs us.
 
 // The judge runs us as `srun -c N ./hw1-1 ...` and does not set
 // OMP_NUM_THREADS, and this cluster overwrites it to 1 anyway. The CPU
@@ -54,7 +52,7 @@ void applyFilterToChannel(
     // read, so rows are independent. dynamic, not static: a bright pixel costs
     // 11x11 = 121 taps and a dark one 5x5 = 25, so a fixed split of an image
     // with a bright sky over a dark foreground leaves threads idle.
-    #pragma omp parallel for schedule(dynamic, FILTER_CHUNK)
+    #pragma omp parallel for schedule(runtime)
     for (int x = 0; x < height; x++) {
         for (int y = 0; y < width; y++) {
             int kernelSize = kernelSizes[x][y];
@@ -298,6 +296,11 @@ int main(int argc, char** argv) {
         if (v > 0) nthreads = v;
     }
     omp_set_num_threads(nthreads);
+
+    // Backstop for schedule(runtime): with OMP_SCHEDULE unset GCC falls back to
+    // static, which would silently throw away the load balancing the filter
+    // needs. Sweep with OMP_SCHEDULE, then hardcode the winner here.
+    if (!getenv("OMP_SCHEDULE")) omp_set_schedule(omp_sched_guided, 4);
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
