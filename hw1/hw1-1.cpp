@@ -13,6 +13,17 @@
 // with OMP_SCHEDULE="guided,4" etc. without recompiling. main() picks a
 // default when OMP_SCHEDULE is unset, which is how the judge runs us.
 
+// PNG output tuning. The judge compares the decoded image pixel by pixel, not
+// the file's bytes, so both of these only trade CPU time against file size and
+// can never change the answer. Sweep without editing the source:
+//   make CXXFLAGS="-std=c++11 -O3 -pthread -fopenmp -DOUT_ROWFILTER=PNG_FILTER_SUB"
+#ifndef OUT_ZLEVEL
+#define OUT_ZLEVEL 1
+#endif
+#ifndef OUT_ROWFILTER
+#define OUT_ROWFILTER PNG_FILTER_NONE
+#endif
+
 // The judge runs us as `srun -c N ./hw1-1 ...` and does not set
 // OMP_NUM_THREADS, and this cluster overwrites it to 1 anyway. The CPU
 // affinity mask is what srun actually handed us, so size the pool from that
@@ -250,6 +261,13 @@ void write_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
     }
 
     png_init_io(png, fp);
+
+    // zlib level 6 (libpng's default) spends most of this function's time
+    // hunting for longer LZ77 matches, and PNG_ALL_FILTERS (also the default)
+    // filters every row five ways and keeps whichever scores best. Deflate is
+    // lossless at every level, so the decoded pixels are unchanged either way.
+    png_set_compression_level(png, OUT_ZLEVEL);
+    png_set_filter(png, PNG_FILTER_TYPE_BASE, OUT_ROWFILTER);
 
     png_set_IHDR(
         png,
