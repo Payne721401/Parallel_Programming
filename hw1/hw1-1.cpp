@@ -49,27 +49,35 @@ void applyFilterToChannel(
     int width
 ) {
     // Each output row is written by exactly one thread and `input` is only
-    // read, so rows are independent. dynamic, not static: a bright pixel costs
-    // 11x11 = 121 taps and a dark one 5x5 = 25, so a fixed split of an image
-    // with a bright sky over a dark foreground leaves threads idle.
+    // read, so rows are independent. The schedule is left to OMP_SCHEDULE /
+    // omp_set_schedule() so it can be swept without recompiling; measurement
+    // says it barely matters here, because the input is a noisy image and that
+    // noise leaves every row with much the same mix of large and small kernels.
     #pragma omp parallel for schedule(runtime)
     for (int x = 0; x < height; x++) {
         for (int y = 0; y < width; y++) {
-            int kernelSize = kernelSizes[x][y];
-            int kernelRadius = kernelSize / 2;
-            double sum = 0.0;
-            double filteredPixel = 0.0;
+            int kernelRadius = kernelSizes[x][y] / 2;
+            // The border clamps rather than skipping, so every (i, j) pair runs
+            // and the divisor is a constant -- no point counting it tap by tap.
+            int taps = (2 * kernelRadius + 1) * (2 * kernelRadius + 1);
+            // int, not double: a window sums at most 121 * 255 = 30855, exact
+            // either way, but integer add is 1 cycle instead of 4 and is
+            // associative, which is what lets the reduction vectorize.
+            int filteredPixel = 0;
 
             for (int i = -kernelRadius; i <= kernelRadius; i++) {
+                // The row index does not depend on j. Hoisting the lookup here
+                // turns two dependent loads per tap into one.
+                const std::vector<int>& row =
+                    input[std::min(std::max(x + i, 0), height - 1)];
                 for (int j = -kernelRadius; j <= kernelRadius; j++) {
-                    int pixelX = std::min(std::max(x + i, 0), height - 1);
-                    int pixelY = std::min(std::max(y + j, 0), width - 1);
-                    filteredPixel += input[pixelX][pixelY];
-                    sum += 1.0;
+                    filteredPixel += row[std::min(std::max(y + j, 0), width - 1)];
                 }
             }
 
-            output[x][y] = static_cast<int>(filteredPixel / sum);
+            // Both operands are non-negative, so integer division truncates the
+            // same way static_cast<int>(double / double) did: bit-identical.
+            output[x][y] = filteredPixel / taps;
         }
     }
 }
