@@ -6,7 +6,35 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <fstream>
+#include <chrono>
+#include <omp.h>
+#include <sched.h>
 // #include <pthread.h>
+
+// ---------- staged timing ----------
+// Gated on PP_TIMING so the judge run stays clean:
+//   PP_TIMING=1 srun -n 1 -c 8 ./hw1-2 a.png b.png out.txt
+// extractFeatures() runs twice (image A, then B), so its three inner stages
+// accumulate into globals rather than being reported per call.
+static double g_tPyramid = 0.0, g_tDetect = 0.0, g_tDescribe = 0.0;
+
+static inline double nowMs() {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// The judge runs us as `srun -c N ./hw1-2 ...` and does not set
+// OMP_NUM_THREADS, and this cluster overwrites it to 1 anyway. The CPU
+// affinity mask is what srun actually handed us, so size the pool from that
+// rather than trusting the environment.
+static int usableCpus() {
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        int n = CPU_COUNT(&set);
+        if (n > 0) return n;
+    }
+    return omp_get_max_threads();
+}
 
 // ---------- shared PNG I/O ----------
 
@@ -330,12 +358,23 @@ struct FeatureSet {
 };
 
 FeatureSet extractFeatures(const Mat& gray, int height, int width) {
+    double t0 = nowMs();
     auto octaves = buildPyramid(gray, height, width);
+
+    double t1 = nowMs();
     auto keypoints = detectKeypoints(octaves);
+
+    double t2 = nowMs();
     for (auto& kp : keypoints) {
         assignOrientation(kp, octaves[kp.octave]);
         computeDescriptor(kp, octaves[kp.octave]);
     }
+    double t3 = nowMs();
+
+    g_tPyramid  += t1 - t0;
+    g_tDetect   += t2 - t1;
+    g_tDescribe += t3 - t2;
+
     FeatureSet fs;
     fs.keypoints = std::move(keypoints);
     return fs;
@@ -423,6 +462,15 @@ int main(int argc, char** argv) {
         return -1;
     }
 
+    int nthreads = usableCpus();
+    if (const char* e = getenv("PP_THREADS")) {   // our own knob, for sweeps
+        int v = atoi(e);
+        if (v > 0) nthreads = v;
+    }
+    omp_set_num_threads(nthreads);
+
+    double t0 = nowMs();
+
     std::vector<std::vector<RGB>> imageA, imageB;
     read_png_file(argv[1], imageA);
     read_png_file(argv[2], imageB);
@@ -430,15 +478,37 @@ int main(int argc, char** argv) {
     int heightA = imageA.size(), widthA = imageA[0].size();
     int heightB = imageB.size(), widthB = imageB[0].size();
 
+    double t1 = nowMs();
+
     Mat grayA = toGrayscale(imageA, heightA, widthA);
     Mat grayB = toGrayscale(imageB, heightB, widthB);
+
+    double t2 = nowMs();
 
     FeatureSet featuresA = extractFeatures(grayA, heightA, widthA);
     FeatureSet featuresB = extractFeatures(grayB, heightB, widthB);
 
+    double t3 = nowMs();
+
     std::vector<Match> matches = matchFeatures(featuresA, featuresB);
 
+    double t4 = nowMs();
+
     writeOutput(argv[3], featuresA, featuresB, matches);
+
+    double t5 = nowMs();
+
+    if (getenv("PP_TIMING")) {
+        size_t nA = featuresA.keypoints.size(), nB = featuresB.keypoints.size();
+        fprintf(stderr,
+                "threads %2d | %dx%d + %dx%d | kpA %zu kpB %zu match %zu\n"
+                "  read %7.1f | gray %6.1f | pyramid %8.1f | detect %7.1f | "
+                "orient+desc %8.1f | match %8.1f | write %6.1f | total %8.1f  (ms)\n",
+                omp_get_max_threads(), widthA, heightA, widthB, heightB,
+                nA, nB, matches.size(),
+                t1 - t0, t2 - t1, g_tPyramid, g_tDetect, g_tDescribe,
+                t4 - t3, t5 - t4, t5 - t0);
+    }
 
     return 0;
 }

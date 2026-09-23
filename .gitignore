@@ -36,3 +36,10 @@ hw1/hw1-3
 
 # Course-provided shared test data / symlinks
 cases
+
+# Personal notes / write-ups, not part of the submission
+*.md
+
+# Program output
+*.png
+!cases/**
