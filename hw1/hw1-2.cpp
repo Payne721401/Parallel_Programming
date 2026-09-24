@@ -125,27 +125,46 @@ Mat gaussianBlur(const Mat& in, int height, int width, double sigma) {
     }
     for (double& v : kernel) v /= sum;
 
+    // Both passes below run x in the innermost loop instead of the kernel
+    // offset. Each out[x] still accumulates i from -radius to +radius in that
+    // order, so every value is bit-identical to the scalar version -- what
+    // changes is that different x are now independent (no shared accumulator
+    // chain) and consecutive, so the loads are stride-1 and can vectorize.
+
+    // Interior columns need no clamping: for x in [xLo, xHi) and any i in
+    // [-radius, radius], x + i stays inside [0, width).
+    const int xLo = std::min(radius, width);
+    const int xHi = std::max(xLo, width - radius);
+
     Mat tmp(height, std::vector<double>(width));
-    for (int y = 0; y < height; y++)
-        for (int x = 0; x < width; x++) {
-            double acc = 0.0;
-            for (int i = -radius; i <= radius; i++) {
-                int xx = std::min(std::max(x + i, 0), width - 1);
-                acc += in[y][xx] * kernel[i + radius];
-            }
-            tmp[y][x] = acc;
+    for (int y = 0; y < height; y++) {
+        const double* src = in[y].data();
+        double* dst = tmp[y].data();
+        std::fill(dst, dst + width, 0.0);
+        for (int i = -radius; i <= radius; i++) {
+            const double kv = kernel[i + radius];
+            for (int x = 0; x < xLo; x++)
+                dst[x] += src[std::min(std::max(x + i, 0), width - 1)] * kv;
+            for (int x = xLo; x < xHi; x++)
+                dst[x] += src[x + i] * kv;
+            for (int x = xHi; x < width; x++)
+                dst[x] += src[std::min(std::max(x + i, 0), width - 1)] * kv;
         }
+    }
 
     Mat out(height, std::vector<double>(width));
-    for (int y = 0; y < height; y++)
-        for (int x = 0; x < width; x++) {
-            double acc = 0.0;
-            for (int i = -radius; i <= radius; i++) {
-                int yy = std::min(std::max(y + i, 0), height - 1);
-                acc += tmp[yy][x] * kernel[i + radius];
-            }
-            out[y][x] = acc;
+    for (int y = 0; y < height; y++) {
+        double* dst = out[y].data();
+        std::fill(dst, dst + width, 0.0);
+        for (int i = -radius; i <= radius; i++) {
+            // The row index is invariant in x, so the clamp and the row lookup
+            // happen once per i here rather than once per tap.
+            const double* src = tmp[std::min(std::max(y + i, 0), height - 1)].data();
+            const double kv = kernel[i + radius];
+            for (int x = 0; x < width; x++)
+                dst[x] += src[x] * kv;
         }
+    }
     return out;
 }
 
