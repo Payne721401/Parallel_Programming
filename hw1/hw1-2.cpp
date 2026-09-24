@@ -103,6 +103,9 @@ void read_png_file(const char* file_name, std::vector<std::vector<RGB>>& image) 
 
 Mat toGrayscale(const std::vector<std::vector<RGB>>& image, int height, int width) {
     Mat gray(height, std::vector<double>(width));
+    // Row y reads only row y and writes only row y. Uniform work per row, so
+    // static: no imbalance to fix and nothing to gain from paying for dynamic.
+    #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++)
         for (int x = 0; x < width; x++) {
             const RGB& p = image[y][x];
@@ -137,6 +140,10 @@ Mat gaussianBlur(const Mat& in, int height, int width, double sigma) {
     const int xHi = std::max(xLo, width - radius);
 
     Mat tmp(height, std::vector<double>(width));
+    // Row y of the horizontal pass reads only row y of `in`, so rows are
+    // independent and each output element is still summed by one thread in the
+    // original order -- the result stays bit-identical.
+    #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
         const double* src = in[y].data();
         double* dst = tmp[y].data();
@@ -153,6 +160,9 @@ Mat gaussianBlur(const Mat& in, int height, int width, double sigma) {
     }
 
     Mat out(height, std::vector<double>(width));
+    // The vertical pass reads rows y-radius..y+radius of `tmp`, but only ever
+    // reads them, and writes only out[y]. Overlapping reads are not a race.
+    #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
         double* dst = out[y].data();
         std::fill(dst, dst + width, 0.0);
@@ -171,6 +181,7 @@ Mat gaussianBlur(const Mat& in, int height, int width, double sigma) {
 Mat downsample2x(const Mat& in, int height, int width) {
     int nh = height / 2, nw = width / 2;
     Mat out(nh, std::vector<double>(nw));
+    #pragma omp parallel for schedule(static)
     for (int y = 0; y < nh; y++)
         for (int x = 0; x < nw; x++)
             out[y][x] = in[2 * y][2 * x];
@@ -209,13 +220,23 @@ std::vector<Octave> buildPyramid(const Mat& gray, int height, int width) {
             double sigma = SIGMA0 * std::pow(k, s);
             oct.gaussian[s] = gaussianBlur(base, h, w, sigma);
         }
+        // Allocate first, then subtract: collapse(2) needs a perfectly nested
+        // pair, and the allocation is not something to run concurrently anyway.
         oct.dog.resize(NUM_SCALES - 1);
-        for (int s = 0; s < NUM_SCALES - 1; s++) {
+        for (int s = 0; s < NUM_SCALES - 1; s++)
             oct.dog[s] = Mat(h, std::vector<double>(w));
-            for (int y = 0; y < h; y++)
-                for (int x = 0; x < w; x++)
-                    oct.dog[s][y][x] = oct.gaussian[s + 1][y][x] - oct.gaussian[s][y][x];
-        }
+
+        // collapse(2) rather than parallelising s alone: the deepest octave is
+        // only ~250 rows and there are just 5 layers, so flattening (s, y) is
+        // what keeps 8 threads fed all the way down the pyramid.
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int s = 0; s < NUM_SCALES - 1; s++)
+            for (int y = 0; y < h; y++) {
+                double* d = oct.dog[s][y].data();
+                const double* hi = oct.gaussian[s + 1][y].data();
+                const double* lo = oct.gaussian[s][y].data();
+                for (int x = 0; x < w; x++) d[x] = hi[x] - lo[x];
+            }
 
         if (o + 1 < NUM_OCTAVES) {
             base = downsample2x(oct.gaussian[S], h, w); // carry over scale = 2*sigma0
