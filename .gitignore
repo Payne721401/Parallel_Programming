@@ -42,4 +42,5 @@ cases
 
 # Program output
 *.png
+*.txt
 !cases/**
