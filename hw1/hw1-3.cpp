@@ -151,6 +151,10 @@ int main(int argc, char** argv) {
 
     Inclusion inc[4];
     const int B = inclusions(seed, N, inc);
+    // field() is a pure function of the index, so every cell is independent --
+    // no sequential PRNG state to carry. Running it in parallel also first-
+    // touches the pages from the thread that will keep using them.
+    #pragma omp parallel for schedule(static)
     for (long i = 1; i <= N; i++)
         for (long j = 1; j <= N; j++)
             for (long k = 1; k <= N; k++) {
@@ -164,8 +168,11 @@ int main(int argc, char** argv) {
     const double tGen = nowMs();
 
     // The energy of the block: the sum of u^2 over its cells.
+    // Only used for energy0 now; the per-step energy is fused into the stencil
+    // loop below so the array is swept once per step instead of twice.
     auto energy_of = [&](const std::vector<double>& v) {
         double energy = 0.0;
+        #pragma omp parallel for schedule(static) reduction(+ : energy)
         for (long i = 1; i <= N; i++)
             for (long j = 1; j <= N; j++)
                 for (long k = 1; k <= N; k++) {
@@ -180,10 +187,17 @@ int main(int argc, char** argv) {
     int steps = 0;
 
     const double tEnergy0 = nowMs();
-    double tStencilAcc = 0.0, tEnergyAcc = 0.0;
+    double tStencilAcc = 0.0;   // the per-step energy is folded into this now
 
     while (steps < T) {
         const double s0 = nowMs();
+        // dynamic, not static: the reactive cells sit inside up to four
+        // spheres of radius 0.12-0.18 N, so they occupy a band of only ~0.3 N
+        // planes. A reactive cell costs 12 exp() calls and measures about 30x
+        // a plain one, so a static split leaves two or three threads doing all
+        // the reaction work while the rest idle.
+        double e = 0.0;
+        #pragma omp parallel for schedule(dynamic, 1) reduction(+ : e)
         for (long i = 1; i <= N; i++)
             for (long j = 1; j <= N; j++)
                 for (long k = 1; k <= N; k++) {
@@ -197,15 +211,21 @@ int main(int argc, char** argv) {
                     flux += (ap + a[p - 1]) * (u[p - 1] - up);
                     flux += (ap + a[p + 1]) * (u[p + 1] - up);
                     const double r = up + flux * (1.0 / 12.0);
-                    unew[p] = mat[p] ? react(r) : r;
+                    const double nu = mat[p] ? react(r) : r;
+                    unew[p] = nu;
+                    // energy_of(u) used to re-read the whole array right after
+                    // the swap; these are the same values, so accumulate here.
+                    // The sum lands in a different order, which the spec allows
+                    // explicitly: the stopping thresholds carry enough margin
+                    // that reordering cannot change the step count, and the
+                    // energy itself is compared at 1e-7 relative tolerance.
+                    e += nu * nu;
                 }
         u.swap(unew);
         steps++;
+        energy = e;
         const double s1 = nowMs();
-        energy = energy_of(u);
-        const double s2 = nowMs();
         tStencilAcc += s1 - s0;
-        tEnergyAcc += s2 - s1;
         if (energy <= theta * energy0) break;
     }
 
@@ -233,12 +253,12 @@ int main(int argc, char** argv) {
         const double cells = (double)M * M * M;
         fprintf(stderr,
                 "threads %2d | N %ld M %ld | T %d steps %d | arrays %.2f GB\n"
-                "  alloc %8.1f | gen %9.1f | energy0 %7.1f | stencil %9.1f | "
-                "energy %8.1f | out %7.1f | total %9.1f  (ms)\n",
+                "  alloc %8.1f | gen %9.1f | energy0 %7.1f | "
+                "stencil+energy %9.1f | out %7.1f | total %9.1f  (ms)\n",
                 omp_get_max_threads(), N, M, T, steps,
                 cells * 25.0 / (1024.0 * 1024.0 * 1024.0),
                 tAlloc - tStart, tGen - tAlloc, tEnergy0 - tGen,
-                tStencilAcc, tEnergyAcc, tEnd - tSteps, tEnd - tStart);
+                tStencilAcc, tEnd - tSteps, tEnd - tStart);
     }
     return 0;
 }
