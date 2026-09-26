@@ -35,6 +35,7 @@ initial energy or less.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 #include <vector>
 #include <chrono>
 #include <omp.h>
@@ -144,8 +145,23 @@ int main(int argc, char** argv) {
     // (N+2)^3 with a halo of zeros around the block, so no cell is a special case.
     const long M = N + 2;
     const long SI = M * M, SJ = M;  // strides of i and j; k is contiguous
-    std::vector<double> u(M * M * M, 0.0), unew(M * M * M, 0.0), a(M * M * M, 0.0);
-    std::vector<uint8_t> mat(M * M * M, 0);  // 1 where the cell is reactive
+    // calloc, not std::vector: a vector value-initialises, which memsets 11 GB
+    // of zeros at N=768 on one thread before a single cell is computed. calloc
+    // on an allocation this size gets anonymous pages from the kernel that are
+    // already zero, so it skips the memset entirely and the pages materialise
+    // on first touch -- inside the parallel generation loop below, which also
+    // places each page on the NUMA node of the thread that will keep using it.
+    // The halo stays zero either way, so the boundary semantics are unchanged.
+    const size_t cells = (size_t)M * M * M;
+    double* u = (double*)calloc(cells, sizeof(double));
+    double* unew = (double*)calloc(cells, sizeof(double));
+    double* a = (double*)calloc(cells, sizeof(double));
+    uint8_t* mat = (uint8_t*)calloc(cells, 1);  // 1 where the cell is reactive
+    if (!u || !unew || !a || !mat) {
+        fprintf(stderr, "out of memory for N=%ld (%.2f GB)\n",
+                N, cells * 25.0 / (1024.0 * 1024.0 * 1024.0));
+        return 1;
+    }
 
     const double tAlloc = nowMs();
 
@@ -170,7 +186,7 @@ int main(int argc, char** argv) {
     // The energy of the block: the sum of u^2 over its cells.
     // Only used for energy0 now; the per-step energy is fused into the stencil
     // loop below so the array is swept once per step instead of twice.
-    auto energy_of = [&](const std::vector<double>& v) {
+    auto energy_of = [&](const double* v) {
         double energy = 0.0;
         #pragma omp parallel for schedule(static) reduction(+ : energy)
         for (long i = 1; i <= N; i++)
@@ -221,7 +237,7 @@ int main(int argc, char** argv) {
                     // energy itself is compared at 1e-7 relative tolerance.
                     e += nu * nu;
                 }
-        u.swap(unew);
+        std::swap(u, unew);
         steps++;
         energy = e;
         const double s1 = nowMs();
@@ -250,15 +266,19 @@ int main(int argc, char** argv) {
 
     if (getenv("PP_TIMING")) {
         const double tEnd = nowMs();
-        const double cells = (double)M * M * M;
         fprintf(stderr,
                 "threads %2d | N %ld M %ld | T %d steps %d | arrays %.2f GB\n"
                 "  alloc %8.1f | gen %9.1f | energy0 %7.1f | "
                 "stencil+energy %9.1f | out %7.1f | total %9.1f  (ms)\n",
                 omp_get_max_threads(), N, M, T, steps,
-                cells * 25.0 / (1024.0 * 1024.0 * 1024.0),
+                (double)cells * 25.0 / (1024.0 * 1024.0 * 1024.0),
                 tAlloc - tStart, tGen - tAlloc, tEnergy0 - tGen,
                 tStencilAcc, tEnd - tSteps, tEnd - tStart);
     }
+
+    free(u);
+    free(unew);
+    free(a);
+    free(mat);
     return 0;
 }
