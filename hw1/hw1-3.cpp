@@ -36,6 +36,30 @@ initial energy or less.
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <chrono>
+#include <omp.h>
+#include <sched.h>
+
+// ---------- staged timing ----------
+// Gated on PP_TIMING so the judge run stays clean:
+//   PP_TIMING=1 srun -n 1 -c 8 ./hw1-3 768 6 1087 0 out.txt
+static inline double nowMs() {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Section 1.4 of the spec: "Use sched_getaffinity and CPU_COUNT to determine
+// how many cores are available to your program, and create that many threads."
+// Public cases run with 2, 4 or 8 cores, and the cluster overwrites
+// OMP_NUM_THREADS to 1, so the affinity mask is the only reliable source.
+static int usableCpus() {
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        int n = CPU_COUNT(&set);
+        if (n > 0) return n;
+    }
+    return omp_get_max_threads();
+}
 
 // ========== START: DO NOT CHANGE BELOW ==========
 static const double R = 0.5;    // the reaction's strength
@@ -108,11 +132,22 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    int nthreads = usableCpus();
+    if (const char* e = getenv("PP_THREADS")) {   // our own knob, for sweeps
+        int v = atoi(e);
+        if (v > 0) nthreads = v;
+    }
+    omp_set_num_threads(nthreads);
+
+    const double tStart = nowMs();
+
     // (N+2)^3 with a halo of zeros around the block, so no cell is a special case.
     const long M = N + 2;
     const long SI = M * M, SJ = M;  // strides of i and j; k is contiguous
     std::vector<double> u(M * M * M, 0.0), unew(M * M * M, 0.0), a(M * M * M, 0.0);
     std::vector<uint8_t> mat(M * M * M, 0);  // 1 where the cell is reactive
+
+    const double tAlloc = nowMs();
 
     Inclusion inc[4];
     const int B = inclusions(seed, N, inc);
@@ -125,6 +160,8 @@ int main(int argc, char** argv) {
                 a[p] = field(seed, index, 1);
                 mat[p] = reactive(inc, B, i, j, k);
             }
+
+    const double tGen = nowMs();
 
     // The energy of the block: the sum of u^2 over its cells.
     auto energy_of = [&](const std::vector<double>& v) {
@@ -141,7 +178,12 @@ int main(int argc, char** argv) {
     const double energy0 = energy_of(u);
     double energy = energy0;
     int steps = 0;
+
+    const double tEnergy0 = nowMs();
+    double tStencilAcc = 0.0, tEnergyAcc = 0.0;
+
     while (steps < T) {
+        const double s0 = nowMs();
         for (long i = 1; i <= N; i++)
             for (long j = 1; j <= N; j++)
                 for (long k = 1; k <= N; k++) {
@@ -159,9 +201,15 @@ int main(int argc, char** argv) {
                 }
         u.swap(unew);
         steps++;
+        const double s1 = nowMs();
         energy = energy_of(u);
+        const double s2 = nowMs();
+        tStencilAcc += s1 - s0;
+        tEnergyAcc += s2 - s1;
         if (energy <= theta * energy0) break;
     }
+
+    const double tSteps = nowMs();
 
     FILE* out = fopen(argv[5], "w");
     if (!out) {
@@ -179,5 +227,18 @@ int main(int argc, char** argv) {
                 fprintf(out, "%.17g\n", u[i * SI + j * SJ + k]);
             }
     fclose(out);
+
+    if (getenv("PP_TIMING")) {
+        const double tEnd = nowMs();
+        const double cells = (double)M * M * M;
+        fprintf(stderr,
+                "threads %2d | N %ld M %ld | T %d steps %d | arrays %.2f GB\n"
+                "  alloc %8.1f | gen %9.1f | energy0 %7.1f | stencil %9.1f | "
+                "energy %8.1f | out %7.1f | total %9.1f  (ms)\n",
+                omp_get_max_threads(), N, M, T, steps,
+                cells * 25.0 / (1024.0 * 1024.0 * 1024.0),
+                tAlloc - tStart, tGen - tAlloc, tEnergy0 - tGen,
+                tStencilAcc, tEnergyAcc, tEnd - tSteps, tEnd - tStart);
+    }
     return 0;
 }
