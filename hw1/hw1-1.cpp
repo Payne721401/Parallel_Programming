@@ -18,7 +18,7 @@
 // can never change the answer. Sweep without editing the source:
 //   make CXXFLAGS="-std=c++11 -O3 -pthread -fopenmp -DOUT_ROWFILTER=PNG_FILTER_SUB"
 #ifndef OUT_ZLEVEL
-#define OUT_ZLEVEL 1
+#define OUT_ZLEVEL 0
 #endif
 #ifndef OUT_ROWFILTER
 #define OUT_ROWFILTER PNG_FILTER_NONE
@@ -49,7 +49,7 @@ double calculateLuminance(const RGB& pixel) {
 
 
 int determineKernelSize(double brightness) {
-    return brightness > 128 ? 10 : 5;
+    return brightness > 128 ? 11 : 5;
 }
 
 void applyFilterToChannel(

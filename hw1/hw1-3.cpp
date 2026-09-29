@@ -62,11 +62,14 @@ static int usableCpus() {
     return omp_get_max_threads();
 }
 
-// ========== START: DO NOT CHANGE BELOW ==========
+// These sit outside the protected range as of the 2026-09-29 handout, but the
+// spec defines the reference answer by this exact iteration count rather than
+// by the converged root, so changing the values still changes the answer.
 static const double R = 0.5;    // the reaction's strength
 static const int SUBSTEPS = 4;  // sub-steps of the reaction per time step
 static const int NEWTON = 3;    // Newton iterations per sub-step
 
+// ========== START: DO NOT CHANGE BELOW ==========
 static double field(uint64_t seed, uint64_t index, int which) {
     uint64_t x = (index * 2 + which) ^ (seed * 0x9E3779B97F4A7C15ull);
     x += 0x9E3779B97F4A7C15ull;
@@ -94,6 +97,10 @@ static int inclusions(uint64_t seed, long N, Inclusion* out) {
     }
     return B;
 }
+// =========== END: DO NOT CHANGE ABOVE ===========
+
+// reactive() and react() below are ours to change now. react() in particular:
+// it is 12 exp() calls deep in a single dependency chain, one cell at a time.
 
 // Whether cell (i, j, k), 1-based, lies inside any of the B inclusions.
 static bool reactive(const Inclusion* inc, int B, long i, long j, long k) {
@@ -117,7 +124,6 @@ static double react(double r) {
     }
     return x;
 }
-// =========== END: DO NOT CHANGE ABOVE ===========
 
 int main(int argc, char** argv) {
     if (argc != 6) {
