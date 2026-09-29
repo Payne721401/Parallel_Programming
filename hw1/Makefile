@@ -18,11 +18,28 @@ ARCH ?= -march=native -mtune=native
 
 # -fno-math-errno lets sqrt and exp compile to instructions rather than library
 # calls that have to set errno on a domain error. It changes no computed value.
+#
+# -ffp-contract=off is required for correctness here. Left at GCC's C++ default
+# of "fast", the compiler fuses a*b + c into one FMA instruction that rounds
+# once instead of twice. That is more accurate, but it is not the arithmetic the
+# reference implementations performed, and both hw1-2 and hw1-3 are judged
+# against their exact output:
+#   hw1-2 accepts a match when best < 0.75 * second, a discrete decision on a
+#   continuous quantity, so a last-bit change flips whichever candidates sit on
+#   that boundary. Measured: 8 extra matches on b08, 3 on a08, and hw1-2-check
+#   requires the count to agree exactly.
+#   hw1-3's react() runs a fixed three Newton iterations rather than iterating
+#   to convergence, so a perturbed intermediate is never corrected -- it reaches
+#   the output and then compounds over every time step. p01 (100 steps) and p03
+#   (50 steps) both went WA; p02, whose seed yields zero inclusions and so never
+#   calls react(), stayed AC.
+# Vectorisation is untouched: the wide-vector register count is identical with
+# and without this flag, so it costs the fusion, not the vector width.
+#
 # Deliberately NOT -ffast-math: that implies -fassociative-math, which lets the
-# compiler regroup floating-point sums. Reassociation would put hw1-2's
-# +-0.02 rad tolerance and hw1-3's 1e-9 relative tolerance at risk, and hw1-3
-# compounds its error over as many as 1000 time steps.
-CXXFLAGS = -std=c++11 -O3 $(ARCH) -fno-math-errno -pthread -fopenmp
+# compiler regroup floating-point sums as well. Reassociation would break the
+# same two tolerances by a much larger margin.
+CXXFLAGS = -std=c++11 -O3 $(ARCH) -fno-math-errno -ffp-contract=off -pthread -fopenmp
 LDLIBS = -lpng
 
 all: hw1-1 hw1-2 hw1-3
