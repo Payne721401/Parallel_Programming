@@ -405,7 +405,16 @@ FeatureSet extractFeatures(const Mat& gray, int height, int width) {
     auto keypoints = detectKeypoints(octaves);
 
     double t2 = nowMs();
-    for (auto& kp : keypoints) {
+    // Independent per keypoint -- each one reads octaves (read-only) and writes
+    // only its own fields. dynamic, unlike the pyramid loops: assignOrientation
+    // samples a window of radius round(4.5 * scale), so a layer-3 keypoint
+    // covers 29x29 = 841 points where a layer-1 one covers 19x19 = 361, and
+    // which layer dominates is decided by the image. A range-for cannot carry
+    // the pragma; OpenMP needs a canonical loop with an explicit index.
+    const long nkp = (long)keypoints.size();
+    #pragma omp parallel for schedule(dynamic, 16)
+    for (long i = 0; i < nkp; i++) {
+        Keypoint& kp = keypoints[i];
         assignOrientation(kp, octaves[kp.octave]);
         computeDescriptor(kp, octaves[kp.octave]);
     }
@@ -447,25 +456,69 @@ double descriptorDist(const std::vector<double>& a, const std::vector<double>& b
 // is matched independently against all of B -- parallelize over A.
 const double RATIO_THRESH = 0.75;
 
+// computeDescriptor() fills CELLS * CELLS * BINS = 4 * 4 * 8 entries.
+const int DESC_DIM = 128;
+
+// Every descriptor is its own ~1KB heap block, so the inner loop below would
+// chase nB unpredictable pointers per query keypoint. Copying them into one
+// contiguous nB x 128 array (2.6 MB at b08) turns that into a stream the
+// prefetcher can follow, and it stays warm in cache for the remaining queries.
+// Values are untouched.
+static std::vector<double> packDescriptors(const std::vector<Keypoint>& kps) {
+    std::vector<double> flat(kps.size() * (size_t)DESC_DIM);
+    for (size_t i = 0; i < kps.size(); i++)
+        std::copy(kps[i].descriptor.begin(), kps[i].descriptor.end(),
+                  flat.begin() + (long)i * DESC_DIM);
+    return flat;
+}
+
 std::vector<Match> matchFeatures(const FeatureSet& a, const FeatureSet& b) {
-    std::vector<Match> matches;
-    for (size_t i = 0; i < a.keypoints.size(); i++) {
+    const long nA = (long)a.keypoints.size(), nB = (long)b.keypoints.size();
+    const std::vector<double> fa = packDescriptors(a.keypoints);
+    const std::vector<double> fb = packDescriptors(b.keypoints);
+
+    // One slot per query keypoint. Threads never write the same location, so
+    // this needs no critical section, and the accepted matches can still be
+    // emitted in ascending i afterwards -- the sequential order.
+    std::vector<int> bestIdx(nA, -1);
+    std::vector<double> bestD(nA, 1e18), secondD(nA, 1e18);
+
+    // static, not dynamic: every i scans the whole of B, so the iterations cost
+    // the same and there is no imbalance worth paying a scheduler for.
+    #pragma omp parallel for schedule(static)
+    for (long i = 0; i < nA; i++) {
+        const double* da = &fa[i * DESC_DIM];
         double best = 1e18, second = 1e18;
-        int bestIdx = -1;
-        for (size_t j = 0; j < b.keypoints.size(); j++) {
-            double d = descriptorDist(a.keypoints[i].descriptor, b.keypoints[j].descriptor);
-            if (d < best) {
+        int bi = -1;
+        for (long j = 0; j < nB; j++) {
+            const double* db = &fb[j * DESC_DIM];
+            // Same summation order as descriptorDist above, and the sqrt is
+            // kept: comparing squared distances instead would save about 4% of
+            // this stage but is not bit-exact, since sqrt(x) < 0.75 * sqrt(y)
+            // and x < 0.5625 * y do not round the same way at the boundary.
+            double sum = 0.0;
+            for (int k = 0; k < DESC_DIM; k++) {
+                const double d = da[k] - db[k];
+                sum += d * d;
+            }
+            const double dist = std::sqrt(sum);
+            if (dist < best) {
                 second = best;
-                best = d;
-                bestIdx = (int)j;
-            } else if (d < second) {
-                second = d;
+                best = dist;
+                bi = (int)j;
+            } else if (dist < second) {
+                second = dist;
             }
         }
-        if (bestIdx >= 0 && best < RATIO_THRESH * second) {
-            matches.push_back({(int)i, bestIdx, best});
-        }
+        bestIdx[i] = bi;
+        bestD[i] = best;
+        secondD[i] = second;
     }
+
+    std::vector<Match> matches;
+    for (long i = 0; i < nA; i++)
+        if (bestIdx[i] >= 0 && bestD[i] < RATIO_THRESH * secondD[i])
+            matches.push_back({(int)i, bestIdx[i], bestD[i]});
     return matches;
 }
 
