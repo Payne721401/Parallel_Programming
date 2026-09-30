@@ -102,6 +102,17 @@ static int inclusions(uint64_t seed, long N, Inclusion* out) {
 // reactive() and react() below are ours to change now. react() in particular:
 // it is 12 exp() calls deep in a single dependency chain, one cell at a time.
 
+// A maximal run of consecutive reactive cells along k, as a flat index and a
+// length. Inclusions are spheres, so for a given (i, j) each one contributes at
+// most one contiguous range of k and the union of at most four of them is at
+// most four disjoint runs. Holding the reactive set this way costs about 3 MB
+// at N=960 against 890 MB for a full per-cell mat array, and it drops a read
+// stream from every time step.
+struct Run {
+    long p;
+    int len;
+};
+
 // Whether cell (i, j, k), 1-based, lies inside any of the B inclusions.
 static bool reactive(const Inclusion* inc, int B, long i, long j, long k) {
     for (int b = 0; b < B; b++) {
@@ -159,13 +170,17 @@ int main(int argc, char** argv) {
     // places each page on the NUMA node of the thread that will keep using it.
     // The halo stays zero either way, so the boundary semantics are unchanged.
     const size_t cells = (size_t)M * M * M;
+    // u + unew + a, all double. The reactive set used to be a fourth array of
+    // one byte per cell; it is a list of runs now. Both the PP_TIMING line and
+    // the out-of-memory message report through this, so keep it in step when an
+    // array is added or removed.
+    const double BYTES_PER_CELL = 24.0;
     double* u = (double*)calloc(cells, sizeof(double));
     double* unew = (double*)calloc(cells, sizeof(double));
     double* a = (double*)calloc(cells, sizeof(double));
-    uint8_t* mat = (uint8_t*)calloc(cells, 1);  // 1 where the cell is reactive
-    if (!u || !unew || !a || !mat) {
+    if (!u || !unew || !a) {
         fprintf(stderr, "out of memory for N=%ld (%.2f GB)\n",
-                N, cells * 25.0 / (1024.0 * 1024.0 * 1024.0));
+                N, cells * BYTES_PER_CELL / (1024.0 * 1024.0 * 1024.0));
         return 1;
     }
 
@@ -173,19 +188,47 @@ int main(int argc, char** argv) {
 
     Inclusion inc[4];
     const int B = inclusions(seed, N, inc);
+
     // field() is a pure function of the index, so every cell is independent --
     // no sequential PRNG state to carry. Running it in parallel also first-
     // touches the pages from the thread that will keep using them.
+    //
+    // The same sweep records the reactive set. It already evaluates reactive()
+    // for every cell, so tracking where the predicate turns on and off along k
+    // is free, and the resulting runs replace the per-cell mat array entirely.
+    // Each thread owns whole i planes, so the per-plane buffers need no locking,
+    // and concatenating them in i order afterwards keeps the list deterministic.
+    std::vector<std::vector<Run> > runsPerPlane(N + 1);
+
     #pragma omp parallel for schedule(static)
-    for (long i = 1; i <= N; i++)
-        for (long j = 1; j <= N; j++)
+    for (long i = 1; i <= N; i++) {
+        std::vector<Run>& out = runsPerPlane[i];
+        for (long j = 1; j <= N; j++) {
+            long runStart = -1;
             for (long k = 1; k <= N; k++) {
                 const long p = i * SI + j * SJ + k;
                 const uint64_t index = ((i - 1) * N + (j - 1)) * N + (k - 1);
                 u[p] = field(seed, index, 0);
                 a[p] = field(seed, index, 1);
-                mat[p] = reactive(inc, B, i, j, k);
+                if (reactive(inc, B, i, j, k)) {
+                    if (runStart < 0) runStart = p;
+                } else if (runStart >= 0) {
+                    out.push_back(Run{runStart, (int)(p - runStart)});
+                    runStart = -1;
+                }
             }
+            if (runStart >= 0) {   // the run reached the far face
+                const long pEnd = i * SI + j * SJ + (N + 1);
+                out.push_back(Run{runStart, (int)(pEnd - runStart)});
+            }
+        }
+    }
+
+    std::vector<Run> runs;
+    for (long i = 1; i <= N; i++)
+        runs.insert(runs.end(), runsPerPlane[i].begin(), runsPerPlane[i].end());
+    std::vector<std::vector<Run> >().swap(runsPerPlane);   // give the memory back
+    const long nRuns = (long)runs.size();
 
     const double tGen = nowMs();
 
@@ -213,36 +256,67 @@ int main(int argc, char** argv) {
 
     while (steps < T) {
         const double s0 = nowMs();
-        // dynamic, not static: the reactive cells sit inside up to four
-        // spheres of radius 0.12-0.18 N, so they occupy a band of only ~0.3 N
-        // planes. A reactive cell costs 12 exp() calls and measures about 30x
-        // a plain one, so a static split leaves two or three threads doing all
-        // the reaction work while the rest idle.
+
+        // __restrict: these are three separate calloc blocks, but as plain
+        // double* the compiler has to assume they might overlap, and that alone
+        // stops the k loop from vectorising.
+        const double* __restrict U = u;
+        const double* __restrict A = a;
+        double* __restrict UN = unew;
+
         double e = 0.0;
-        #pragma omp parallel for schedule(dynamic, 1) reduction(+ : e)
+
+        // Pass 1: plain diffusion for every cell. No branch and no call in the
+        // k loop now that the reaction has moved out, so it vectorises -- and
+        // static, because with react() gone every cell costs the same. (It
+        // needed dynamic before: reactive cells are ~30x a plain one and sit
+        // inside spheres spanning only ~0.3 N planes, so a fixed split left
+        // most threads idle.)
+        //
+        // omp simd is what makes the reduction legal to vectorise: e += r * r
+        // needs the additions regrouped, and GCC will not do that on its own
+        // without -ffast-math, which we cannot afford globally. The directive
+        // grants it for this loop alone. The temperatures are unaffected --
+        // every UN[p] is still the same expression evaluated in the same order.
+        #pragma omp parallel for schedule(static) reduction(+ : e)
         for (long i = 1; i <= N; i++)
-            for (long j = 1; j <= N; j++)
+            for (long j = 1; j <= N; j++) {
+                const long base = i * SI + j * SJ;
+                #pragma omp simd reduction(+ : e)
                 for (long k = 1; k <= N; k++) {
-                    const long p = i * SI + j * SJ + k;
-                    const double up = u[p], ap = a[p];
+                    const long p = base + k;
+                    const double up = U[p], ap = A[p];
                     double flux = 0.0;
-                    flux += (ap + a[p - SI]) * (u[p - SI] - up);
-                    flux += (ap + a[p + SI]) * (u[p + SI] - up);
-                    flux += (ap + a[p - SJ]) * (u[p - SJ] - up);
-                    flux += (ap + a[p + SJ]) * (u[p + SJ] - up);
-                    flux += (ap + a[p - 1]) * (u[p - 1] - up);
-                    flux += (ap + a[p + 1]) * (u[p + 1] - up);
+                    flux += (ap + A[p - SI]) * (U[p - SI] - up);
+                    flux += (ap + A[p + SI]) * (U[p + SI] - up);
+                    flux += (ap + A[p - SJ]) * (U[p - SJ] - up);
+                    flux += (ap + A[p + SJ]) * (U[p + SJ] - up);
+                    flux += (ap + A[p - 1]) * (U[p - 1] - up);
+                    flux += (ap + A[p + 1]) * (U[p + 1] - up);
                     const double r = up + flux * (1.0 / 12.0);
-                    const double nu = mat[p] ? react(r) : r;
-                    unew[p] = nu;
-                    // energy_of(u) used to re-read the whole array right after
-                    // the swap; these are the same values, so accumulate here.
-                    // The sum lands in a different order, which the spec allows
-                    // explicitly: the stopping thresholds carry enough margin
-                    // that reordering cannot change the step count, and the
-                    // energy itself is compared at 1e-7 relative tolerance.
-                    e += nu * nu;
+                    UN[p] = r;
+                    e += r * r;
                 }
+            }
+
+        // Pass 2: replace the plain value in each reactive cell with the
+        // reacted one. Pass 1 already added pre^2 to the energy, so adding the
+        // difference costs O(reactive cells) instead of another full sweep.
+        // dynamic: a run is a chord through a sphere, so lengths vary from 1 to
+        // twice the radius.
+        #pragma omp parallel for schedule(dynamic, 64) reduction(+ : e)
+        for (long t = 0; t < nRuns; t++) {
+            const long p0 = runs[t].p;
+            const int len = runs[t].len;
+            for (int m = 0; m < len; m++) {
+                const long p = p0 + m;
+                const double pre = UN[p];
+                const double post = react(pre);
+                UN[p] = post;
+                e += post * post - pre * pre;
+            }
+        }
+
         std::swap(u, unew);
         steps++;
         energy = e;
@@ -277,7 +351,7 @@ int main(int argc, char** argv) {
                 "  alloc %8.1f | gen %9.1f | energy0 %7.1f | "
                 "stencil+energy %9.1f | out %7.1f | total %9.1f  (ms)\n",
                 omp_get_max_threads(), N, M, T, steps,
-                (double)cells * 25.0 / (1024.0 * 1024.0 * 1024.0),
+                (double)cells * BYTES_PER_CELL / (1024.0 * 1024.0 * 1024.0),
                 tAlloc - tStart, tGen - tAlloc, tEnergy0 - tGen,
                 tStencilAcc, tEnd - tSteps, tEnd - tStart);
     }
@@ -285,6 +359,5 @@ int main(int argc, char** argv) {
     free(u);
     free(unew);
     free(a);
-    free(mat);
     return 0;
 }
