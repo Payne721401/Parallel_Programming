@@ -41,6 +41,19 @@ initial energy or less.
 #include <omp.h>
 #include <sched.h>
 
+// Set -DSTENCIL_SIMD=0 to drop the omp simd directive on the diffusion loop and
+// let GCC's cost model decide instead. The stencil is memory-bound at roughly
+// 1 flop per byte, so forcing vectorisation may well be a pessimisation.
+#ifndef STENCIL_SIMD
+#define STENCIL_SIMD 1
+#endif
+
+// Per-thread profile counters, one 64-byte line each so the threads never share
+// a cache line while accumulating. Slots: pass 1 work, wait at the barrier after
+// pass 1, pass 2 work, wait at the barrier after pass 2.
+#define TPROF_STRIDE 8
+#define TPROF_SLOTS 4
+
 // ---------- staged timing ----------
 // Gated on PP_TIMING so the judge run stays clean:
 //   PP_TIMING=1 srun -n 1 -c 8 ./hw1-3 768 6 1087 0 out.txt
@@ -254,6 +267,12 @@ int main(int argc, char** argv) {
     const double tEnergy0 = nowMs();
     double tStencilAcc = 0.0;   // the per-step energy is folded into this now
 
+    // Totals alone hide imbalance: eight threads averaging 100 ms tell you
+    // nothing about whether one of them took 400 ms while the rest waited. Time
+    // each pass and each barrier per thread instead, and report max against
+    // mean -- the barrier columns are where imbalance actually shows up.
+    std::vector<double> tprof((size_t)nthreads * TPROF_STRIDE, 0.0);
+
     while (steps < T) {
         const double s0 = nowMs();
 
@@ -266,55 +285,80 @@ int main(int argc, char** argv) {
 
         double e = 0.0;
 
-        // Pass 1: plain diffusion for every cell. No branch and no call in the
-        // k loop now that the reaction has moved out, so it vectorises -- and
-        // static, because with react() gone every cell costs the same. (It
-        // needed dynamic before: reactive cells are ~30x a plain one and sit
-        // inside spheres spanning only ~0.3 N planes, so a fixed split left
-        // most threads idle.)
-        //
-        // omp simd is what makes the reduction legal to vectorise: e += r * r
-        // needs the additions regrouped, and GCC will not do that on its own
-        // without -ffast-math, which we cannot afford globally. The directive
-        // grants it for this loop alone. The temperatures are unaffected --
-        // every UN[p] is still the same expression evaluated in the same order.
-        #pragma omp parallel for schedule(static) reduction(+ : e)
-        for (long i = 1; i <= N; i++)
-            for (long j = 1; j <= N; j++) {
-                const long base = i * SI + j * SJ;
-                #pragma omp simd reduction(+ : e)
-                for (long k = 1; k <= N; k++) {
-                    const long p = base + k;
-                    const double up = U[p], ap = A[p];
-                    double flux = 0.0;
-                    flux += (ap + A[p - SI]) * (U[p - SI] - up);
-                    flux += (ap + A[p + SI]) * (U[p + SI] - up);
-                    flux += (ap + A[p - SJ]) * (U[p - SJ] - up);
-                    flux += (ap + A[p + SJ]) * (U[p + SJ] - up);
-                    flux += (ap + A[p - 1]) * (U[p - 1] - up);
-                    flux += (ap + A[p + 1]) * (U[p + 1] - up);
-                    const double r = up + flux * (1.0 / 12.0);
-                    UN[p] = r;
-                    e += r * r;
+        // One parallel region for both passes, with nowait on each omp for and
+        // an explicit barrier after it, so the wait can be timed separately
+        // from the work.
+        #pragma omp parallel reduction(+ : e)
+        {
+            double* tp = &tprof[(size_t)omp_get_thread_num() * TPROF_STRIDE];
+            const double w0 = omp_get_wtime();
+
+            // Pass 1: plain diffusion for every cell. No branch and no call in
+            // the k loop now that the reaction has moved out, and static,
+            // because with react() gone every cell costs the same. (It needed
+            // dynamic before: reactive cells run ~30x a plain one and sit
+            // inside spheres spanning only ~0.3 N planes, so a fixed split left
+            // most threads idle.)
+            //
+            // omp simd is what would make the reduction legal to vectorise:
+            // e += r * r needs its additions regrouped, and GCC will not do
+            // that unprompted without -ffast-math, which we cannot afford
+            // globally. Whether it is worth doing is another question -- see
+            // STENCIL_SIMD. The temperatures are unaffected either way, since
+            // every UN[p] is the same expression evaluated in the same order.
+            #pragma omp for schedule(static) nowait
+            for (long i = 1; i <= N; i++)
+                for (long j = 1; j <= N; j++) {
+                    const long base = i * SI + j * SJ;
+#if STENCIL_SIMD
+                    #pragma omp simd reduction(+ : e)
+#endif
+                    for (long k = 1; k <= N; k++) {
+                        const long p = base + k;
+                        const double up = U[p], ap = A[p];
+                        double flux = 0.0;
+                        flux += (ap + A[p - SI]) * (U[p - SI] - up);
+                        flux += (ap + A[p + SI]) * (U[p + SI] - up);
+                        flux += (ap + A[p - SJ]) * (U[p - SJ] - up);
+                        flux += (ap + A[p + SJ]) * (U[p + SJ] - up);
+                        flux += (ap + A[p - 1]) * (U[p - 1] - up);
+                        flux += (ap + A[p + 1]) * (U[p + 1] - up);
+                        const double r = up + flux * (1.0 / 12.0);
+                        UN[p] = r;
+                        e += r * r;
+                    }
+                }
+
+            const double w1 = omp_get_wtime();
+            #pragma omp barrier
+            const double w2 = omp_get_wtime();
+
+            // Pass 2: replace the plain value in each reactive cell with the
+            // reacted one. Pass 1 already added pre^2 to the energy, so adding
+            // the difference costs O(reactive cells) instead of another full
+            // sweep. dynamic: a run is a chord through a sphere, so lengths
+            // vary from 1 to twice the radius.
+            #pragma omp for schedule(dynamic, 64) nowait
+            for (long t = 0; t < nRuns; t++) {
+                const long p0 = runs[t].p;
+                const int len = runs[t].len;
+                for (int m = 0; m < len; m++) {
+                    const long p = p0 + m;
+                    const double pre = UN[p];
+                    const double post = react(pre);
+                    UN[p] = post;
+                    e += post * post - pre * pre;
                 }
             }
 
-        // Pass 2: replace the plain value in each reactive cell with the
-        // reacted one. Pass 1 already added pre^2 to the energy, so adding the
-        // difference costs O(reactive cells) instead of another full sweep.
-        // dynamic: a run is a chord through a sphere, so lengths vary from 1 to
-        // twice the radius.
-        #pragma omp parallel for schedule(dynamic, 64) reduction(+ : e)
-        for (long t = 0; t < nRuns; t++) {
-            const long p0 = runs[t].p;
-            const int len = runs[t].len;
-            for (int m = 0; m < len; m++) {
-                const long p = p0 + m;
-                const double pre = UN[p];
-                const double post = react(pre);
-                UN[p] = post;
-                e += post * post - pre * pre;
-            }
+            const double w3 = omp_get_wtime();
+            #pragma omp barrier
+            const double w4 = omp_get_wtime();
+
+            tp[0] += (w1 - w0) * 1000.0;   // pass 1 work
+            tp[1] += (w2 - w1) * 1000.0;   // waiting at the barrier after pass 1
+            tp[2] += (w3 - w2) * 1000.0;   // pass 2 work
+            tp[3] += (w4 - w3) * 1000.0;   // waiting at the barrier after pass 2
         }
 
         std::swap(u, unew);
@@ -354,6 +398,27 @@ int main(int argc, char** argv) {
                 (double)cells * BYTES_PER_CELL / (1024.0 * 1024.0 * 1024.0),
                 tAlloc - tStart, tGen - tAlloc, tEnergy0 - tGen,
                 tStencilAcc, tEnd - tSteps, tEnd - tStart);
+
+        // max against mean is the point: a barrier column whose max is well
+        // above its mean means the threads finished the preceding pass at very
+        // different times, which is imbalance rather than slow work.
+        static const char* slotName[TPROF_SLOTS] = {
+            "pass1 stencil", "barrier after 1", "pass2 react", "barrier after 2"};
+        fprintf(stderr, "  per-thread, summed over steps (ms)\n");
+        fprintf(stderr, "    %-16s %9s %9s %9s %9s\n",
+                "", "min", "mean", "max", "max/mean");
+        for (int s = 0; s < TPROF_SLOTS; s++) {
+            double sum = 0.0, mx = 0.0, mn = 1e300;
+            for (int t = 0; t < nthreads; t++) {
+                const double v = tprof[(size_t)t * TPROF_STRIDE + s];
+                sum += v;
+                if (v > mx) mx = v;
+                if (v < mn) mn = v;
+            }
+            const double mean = sum / nthreads;
+            fprintf(stderr, "    %-16s %9.1f %9.1f %9.1f %9.2f\n",
+                    slotName[s], mn, mean, mx, mean > 0.0 ? mx / mean : 0.0);
+        }
     }
 
     free(u);
