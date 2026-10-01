@@ -44,7 +44,19 @@ struct RGB {
 
 using Mat = std::vector<std::vector<double>>;
 
-void read_png_file(const char* file_name, std::vector<std::vector<RGB>>& image) {
+// The two images decode independently -- separate files, separate FILE* and
+// separate png_structp, and libpng is reentrant per struct -- so main runs these
+// as two omp sections. Nested parallelism is off, so the work inside has to stay
+// serial; hence the decode stops at a contiguous RGB buffer and the conversion
+// to grayscale happens afterwards with the whole team. That also drops the
+// vector<vector<RGB>> the old path built, 63 MB per image at 2640x1980, and the
+// pass that read it back out again.
+//
+// png_set_strip_alpha replaces png_set_filler: the old path expanded RGB to RGBA
+// and then discarded the alpha, which costs libpng a transform pass and 25% more
+// output traffic.
+static png_byte* read_png_raw(const char* file_name, int* out_w, int* out_h,
+                              size_t* out_rowbytes) {
     FILE *fp = fopen(file_name, "rb");
     if (!fp) {
         std::cerr << "Error: Cannot open file " << file_name << std::endl;
@@ -70,47 +82,47 @@ void read_png_file(const char* file_name, std::vector<std::vector<RGB>>& image) 
     if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
     if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) png_set_expand_gray_1_2_4_to_8(png);
     if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
-    if (color_type == PNG_COLOR_TYPE_RGB || color_type == PNG_COLOR_TYPE_GRAY ||
-        color_type == PNG_COLOR_TYPE_PALETTE)
-        png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+    png_set_strip_alpha(png);   // every source type reduces to plain RGB
     if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
         png_set_gray_to_rgb(png);
 
     png_read_update_info(png, info);
 
+    const size_t rowbytes = png_get_rowbytes(png, info);
+    png_byte* raw = (png_byte*)malloc(rowbytes * (size_t)height);
     png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
+    if (!raw || !row_pointers) {
+        std::cerr << "Error: out of memory for " << width << "x" << height << std::endl;
+        exit(EXIT_FAILURE);
+    }
     for (int y = 0; y < height; y++)
-        row_pointers[y] = (png_byte*)malloc(png_get_rowbytes(png, info));
+        row_pointers[y] = raw + (size_t)y * rowbytes;
     png_read_image(png, row_pointers);
     fclose(fp);
-
-    image.resize(height, std::vector<RGB>(width));
-    for (int y = 0; y < height; y++) {
-        png_bytep row = row_pointers[y];
-        for (int x = 0; x < width; x++) {
-            png_bytep px = &(row[x * 4]);
-            image[y][x].r = px[0];
-            image[y][x].g = px[1];
-            image[y][x].b = px[2];
-        }
-        free(row_pointers[y]);
-    }
     free(row_pointers);
     png_destroy_read_struct(&png, &info, nullptr);
+
+    *out_w = width;
+    *out_h = height;
+    *out_rowbytes = rowbytes;
+    return raw;
 }
 
 // ---------- grayscale + Gaussian scale space ----------
 
-Mat toGrayscale(const std::vector<std::vector<RGB>>& image, int height, int width) {
+// Same expression and the same order as before -- the luminance weights are
+// inexact in binary, and every later extremum decision rests on these values.
+Mat toGrayscale(const png_byte* raw, size_t rowbytes, int height, int width) {
     Mat gray(height, std::vector<double>(width));
     // Row y reads only row y and writes only row y. Uniform work per row, so
     // static: no imbalance to fix and nothing to gain from paying for dynamic.
     #pragma omp parallel for schedule(static)
-    for (int y = 0; y < height; y++)
-        for (int x = 0; x < width; x++) {
-            const RGB& p = image[y][x];
-            gray[y][x] = (0.299 * p.r + 0.587 * p.g + 0.114 * p.b) / 255.0;
-        }
+    for (int y = 0; y < height; y++) {
+        const png_byte* row = raw + (size_t)y * rowbytes;
+        for (int x = 0; x < width; x++)
+            gray[y][x] = (0.299 * row[x * 3] + 0.587 * row[x * 3 + 1] +
+                          0.114 * row[x * 3 + 2]) / 255.0;
+    }
     return gray;
 }
 
@@ -564,17 +576,26 @@ int main(int argc, char** argv) {
 
     double t0 = nowMs();
 
-    std::vector<std::vector<RGB>> imageA, imageB;
-    read_png_file(argv[1], imageA);
-    read_png_file(argv[2], imageB);
+    png_byte *rawA = nullptr, *rawB = nullptr;
+    int widthA = 0, heightA = 0, widthB = 0, heightB = 0;
+    size_t rowbytesA = 0, rowbytesB = 0;
 
-    int heightA = imageA.size(), widthA = imageA[0].size();
-    int heightB = imageB.size(), widthB = imageB[0].size();
+    // Two independent DEFLATE streams, so this is a genuine 2x -- unlike hw1-1,
+    // whose single stream cannot be split at all.
+    #pragma omp parallel sections
+    {
+        #pragma omp section
+        rawA = read_png_raw(argv[1], &widthA, &heightA, &rowbytesA);
+        #pragma omp section
+        rawB = read_png_raw(argv[2], &widthB, &heightB, &rowbytesB);
+    }
 
     double t1 = nowMs();
 
-    Mat grayA = toGrayscale(imageA, heightA, widthA);
-    Mat grayB = toGrayscale(imageB, heightB, widthB);
+    Mat grayA = toGrayscale(rawA, rowbytesA, heightA, widthA);
+    Mat grayB = toGrayscale(rawB, rowbytesB, heightB, widthB);
+    free(rawA);
+    free(rawB);
 
     double t2 = nowMs();
 
