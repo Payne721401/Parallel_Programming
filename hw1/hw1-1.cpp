@@ -9,14 +9,8 @@
 #include <sched.h>
 // #include <pthread.h>
 
-// The filter loop below uses schedule(runtime) so its schedule can be swept
-// with OMP_SCHEDULE="guided,4" etc. without recompiling. main() picks a
-// default when OMP_SCHEDULE is unset, which is how the judge runs us.
-
-// PNG output tuning. The judge compares the decoded image pixel by pixel, not
-// the file's bytes, so both of these only trade CPU time against file size and
-// can never change the answer. Sweep without editing the source:
-//   make CXXFLAGS="-std=c++11 -O3 -pthread -fopenmp -DOUT_ROWFILTER=PNG_FILTER_SUB"
+// PNG output tuning, sweepable with -DOUT_ZLEVEL / -DOUT_ROWFILTER. Deflate is
+// lossless at every level, so neither can change the decoded pixels.
 #ifndef OUT_ZLEVEL
 #define OUT_ZLEVEL 0
 #endif
@@ -24,10 +18,8 @@
 #define OUT_ROWFILTER PNG_FILTER_NONE
 #endif
 
-// The judge runs us as `srun -c N ./hw1-1 ...` and does not set
-// OMP_NUM_THREADS, and this cluster overwrites it to 1 anyway. The CPU
-// affinity mask is what srun actually handed us, so size the pool from that
-// rather than trusting the environment.
+// Spec 1.4: size the pool from the affinity mask. The cluster overwrites
+// OMP_NUM_THREADS to 1, so the environment cannot be trusted.
 static int usableCpus() {
     cpu_set_t set;
     if (sched_getaffinity(0, sizeof(set), &set) == 0) {
@@ -55,8 +47,7 @@ int determineKernelSize(double brightness) {
 // The largest radius determineKernelSize can produce: 11 / 2 == 5.
 static const int RMAX = 5;
 
-// Border cells, where y + j runs off the row and has to be clamped. Only RMAX
-// columns at each end, so 10 of 4930 on the largest public case.
+// The RMAX columns at each end of a row, where y + j has to be clamped.
 static inline int clampedBox(const unsigned char* const* rows, int rad, int y, int width) {
     int s = 0;
     for (int i = -rad; i <= rad; i++) {
@@ -68,17 +59,11 @@ static inline int clampedBox(const unsigned char* const* rows, int rad, int y, i
     return s / (n * n);
 }
 
-// Flat unsigned char planes rather than vector<vector<int>>: the values are
-// always 0..255, so a byte per sample is a quarter of the memory traffic of an
-// int, and a flat plane makes consecutive rows actually consecutive, which a
-// vector of vectors never is.
-//
-// Two further changes to the inner loops. The row lookups are clamped once per
-// output row instead of once per tap. And y is split so that the interior needs
-// no clamping at all, which lets the radius be branched on once per pixel and
-// the resulting loops have compile-time trip counts -- 11x11 or 5x5 -- so they
-// can be unrolled and vectorised. Integer addition is associative, so none of
-// this changes the sum.
+// Flat unsigned char planes rather than vector<vector<int>>: a byte per sample
+// instead of an int, and consecutive rows actually consecutive. The row lookups
+// are clamped once per output row, and y is split so the interior needs no
+// clamping -- which makes the inner trip counts compile-time constants, 11x11
+// or 5x5. Integer addition is associative, so none of this changes the sum.
 void applyFilterToChannel(
     const unsigned char* input,
     unsigned char* output,
@@ -86,11 +71,10 @@ void applyFilterToChannel(
     int height,
     int width
 ) {
-    // Each output row is written by exactly one thread and `input` is only
-    // read, so rows are independent. The schedule is left to OMP_SCHEDULE /
-    // omp_set_schedule() so it can be swept without recompiling; measurement
-    // says it barely matters here, because the input is a noisy image and that
-    // noise leaves every row with much the same mix of large and small kernels.
+    // Each output row is written by one thread and `input` is only read, so
+    // rows are independent. schedule(runtime) lets OMP_SCHEDULE sweep it;
+    // measurement says it barely matters, because the noisy input leaves every
+    // row much the same mix of large and small kernels.
     #pragma omp parallel for schedule(runtime)
     for (int x = 0; x < height; x++) {
         const unsigned char* rows[2 * RMAX + 1];
@@ -127,9 +111,8 @@ void applyFilterToChannel(
     }
 }
 
-// Writes straight into the output planes the encoder will read, so there is no
-// interleaved vector<vector<RGB>> in between -- another 219 MB at 18 Mpixel,
-// allocated and zero-filled before being overwritten.
+// Writes straight into the planes the encoder will read, so there is no
+// interleaved vector<vector<RGB>> in between -- 219 MB at 18 Mpixel.
 void adaptiveFilterRGB(
     const unsigned char* redChannel,
     const unsigned char* greenChannel,
@@ -147,11 +130,10 @@ void adaptiveFilterRGB(
     for (int x = 0; x < height; x++)
         for (int y = 0; y < width; y++) {
             const size_t p = (size_t)x * width + y;
-            // Assembled back into an RGB so calculateLuminance evaluates the
-            // same double expression in the same order. The integer form
-            // 299r + 587g + 114b > 128000 is not equivalent: 0.299, 0.587 and
-            // 0.114 are inexact in binary, so a flat mid-grey region would pick
-            // a different kernel for every one of its pixels.
+            // Reassembled into an RGB so calculateLuminance evaluates the same
+            // double expression. The integer form 299r + 587g + 114b > 128000
+            // is not equivalent -- the weights are inexact in binary, so a flat
+            // mid-grey region would pick a different kernel per pixel.
             RGB px;
             px.r = redChannel[p];
             px.g = greenChannel[p];
@@ -166,12 +148,9 @@ void adaptiveFilterRGB(
 
 // ---------- shared PNG I/O ----------
 
-// Decodes straight into the three channel planes the filter wants. Two changes
-// beyond that: png_set_strip_alpha instead of png_set_filler, because the old
-// path expanded RGB to RGBA and then discarded the alpha, costing libpng an
-// extra transform pass and 25% more output traffic; and one contiguous buffer
-// for all the rows instead of a malloc per row, which was 3700 allocations on
-// the largest public case.
+// Decodes straight into the three channel planes. png_set_strip_alpha rather
+// than png_set_filler, which expanded RGB to RGBA only to discard the alpha;
+// and one contiguous buffer instead of a malloc per row.
 void read_png_planes(char* file_name,
                      std::vector<unsigned char>& redChannel,
                      std::vector<unsigned char>& greenChannel,
@@ -302,10 +281,9 @@ void write_png_file(char* file_name, const unsigned char* R,
 
     png_init_io(png, fp);
 
-    // zlib level 6 (libpng's default) spends most of this function's time
-    // hunting for longer LZ77 matches, and PNG_ALL_FILTERS (also the default)
-    // filters every row five ways and keeps whichever scores best. Deflate is
-    // lossless at every level, so the decoded pixels are unchanged either way.
+    // libpng's defaults spend this function's time hunting for longer LZ77
+    // matches and filtering every row five ways to keep the best. Both are
+    // lossless, so the decoded pixels are unchanged either way.
     png_set_compression_level(png, OUT_ZLEVEL);
     png_set_filter(png, PNG_FILTER_TYPE_BASE, OUT_ROWFILTER);
 
@@ -368,9 +346,8 @@ int main(int argc, char** argv) {
     }
     omp_set_num_threads(nthreads);
 
-    // Backstop for schedule(runtime): with OMP_SCHEDULE unset GCC falls back to
-    // static, which would silently throw away the load balancing the filter
-    // needs. Sweep with OMP_SCHEDULE, then hardcode the winner here.
+    // Backstop for schedule(runtime): with OMP_SCHEDULE unset GCC falls back
+    // to static.
     if (!getenv("OMP_SCHEDULE")) omp_set_schedule(omp_sched_guided, 4);
 
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -397,8 +374,7 @@ int main(int argc, char** argv) {
 
     auto t4 = std::chrono::high_resolution_clock::now();
 
-    // Gated on an env var so the judge run stays clean and these lines never
-    // have to be commented back out: PP_TIMING=1 srun ... ./hw1-1 in.png out.png
+    // PP_TIMING=1 srun -n 1 -c 8 ./hw1-1 in.png out.png
     if (getenv("PP_TIMING")) {
         auto ms = [](std::chrono::high_resolution_clock::time_point a,
                      std::chrono::high_resolution_clock::time_point b) {

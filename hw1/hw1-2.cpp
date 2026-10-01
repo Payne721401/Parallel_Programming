@@ -12,10 +12,8 @@
 // #include <pthread.h>
 
 // ---------- staged timing ----------
-// Gated on PP_TIMING so the judge run stays clean:
-//   PP_TIMING=1 srun -n 1 -c 8 ./hw1-2 a.png b.png out.txt
-// extractFeatures() runs twice (image A, then B), so its three inner stages
-// accumulate into globals rather than being reported per call.
+// PP_TIMING=1 srun -n 1 -c 8 ./hw1-2 a.png b.png out.txt
+// extractFeatures() runs twice, so its inner stages accumulate into globals.
 static double g_tPyramid = 0.0, g_tDetect = 0.0, g_tDescribe = 0.0;
 
 static inline double nowMs() {
@@ -23,10 +21,8 @@ static inline double nowMs() {
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// The judge runs us as `srun -c N ./hw1-2 ...` and does not set
-// OMP_NUM_THREADS, and this cluster overwrites it to 1 anyway. The CPU
-// affinity mask is what srun actually handed us, so size the pool from that
-// rather than trusting the environment.
+// Spec 1.4: size the pool from the affinity mask. The cluster overwrites
+// OMP_NUM_THREADS to 1, so the environment cannot be trusted.
 static int usableCpus() {
     cpu_set_t set;
     if (sched_getaffinity(0, sizeof(set), &set) == 0) {
@@ -44,17 +40,12 @@ struct RGB {
 
 using Mat = std::vector<std::vector<double>>;
 
-// The two images decode independently -- separate files, separate FILE* and
-// separate png_structp, and libpng is reentrant per struct -- so main runs these
-// as two omp sections. Nested parallelism is off, so the work inside has to stay
-// serial; hence the decode stops at a contiguous RGB buffer and the conversion
-// to grayscale happens afterwards with the whole team. That also drops the
-// vector<vector<RGB>> the old path built, 63 MB per image at 2640x1980, and the
-// pass that read it back out again.
-//
-// png_set_strip_alpha replaces png_set_filler: the old path expanded RGB to RGBA
-// and then discarded the alpha, which costs libpng a transform pass and 25% more
-// output traffic.
+// The two images decode independently -- separate files, separate png_structp,
+// and libpng is reentrant per struct -- so main runs these as two omp sections.
+// Nested parallelism is off, so the decode stops at a contiguous RGB buffer
+// (dropping the old vector<vector<RGB>>, 63 MB per image at 2640x1980) and the
+// grayscale conversion runs afterwards with the whole team. png_set_strip_alpha
+// replaces png_set_filler, which expanded RGB to RGBA only to discard the alpha.
 static png_byte* read_png_raw(const char* file_name, int* out_w, int* out_h,
                               size_t* out_rowbytes) {
     FILE *fp = fopen(file_name, "rb");
@@ -110,12 +101,11 @@ static png_byte* read_png_raw(const char* file_name, int* out_w, int* out_h,
 
 // ---------- grayscale + Gaussian scale space ----------
 
-// Same expression and the same order as before -- the luminance weights are
+// The same expression in the same order as before: the luminance weights are
 // inexact in binary, and every later extremum decision rests on these values.
 Mat toGrayscale(const png_byte* raw, size_t rowbytes, int height, int width) {
     Mat gray(height, std::vector<double>(width));
-    // Row y reads only row y and writes only row y. Uniform work per row, so
-    // static: no imbalance to fix and nothing to gain from paying for dynamic.
+    // Row y reads and writes only row y, and the work per row is uniform.
     #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
         const png_byte* row = raw + (size_t)y * rowbytes;
@@ -140,21 +130,18 @@ Mat gaussianBlur(const Mat& in, int height, int width, double sigma) {
     }
     for (double& v : kernel) v /= sum;
 
-    // Both passes below run x in the innermost loop instead of the kernel
-    // offset. Each out[x] still accumulates i from -radius to +radius in that
-    // order, so every value is bit-identical to the scalar version -- what
-    // changes is that different x are now independent (no shared accumulator
-    // chain) and consecutive, so the loads are stride-1 and can vectorize.
+    // Both passes run x innermost instead of the kernel offset. Each out[x]
+    // still accumulates i from -radius to +radius in that order, so the values
+    // stay bit-identical; what changes is that different x become independent
+    // (no shared accumulator chain) and contiguous, so the loads vectorize.
 
-    // Interior columns need no clamping: for x in [xLo, xHi) and any i in
-    // [-radius, radius], x + i stays inside [0, width).
+    // Interior columns need no clamping: x + i stays inside [0, width).
     const int xLo = std::min(radius, width);
     const int xHi = std::max(xLo, width - radius);
 
     Mat tmp(height, std::vector<double>(width));
-    // Row y of the horizontal pass reads only row y of `in`, so rows are
-    // independent and each output element is still summed by one thread in the
-    // original order -- the result stays bit-identical.
+    // Rows are independent, and each element is still summed by one thread in
+    // the original order.
     #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
         const double* src = in[y].data();
@@ -172,15 +159,14 @@ Mat gaussianBlur(const Mat& in, int height, int width, double sigma) {
     }
 
     Mat out(height, std::vector<double>(width));
-    // The vertical pass reads rows y-radius..y+radius of `tmp`, but only ever
-    // reads them, and writes only out[y]. Overlapping reads are not a race.
+    // Reads rows y-radius..y+radius of `tmp` but only ever reads them, and
+    // writes only out[y]. Overlapping reads are not a race.
     #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
         double* dst = out[y].data();
         std::fill(dst, dst + width, 0.0);
         for (int i = -radius; i <= radius; i++) {
-            // The row index is invariant in x, so the clamp and the row lookup
-            // happen once per i here rather than once per tap.
+            // The row index is invariant in x, so clamp once per i.
             const double* src = tmp[std::min(std::max(y + i, 0), height - 1)].data();
             const double kv = kernel[i + radius];
             for (int x = 0; x < width; x++)
@@ -232,15 +218,13 @@ std::vector<Octave> buildPyramid(const Mat& gray, int height, int width) {
             double sigma = SIGMA0 * std::pow(k, s);
             oct.gaussian[s] = gaussianBlur(base, h, w, sigma);
         }
-        // Allocate first, then subtract: collapse(2) needs a perfectly nested
-        // pair, and the allocation is not something to run concurrently anyway.
+        // Allocate first, then subtract: collapse(2) needs a perfect nest.
         oct.dog.resize(NUM_SCALES - 1);
         for (int s = 0; s < NUM_SCALES - 1; s++)
             oct.dog[s] = Mat(h, std::vector<double>(w));
 
-        // collapse(2) rather than parallelising s alone: the deepest octave is
-        // only ~250 rows and there are just 5 layers, so flattening (s, y) is
-        // what keeps 8 threads fed all the way down the pyramid.
+        // collapse(2) rather than s alone: the deepest octave is only ~250
+        // rows and there are 5 layers, so flattening (s, y) keeps 8 threads fed.
         #pragma omp parallel for collapse(2) schedule(static)
         for (int s = 0; s < NUM_SCALES - 1; s++)
             for (int y = 0; y < h; y++) {
@@ -417,12 +401,10 @@ FeatureSet extractFeatures(const Mat& gray, int height, int width) {
     auto keypoints = detectKeypoints(octaves);
 
     double t2 = nowMs();
-    // Independent per keypoint -- each one reads octaves (read-only) and writes
-    // only its own fields. dynamic, unlike the pyramid loops: assignOrientation
-    // samples a window of radius round(4.5 * scale), so a layer-3 keypoint
-    // covers 29x29 = 841 points where a layer-1 one covers 19x19 = 361, and
-    // which layer dominates is decided by the image. A range-for cannot carry
-    // the pragma; OpenMP needs a canonical loop with an explicit index.
+    // Independent per keypoint. dynamic, unlike the pyramid loops:
+    // assignOrientation samples a window of radius round(4.5 * scale), so a
+    // layer-3 keypoint covers 29x29 points where a layer-1 one covers 19x19.
+    // The explicit index is because OpenMP cannot take a range-for.
     const long nkp = (long)keypoints.size();
     #pragma omp parallel for schedule(dynamic, 16)
     for (long i = 0; i < nkp; i++) {
@@ -471,11 +453,9 @@ const double RATIO_THRESH = 0.75;
 // computeDescriptor() fills CELLS * CELLS * BINS = 4 * 4 * 8 entries.
 const int DESC_DIM = 128;
 
-// Every descriptor is its own ~1KB heap block, so the inner loop below would
-// chase nB unpredictable pointers per query keypoint. Copying them into one
-// contiguous nB x 128 array (2.6 MB at b08) turns that into a stream the
-// prefetcher can follow, and it stays warm in cache for the remaining queries.
-// Values are untouched.
+// Every descriptor is its own ~1KB heap block, so the match loop would chase
+// nB unpredictable pointers per query. One contiguous nB x 128 array (2.6 MB at
+// b08) makes it a stream the prefetcher can follow. Values are untouched.
 static std::vector<double> packDescriptors(const std::vector<Keypoint>& kps) {
     std::vector<double> flat(kps.size() * (size_t)DESC_DIM);
     for (size_t i = 0; i < kps.size(); i++)
@@ -489,14 +469,12 @@ std::vector<Match> matchFeatures(const FeatureSet& a, const FeatureSet& b) {
     const std::vector<double> fa = packDescriptors(a.keypoints);
     const std::vector<double> fb = packDescriptors(b.keypoints);
 
-    // One slot per query keypoint. Threads never write the same location, so
-    // this needs no critical section, and the accepted matches can still be
-    // emitted in ascending i afterwards -- the sequential order.
+    // One slot per query keypoint, so no critical section is needed, and the
+    // accepted matches can still be emitted in ascending i -- the serial order.
     std::vector<int> bestIdx(nA, -1);
     std::vector<double> bestD(nA, 1e18), secondD(nA, 1e18);
 
-    // static, not dynamic: every i scans the whole of B, so the iterations cost
-    // the same and there is no imbalance worth paying a scheduler for.
+    // static: every i scans the whole of B, so the iterations cost the same.
     #pragma omp parallel for schedule(static)
     for (long i = 0; i < nA; i++) {
         const double* da = &fa[i * DESC_DIM];
@@ -504,10 +482,9 @@ std::vector<Match> matchFeatures(const FeatureSet& a, const FeatureSet& b) {
         int bi = -1;
         for (long j = 0; j < nB; j++) {
             const double* db = &fb[j * DESC_DIM];
-            // Same summation order as descriptorDist above, and the sqrt is
-            // kept: comparing squared distances instead would save about 4% of
-            // this stage but is not bit-exact, since sqrt(x) < 0.75 * sqrt(y)
-            // and x < 0.5625 * y do not round the same way at the boundary.
+            // Same summation order as descriptorDist, and the sqrt is kept:
+            // sqrt(x) < 0.75 * sqrt(y) and x < 0.5625 * y do not round the same
+            // way at the boundary, so dropping it would not be bit-exact.
             double sum = 0.0;
             for (int k = 0; k < DESC_DIM; k++) {
                 const double d = da[k] - db[k];
@@ -580,8 +557,8 @@ int main(int argc, char** argv) {
     int widthA = 0, heightA = 0, widthB = 0, heightB = 0;
     size_t rowbytesA = 0, rowbytesB = 0;
 
-    // Two independent DEFLATE streams, so this is a genuine 2x -- unlike hw1-1,
-    // whose single stream cannot be split at all.
+    // Two independent DEFLATE streams, so this is a genuine 2x -- unlike
+    // hw1-1, whose single stream cannot be split at all.
     #pragma omp parallel sections
     {
         #pragma omp section

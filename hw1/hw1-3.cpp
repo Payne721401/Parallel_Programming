@@ -43,12 +43,10 @@ initial energy or less.
 #include <sched.h>
 #include <sys/mman.h>
 
-// Ask the kernel for transparent huge pages. A 7 GB array needs 1.7M 4 KB page
-// faults to materialise, and 1.7M TLB entries to address, against a TLB that
-// holds one or two thousand -- so the stencil misses on nearly every access.
-// 2 MB pages cut both by 512. glibc returns a pointer just past a chunk header
-// rather than on a page boundary, so round up first; losing the leading partial
-// page costs nothing against gigabytes.
+// Transparent huge pages: a 7 GB array needs 1.7M 4 KB faults to materialise
+// and 1.7M TLB entries to address, against a TLB holding one or two thousand.
+// 2 MB pages cut both by 512. glibc hands back a pointer just past a chunk
+// header, so round up to a page boundary first.
 static void adviseHuge(void* p, size_t bytes) {
 #ifdef MADV_HUGEPAGE
     const uintptr_t pg = 4096;
@@ -62,31 +60,27 @@ static void adviseHuge(void* p, size_t bytes) {
 #endif
 }
 
-// Set -DSTENCIL_SIMD=0 to drop the omp simd directive on the diffusion loop and
-// let GCC's cost model decide instead. The stencil is memory-bound at roughly
-// 1 flop per byte, so forcing vectorisation may well be a pessimisation.
+// -DSTENCIL_SIMD=0 drops the omp simd on the diffusion loop and lets GCC's
+// cost model decide instead.
 #ifndef STENCIL_SIMD
 #define STENCIL_SIMD 1
 #endif
 
-// Per-thread profile counters, one 64-byte line each so the threads never share
-// a cache line while accumulating. Slots: pass 1 work, wait at the barrier after
-// pass 1, pass 2 work, wait at the barrier after pass 2.
+// Per-thread profile counters, one 64-byte line each so the threads never
+// share a line. Slots: pass 1 work, wait after pass 1, pass 2 work, wait after 2.
 #define TPROF_STRIDE 8
 #define TPROF_SLOTS 4
 
 // ---------- staged timing ----------
-// Gated on PP_TIMING so the judge run stays clean:
-//   PP_TIMING=1 srun -n 1 -c 8 ./hw1-3 768 6 1087 0 out.txt
+// PP_TIMING=1 srun -n 1 -c 8 ./hw1-3 768 6 1087 0 out.txt
 static inline double nowMs() {
     return std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// Section 1.4 of the spec: "Use sched_getaffinity and CPU_COUNT to determine
-// how many cores are available to your program, and create that many threads."
-// Public cases run with 2, 4 or 8 cores, and the cluster overwrites
-// OMP_NUM_THREADS to 1, so the affinity mask is the only reliable source.
+// Spec 1.4: "Use sched_getaffinity and CPU_COUNT to determine how many cores
+// are available to your program, and create that many threads." The cluster
+// overwrites OMP_NUM_THREADS to 1, so the mask is the only reliable source.
 static int usableCpus() {
     cpu_set_t set;
     if (sched_getaffinity(0, sizeof(set), &set) == 0) {
@@ -96,9 +90,9 @@ static int usableCpus() {
     return omp_get_max_threads();
 }
 
-// These sit outside the protected range as of the 2026-09-29 handout, but the
-// spec defines the reference answer by this exact iteration count rather than
-// by the converged root, so changing the values still changes the answer.
+// Outside the protected range as of the 2026-09-29 handout, but the reference
+// answer is defined by this exact iteration count rather than by the converged
+// root, so changing the values still changes the answer.
 static const double R = 0.5;    // the reaction's strength
 static const int SUBSTEPS = 4;  // sub-steps of the reaction per time step
 static const int NEWTON = 3;    // Newton iterations per sub-step
@@ -133,15 +127,11 @@ static int inclusions(uint64_t seed, long N, Inclusion* out) {
 }
 // =========== END: DO NOT CHANGE ABOVE ===========
 
-// reactive() and react() below are ours to change now. react() in particular:
-// it is 12 exp() calls deep in a single dependency chain, one cell at a time.
-
 // A maximal run of consecutive reactive cells along k, as a flat index and a
-// length. Inclusions are spheres, so for a given (i, j) each one contributes at
-// most one contiguous range of k and the union of at most four of them is at
-// most four disjoint runs. Holding the reactive set this way costs about 3 MB
-// at N=960 against 890 MB for a full per-cell mat array, and it drops a read
-// stream from every time step.
+// length. Inclusions are spheres, so for a given (i, j) each contributes at
+// most one contiguous range of k, and four of them at most four disjoint runs.
+// About 3 MB at N=960 against 890 MB for a full per-cell mat array, and one
+// fewer read stream in every time step.
 struct Run {
     long p;
     int len;
@@ -158,16 +148,30 @@ static bool reactive(const Inclusion* inc, int B, long i, long j, long k) {
 
 // The new temperature of a reactive cell whose plain update would be r:
 // NEWTON iterations of Newton's method on x + R (e^x - 1) = r, from x = r.
-static double react(double r) {
-    double x = r;
+//
+// Advances RBLK cells at once. One cell's chain is SUBSTEPS * NEWTON = 12
+// exp() calls deep and each one feeds the next, so a lone cell spends nearly
+// all of its time waiting on latency with the execution units idle. Cells are
+// independent of each other, so interleaving them lets the out-of-order engine
+// overlap one cell's exp() with the next cell's and the chain depth stops being
+// the limit. Every cell still performs the same operations in the same order,
+// so each result is bit-identical to the one-at-a-time version.
+//
+// Not omp simd: a vector exp() means libmvec, which GCC only emits under
+// -ffast-math and which does not round the same way as the scalar one.
+#ifndef RBLK
+#define RBLK 8
+#endif
+static void reactBlock(double* x, int n) {
+    double prev[RBLK];
     for (int s = 0; s < SUBSTEPS; s++) {
-        const double prev = x;
-        for (int n = 0; n < NEWTON; n++) {
-            const double e = exp(x);
-            x -= (x + R * (e - 1.0) - prev) / (1.0 + R * e);
-        }
+        for (int c = 0; c < n; c++) prev[c] = x[c];
+        for (int it = 0; it < NEWTON; it++)
+            for (int c = 0; c < n; c++) {
+                const double ex = exp(x[c]);
+                x[c] -= (x[c] + R * (ex - 1.0) - prev[c]) / (1.0 + R * ex);
+            }
     }
-    return x;
 }
 
 int main(int argc, char** argv) {
@@ -196,21 +200,15 @@ int main(int argc, char** argv) {
     // (N+2)^3 with a halo of zeros around the block, so no cell is a special case.
     const long M = N + 2;
     const long SI = M * M, SJ = M;  // strides of i and j; k is contiguous
-    // calloc, not std::vector: a vector value-initialises, which memsets 11 GB
-    // of zeros at N=768 on one thread before a single cell is computed. calloc
-    // on an allocation this size gets anonymous pages from the kernel that are
-    // already zero, so it skips the memset entirely and the pages materialise
-    // on first touch -- inside the parallel generation loop below, which also
-    // places each page on the NUMA node of the thread that will keep using it.
-    // The halo stays zero either way, so the boundary semantics are unchanged.
+    // calloc, not std::vector: a vector value-initialises, memsetting 11 GB of
+    // zeros at N=768 on one thread before a single cell is computed. calloc at
+    // this size gets kernel anonymous pages that are already zero, so the pages
+    // materialise on first touch -- in the parallel loop below, which also puts
+    // each page on the NUMA node of the thread that will keep using it.
     const size_t cells = (size_t)M * M * M;
-    // Two O(N^3) arrays, u and a, both double. There used to be a third, unew,
-    // and a fourth of one byte per cell for the reactive set; the reactive set
-    // is a list of runs now, and the step updates u in place. At N=960 that is
-    // the difference between 22.3 GB and 14.2 GB against a 16 GB limit -- the
-    // spec says outright that the provided program exceeds it for large N.
-    // Both the PP_TIMING line and the out-of-memory message report through
-    // this, so keep it in step when an array is added or removed.
+    // Two O(N^3) arrays now, u and a. unew and the per-cell reactive byte are
+    // both gone: 14.2 GB at N=960 against 22.3 GB and a 16 GB limit. Keep
+    // BYTES_PER_CELL in step -- both PP_TIMING and the OOM message use it.
     const double BYTES_PER_CELL = 16.0;
     double* u = (double*)calloc(cells, sizeof(double));
     double* a = (double*)calloc(cells, sizeof(double));
@@ -228,10 +226,8 @@ int main(int argc, char** argv) {
     const int B = inclusions(seed, N, inc);
 
     // field() is a pure function of the index, so every cell is independent --
-    // no sequential PRNG state to carry. Running it in parallel also first-
-    // touches the pages from the thread that will keep using them. Nothing else
-    // is in this loop, so it is straight integer hashing over consecutive
-    // indices with no branch and no call that cannot be inlined.
+    // no sequential PRNG state to carry. Running it in parallel also
+    // first-touches each page from the thread that will keep using it.
     #pragma omp parallel for schedule(static)
     for (long i = 1; i <= N; i++)
         for (long j = 1; j <= N; j++) {
@@ -243,18 +239,16 @@ int main(int argc, char** argv) {
             }
         }
 
-    // The reactive set, as runs of consecutive k.
+    // The reactive set, as runs of consecutive k. A cell is inside a sphere
+    // when dk^2 <= r^2 - di^2 - dj^2, which for a given (i, j) is one interval
+    // of k bounded by ck +- sqrt(r^2 - di^2 - dj^2). Widening those bounds by a
+    // cell gives a window that certainly contains every reactive k, and
+    // reactive() then decides each k inside it -- so the set is exactly what a
+    // full scan produces, with the predicate evaluated O(reactive cells) times
+    // instead of N^3.
     //
-    // An inclusion is a sphere, so cell (i, j, k) is inside it when
-    // dk^2 <= r^2 - di^2 - dj^2; for a given (i, j) that is one interval of k,
-    // bounded by ck +- sqrt(r^2 - di^2 - dj^2). Taking those bounds a cell wide
-    // on each side gives a window that certainly contains every reactive k, and
-    // reactive() itself then decides each k inside the window -- so the set is
-    // exactly what a full scan would produce, while the number of predicate
-    // evaluations drops from N^3 to roughly the number of reactive cells.
-    //
-    // Each thread owns whole i planes, so the per-plane buffers need no locking,
-    // and concatenating them in i order afterwards keeps the list deterministic.
+    // Each thread owns whole i planes, so the per-plane buffers need no lock,
+    // and concatenating them in i order keeps the list deterministic.
     std::vector<std::vector<Run> > runsPerPlane(N + 1);
 
     if (B > 0) {
@@ -304,9 +298,9 @@ int main(int argc, char** argv) {
 
     const double tGen = nowMs();
 
-    // The energy of the block: the sum of u^2 over its cells.
-    // Only used for energy0 now; the per-step energy is fused into the stencil
-    // loop below so the array is swept once per step instead of twice.
+    // The energy of the block: the sum of u^2 over its cells. Only energy0
+    // uses this now -- the per-step energy is fused into the stencil loop, so
+    // the array is swept once per step instead of twice.
     auto energy_of = [&](const double* v) {
         double energy = 0.0;
         #pragma omp parallel for schedule(static) reduction(+ : energy)
@@ -326,19 +320,23 @@ int main(int argc, char** argv) {
     const double tEnergy0 = nowMs();
     double tStencilAcc = 0.0;   // the per-step energy is folded into this now
 
-    // Totals alone hide imbalance: eight threads averaging 100 ms tell you
-    // nothing about whether one of them took 400 ms while the rest waited. Time
-    // each pass and each barrier per thread instead, and report max against
-    // mean -- the barrier columns are where imbalance actually shows up.
+    // Totals hide imbalance: eight threads averaging 100 ms say nothing about
+    // one of them taking 400 ms while the rest waited. Time each pass and each
+    // barrier per thread instead, and report max against mean.
+    //
+    // Gated on prof, because the clock reads and the barrier that separates the
+    // wait from the work are per step and per thread, and the judge never asks
+    // for them. prof is read once here, so it is uniform across the team --
+    // which is what makes it legal to put a barrier under it.
+    const bool prof = (getenv("PP_TIMING") != nullptr);
     std::vector<double> tprof((size_t)nthreads * TPROF_STRIDE, 0.0);
 
     // Scratch for the in-place update. Writing the new u[i] destroys values
     // that plane i+1, row j+1 and cell k+1 still need, so each thread carries
-    // the old plane i-1, the old row j-1 and the old row j, and reads the three
-    // "+1" neighbours straight out of u while they are still untouched.
-    // firstPlane is how a thread publishes its own first plane to the thread
-    // below, whose last plane needs it after this thread has overwritten it.
-    // These are O(N^2), so 118 MB at N=960 against the 7.1 GB that unew cost.
+    // the old plane i-1 and the old rows j-1 and j, and reads the three "+1"
+    // neighbours out of u while they are still untouched. firstPlanes is how a
+    // thread publishes its own first plane to the thread below, whose last
+    // plane needs it. O(N^2): 118 MB at N=960 against the 7.1 GB unew cost.
     const size_t planeDoubles = (size_t)M * M;
     double* planeBufs = (double*)calloc((size_t)nthreads * planeDoubles, sizeof(double));
     double* firstPlanes = (double*)calloc((size_t)nthreads * planeDoubles, sizeof(double));
@@ -355,24 +353,20 @@ int main(int argc, char** argv) {
 
         double e = 0.0;
 
-        // One parallel region for both passes, with nowait on each omp for and
-        // an explicit barrier after it, so the wait can be timed separately
-        // from the work.
+        // One parallel region for both passes.
         #pragma omp parallel reduction(+ : e)
         {
             const int tid = omp_get_thread_num();
             const int P = omp_get_num_threads();
             double* tp = &tprof[(size_t)tid * TPROF_STRIDE];
 
-            // A manual slab split rather than omp for: the rolling buffers have
-            // to know exactly which planes this thread owns, and which plane the
-            // thread above is about to overwrite. Uniform work per plane, so an
-            // even split is the right one -- the reaction, which is what made
-            // the old fused loop need dynamic, is pass 2's problem now.
-            // Spread the remainder one plane at a time rather than rounding the
-            // chunk up: at N=700 with 8 threads, ceil(700/8) = 89 gives seven
-            // threads 89 planes and the last one 77, a 13% gap that the whole
-            // team then waits on. This gives four threads 88 and four 87.
+            // A manual slab split rather than omp for: the rolling buffers
+            // have to know which planes this thread owns, and which plane the
+            // thread above is about to overwrite. Work per plane is uniform, so
+            // spread the remainder one plane at a time rather than rounding the
+            // chunk up -- at N=700 with 8 threads, ceil(700/8) = 89 would give
+            // seven threads 89 planes and the last 77, a 13% gap the whole team
+            // waits on. This gives four threads 88 and four 87.
             const long span = N / P, extra = N % P;
             const long cnt = span + (tid < extra ? 1 : 0);
             const long lo = 1 + (long)tid * span + (tid < extra ? tid : extra);
@@ -384,35 +378,33 @@ int main(int argc, char** argv) {
             double* row = rowBufs + (size_t)tid * 2 * M;
             double* cur = row + M;
 
-            const double w0 = omp_get_wtime();
+            const double w0 = prof ? omp_get_wtime() : 0.0;
 
-            // Seed the rolling plane with the old plane below this slab, and
+            // Seed the rolling plane from the old plane below this slab and
             // publish this slab's own first plane, both before anyone starts
-            // overwriting. Plane 0 and plane N+1 are halo and never written, so
-            // the outermost threads need nothing from a neighbour.
+            // overwriting. Planes 0 and N+1 are halo and never written, so the
+            // outermost threads need nothing from a neighbour.
             if (mine) {
                 memcpy(plane, u + (lo - 1) * SI, planeDoubles * sizeof(double));
                 memcpy(myFirst, u + lo * SI, planeDoubles * sizeof(double));
             }
             #pragma omp barrier
 
-            // Pass 1: plain diffusion for every cell, in place. The k loop has
-            // no branch and no call now that the reaction has moved to pass 2,
-            // and every value it reads comes from a buffer or from a part of u
-            // this thread has not reached yet, so there is no dependence between
-            // iterations and it vectorises.
+            // Pass 1: plain diffusion for every cell, in place. With the
+            // reaction moved to pass 2 the k loop has no branch and no call,
+            // and everything it reads comes from a buffer or from part of u
+            // this thread has not reached, so it carries no dependence.
             //
-            // omp simd is what makes the reduction legal to vectorise: e += r*r
-            // needs its additions regrouped, and GCC will not do that unprompted
-            // without -ffast-math, which we cannot afford globally. It also
-            // spares the runtime aliasing check GCC otherwise inserts around the
-            // u[p] write and the u[p + SJ] read. The temperatures are unaffected
-            // either way -- every u[p] is the same expression in the same order.
+            // omp simd is what makes e += r*r legal to vectorise -- GCC will
+            // not regroup the additions unprompted without -ffast-math, which
+            // we cannot afford globally. It also spares the runtime aliasing
+            // check around the u[p] write and the u[p + SJ] read. Temperatures
+            // are unaffected: every u[p] is the same expression, same order.
             if (mine) {
                 for (long i = lo; i <= hi; i++) {
-                    // Old plane i+1. Inside the slab it is still untouched; at
-                    // the top of the slab the thread above overwrites its first
-                    // plane immediately, so read the copy it published.
+                    // Old plane i+1: untouched inside the slab, but at the top
+                    // the thread above overwrites its first plane immediately,
+                    // so read the copy it published.
                     const double* up1 =
                         (i < hi) ? (u + (i + 1) * SI)
                                  : ((tid + 1 < P && hi < N)
@@ -425,9 +417,8 @@ int main(int argc, char** argv) {
                     for (long j = 1; j <= N; j++) {
                         const long base = i * SI + j * SJ;
                         const long qb = j * SJ;
-                        // Stash the old row before overwriting any of it, so the
-                        // k-1 and k+1 neighbours stay available and the loop
-                        // carries no dependence.
+                        // Stash the old row before overwriting any of it, so
+                        // the k-1 and k+1 neighbours stay available.
                         memcpy(cur, u + base, M * sizeof(double));
 #if STENCIL_SIMD
                         #pragma omp simd reduction(+ : e)
@@ -453,36 +444,59 @@ int main(int argc, char** argv) {
                 }
             }
 
-            const double w1 = omp_get_wtime();
-            #pragma omp barrier
-            const double w2 = omp_get_wtime();
+            const double w1 = prof ? omp_get_wtime() : 0.0;
+            double w2 = w1, w3 = w1;
 
             // Pass 2: replace the plain value in each reactive cell with the
             // reacted one. Pass 1 already added pre^2 to the energy, so adding
             // the difference costs O(reactive cells) instead of another full
             // sweep. dynamic: a run is a chord through a sphere, so lengths
             // vary from 1 to twice the radius.
-            #pragma omp for schedule(dynamic, 64) nowait
-            for (long t = 0; t < nRuns; t++) {
-                const long p0 = runs[t].p;
-                const int len = runs[t].len;
-                for (int m = 0; m < len; m++) {
-                    const long p = p0 + m;
-                    const double pre = u[p];
-                    const double post = react(pre);
-                    u[p] = post;
-                    e += post * post - pre * pre;
+            //
+            // Skipped outright when the seed yields no inclusions -- four of
+            // the ten public cases. nRuns is shared and fixed before the region
+            // starts, so every thread takes the same branch, which is what a
+            // barrier and an omp for require: the whole team, or none of it.
+            if (nRuns > 0) {
+                // A run can lie in any slab, so pass 2 reads cells that other
+                // threads wrote in pass 1. This barrier is load-bearing.
+                #pragma omp barrier
+                w2 = prof ? omp_get_wtime() : 0.0;
+
+                #pragma omp for schedule(dynamic, 64) nowait
+                for (long t = 0; t < nRuns; t++) {
+                    const long p0 = runs[t].p;
+                    const int len = runs[t].len;
+                    for (int m = 0; m < len; m += RBLK) {
+                        const int n = (len - m < RBLK) ? (len - m) : RBLK;
+                        double pre[RBLK], post[RBLK];
+                        for (int c = 0; c < n; c++)
+                            pre[c] = post[c] = u[p0 + m + c];
+                        reactBlock(post, n);
+                        // Ascending c inside ascending m is the order the
+                        // one-cell-at-a-time version used, so this thread's
+                        // partial sum is unchanged.
+                        for (int c = 0; c < n; c++) {
+                            u[p0 + m + c] = post[c];
+                            e += post[c] * post[c] - pre[c] * pre[c];
+                        }
+                    }
                 }
+                w3 = prof ? omp_get_wtime() : 0.0;
             }
 
-            const double w3 = omp_get_wtime();
-            #pragma omp barrier
-            const double w4 = omp_get_wtime();
-
-            tp[0] += (w1 - w0) * 1000.0;   // pass 1 work
-            tp[1] += (w2 - w1) * 1000.0;   // waiting at the barrier after pass 1
-            tp[2] += (w3 - w2) * 1000.0;   // pass 2 work
-            tp[3] += (w4 - w3) * 1000.0;   // waiting at the barrier after pass 2
+            // Nothing below needs another thread's writes, so the region's own
+            // closing barrier is the last one required. The barrier here exists
+            // only to separate the wait from the work in the profile, so it is
+            // taken only when the profile is being collected.
+            if (prof) {
+                #pragma omp barrier
+                const double w4 = omp_get_wtime();
+                tp[0] += (w1 - w0) * 1000.0;   // pass 1 work
+                tp[1] += (w2 - w1) * 1000.0;   // wait at the barrier after 1
+                tp[2] += (w3 - w2) * 1000.0;   // pass 2 work
+                tp[3] += (w4 - w3) * 1000.0;   // wait at the barrier after 2
+            }
         }
 
         steps++;
@@ -511,7 +525,7 @@ int main(int argc, char** argv) {
             }
     fclose(out);
 
-    if (getenv("PP_TIMING")) {
+    if (prof) {
         const double tEnd = nowMs();
         fprintf(stderr,
                 "threads %2d | N %ld M %ld | T %d steps %d | arrays %.2f GB\n"
@@ -522,9 +536,8 @@ int main(int argc, char** argv) {
                 tAlloc - tStart, tGen - tAlloc, tEnergy0 - tGen,
                 tStencilAcc, tEnd - tSteps, tEnd - tStart);
 
-        // max against mean is the point: a barrier column whose max is well
-        // above its mean means the threads finished the preceding pass at very
-        // different times, which is imbalance rather than slow work.
+        // max against mean is the point: a barrier whose max is well above its
+        // mean means imbalance rather than slow work.
         static const char* slotName[TPROF_SLOTS] = {
             "pass1 stencil", "barrier after 1", "pass2 react", "barrier after 2"};
         fprintf(stderr, "  per-thread, summed over steps (ms)\n");
