@@ -93,32 +93,33 @@ void applyFilterToChannel(
     }
 }
 
+// Takes the channel planes the decoder already produced, rather than an
+// interleaved image it would have to split again. That removes a 219 MB
+// vector<vector<RGB>> at 18 Mpixel -- allocated and zero-filled before being
+// overwritten -- along with the whole pass that copied it into planes.
 void adaptiveFilterRGB(
-    const std::vector<std::vector<RGB>>& inputImage,
+    const std::vector<std::vector<int>>& redChannel,
+    const std::vector<std::vector<int>>& greenChannel,
+    const std::vector<std::vector<int>>& blueChannel,
     std::vector<std::vector<RGB>>& outputImage,
     int height, 
     int width
 ) {
-    std::vector<std::vector<int>> redChannel(height, std::vector<int>(width));
-    std::vector<std::vector<int>> greenChannel(height, std::vector<int>(width));
-    std::vector<std::vector<int>> blueChannel(height, std::vector<int>(width));
-
-    #pragma omp parallel for schedule(static)
-    for (int x = 0; x < height; x++) {
-        for (int y = 0; y < width; y++) {
-            redChannel[x][y] = inputImage[x][y].r;
-            greenChannel[x][y] = inputImage[x][y].g;
-            blueChannel[x][y] = inputImage[x][y].b;
-        }
-    }
-
     std::vector<std::vector<int>> kernelSizes(height, std::vector<int>(width));
 
     #pragma omp parallel for schedule(static)
     for (int x = 0; x < height; x++) {
         for (int y = 0; y < width; y++) {
-            double brightness = calculateLuminance(inputImage[x][y]);
-            kernelSizes[x][y] = determineKernelSize(brightness);
+            // Assembled back into an RGB so calculateLuminance evaluates the
+            // same double expression in the same order. The integer form
+            // 299r + 587g + 114b > 128000 is not equivalent: 0.299, 0.587 and
+            // 0.114 are inexact in binary, so a flat mid-grey region would pick
+            // a different kernel for every one of its pixels.
+            RGB px;
+            px.r = redChannel[x][y];
+            px.g = greenChannel[x][y];
+            px.b = blueChannel[x][y];
+            kernelSizes[x][y] = determineKernelSize(calculateLuminance(px));
         }
     }
 
@@ -142,7 +143,16 @@ void adaptiveFilterRGB(
 
 // ---------- shared PNG I/O ----------
 
-void read_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
+// Decodes straight into the three channel planes the filter wants. Two changes
+// beyond that: png_set_strip_alpha instead of png_set_filler, because the old
+// path expanded RGB to RGBA and then discarded the alpha, costing libpng an
+// extra transform pass and 25% more output traffic; and one contiguous buffer
+// for all the rows instead of a malloc per row, which was 3700 allocations on
+// the largest public case.
+void read_png_planes(char* file_name,
+                     std::vector<std::vector<int>>& redChannel,
+                     std::vector<std::vector<int>>& greenChannel,
+                     std::vector<std::vector<int>>& blueChannel) {
     FILE *fp = fopen(file_name, "rb");
     if (!fp) {
         std::cerr << "Error: Cannot open file " << file_name << std::endl;
@@ -191,10 +201,7 @@ void read_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
     if(png_get_valid(png, info, PNG_INFO_tRNS))
         png_set_tRNS_to_alpha(png);
 
-    if(color_type == PNG_COLOR_TYPE_RGB ||
-       color_type == PNG_COLOR_TYPE_GRAY ||
-       color_type == PNG_COLOR_TYPE_PALETTE)
-        png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+    png_set_strip_alpha(png);   // every source type reduces to plain RGB
 
     if(color_type == PNG_COLOR_TYPE_GRAY ||
        color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
@@ -202,28 +209,34 @@ void read_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
 
     png_read_update_info(png, info);
 
+    const size_t rowbytes = png_get_rowbytes(png, info);
+    png_byte* raw = (png_byte*)malloc(rowbytes * (size_t)height);
     png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
-    for(int y = 0; y < height; y++) {
-        row_pointers[y] = (png_byte*)malloc(png_get_rowbytes(png,info));
+    if (!raw || !row_pointers) {
+        std::cerr << "Error: out of memory for " << width << "x" << height << std::endl;
+        exit(EXIT_FAILURE);
     }
+    for (int y = 0; y < height; y++)
+        row_pointers[y] = raw + (size_t)y * rowbytes;
 
     png_read_image(png, row_pointers);
 
     fclose(fp);
 
-    image.resize(height, std::vector<RGB>(width));
+    redChannel.assign(height, std::vector<int>(width));
+    greenChannel.assign(height, std::vector<int>(width));
+    blueChannel.assign(height, std::vector<int>(width));
     #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
-        png_bytep row = row_pointers[y];
+        const png_byte* row = raw + (size_t)y * rowbytes;
         for (int x = 0; x < width; x++) {
-            png_bytep px = &(row[x * 4]);
-            image[y][x].r = px[0];
-            image[y][x].g = px[1];
-            image[y][x].b = px[2];
+            redChannel[y][x] = row[x * 3];
+            greenChannel[y][x] = row[x * 3 + 1];
+            blueChannel[y][x] = row[x * 3 + 2];
         }
-        free(row_pointers[y]);
     }
     free(row_pointers);
+    free(raw);
 
     png_destroy_read_struct(&png, &info, nullptr);
 }
@@ -330,11 +343,11 @@ int main(int argc, char** argv) {
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    std::vector<std::vector<RGB>> inputImage;
-    read_png_file(input_file, inputImage);
+    std::vector<std::vector<int>> redChannel, greenChannel, blueChannel;
+    read_png_planes(input_file, redChannel, greenChannel, blueChannel);
 
-    int height = inputImage.size();
-    int width = inputImage[0].size();
+    int height = redChannel.size();
+    int width = redChannel[0].size();
 
     auto t1 = std::chrono::high_resolution_clock::now();
 
@@ -342,7 +355,7 @@ int main(int argc, char** argv) {
 
     auto t2 = std::chrono::high_resolution_clock::now();
 
-    adaptiveFilterRGB(inputImage, outputImage, height, width);
+    adaptiveFilterRGB(redChannel, greenChannel, blueChannel, outputImage, height, width);
 
     auto t3 = std::chrono::high_resolution_clock::now();
 
