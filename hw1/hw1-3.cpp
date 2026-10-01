@@ -48,6 +48,11 @@ initial energy or less.
 #define STENCIL_SIMD 1
 #endif
 
+// How many cells reactBatch() advances at once. Sweep with -DREACT_BATCH=8.
+#ifndef REACT_BATCH
+#define REACT_BATCH 4
+#endif
+
 // Per-thread profile counters, one 64-byte line each so the threads never share
 // a cache line while accumulating. Slots: pass 1 work, wait at the barrier after
 // pass 1, pass 2 work, wait at the barrier after pass 2.
@@ -147,6 +152,38 @@ static double react(double r) {
         }
     }
     return x;
+}
+
+// react() advanced for REACT_BATCH cells together, in place.
+//
+// The scalar version is SUBSTEPS * NEWTON = 12 exp() calls where each one waits
+// on the previous call's result, so almost all of its cost is that chain:
+// measured at about 80 cycles per exp against exp's own ~15-cycle throughput.
+// Interleaving several cells puts that many independent chains in flight, and
+// the out-of-order window (hundreds of instructions, against roughly 30 for one
+// exp) is wide enough to overlap them.
+//
+// Every cell still walks the identical sequence -- prev = x, then NEWTON rounds
+// of exp and update, SUBSTEPS times, with the same expression and the same
+// operands -- so each result is bit-identical to react(). Only the interleaving
+// changes, and interleaving independent chains is not a reordering of any one
+// chain.
+//
+// Note what is deliberately absent: no omp simd on the exp() loop. That would
+// let GCC call glibc's vector exp, which is allowed 4 ULP against the scalar
+// routine's sub-ULP. FMA's roughly 1 ULP was already enough to turn p01 and p03
+// into WA, so 4 ULP is out of the question.
+static void reactBatch(double* x) {
+    for (int s = 0; s < SUBSTEPS; s++) {
+        double prev[REACT_BATCH];
+        for (int v = 0; v < REACT_BATCH; v++) prev[v] = x[v];
+        for (int n = 0; n < NEWTON; n++) {
+            double ex[REACT_BATCH];
+            for (int v = 0; v < REACT_BATCH; v++) ex[v] = exp(x[v]);
+            for (int v = 0; v < REACT_BATCH; v++)
+                x[v] -= (x[v] + R * (ex[v] - 1.0) - prev[v]) / (1.0 + R * ex[v]);
+        }
+    }
 }
 
 int main(int argc, char** argv) {
@@ -342,7 +379,18 @@ int main(int argc, char** argv) {
             for (long t = 0; t < nRuns; t++) {
                 const long p0 = runs[t].p;
                 const int len = runs[t].len;
-                for (int m = 0; m < len; m++) {
+                int m = 0;
+                for (; m + REACT_BATCH <= len; m += REACT_BATCH) {
+                    double x[REACT_BATCH], pre[REACT_BATCH];
+                    for (int v = 0; v < REACT_BATCH; v++)
+                        pre[v] = x[v] = UN[p0 + m + v];
+                    reactBatch(x);
+                    for (int v = 0; v < REACT_BATCH; v++) {
+                        UN[p0 + m + v] = x[v];
+                        e += x[v] * x[v] - pre[v] * pre[v];
+                    }
+                }
+                for (; m < len; m++) {   // tail of a run shorter than a batch
                     const long p = p0 + m;
                     const double pre = UN[p];
                     const double post = react(pre);
