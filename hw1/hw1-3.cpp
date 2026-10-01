@@ -35,6 +35,7 @@ initial energy or less.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <utility>
 #include <vector>
 #include <chrono>
@@ -46,11 +47,6 @@ initial energy or less.
 // 1 flop per byte, so forcing vectorisation may well be a pessimisation.
 #ifndef STENCIL_SIMD
 #define STENCIL_SIMD 1
-#endif
-
-// How many cells reactBatch() advances at once. Sweep with -DREACT_BATCH=8.
-#ifndef REACT_BATCH
-#define REACT_BATCH 4
 #endif
 
 // Per-thread profile counters, one 64-byte line each so the threads never share
@@ -154,38 +150,6 @@ static double react(double r) {
     return x;
 }
 
-// react() advanced for REACT_BATCH cells together, in place.
-//
-// The scalar version is SUBSTEPS * NEWTON = 12 exp() calls where each one waits
-// on the previous call's result, so almost all of its cost is that chain:
-// measured at about 80 cycles per exp against exp's own ~15-cycle throughput.
-// Interleaving several cells puts that many independent chains in flight, and
-// the out-of-order window (hundreds of instructions, against roughly 30 for one
-// exp) is wide enough to overlap them.
-//
-// Every cell still walks the identical sequence -- prev = x, then NEWTON rounds
-// of exp and update, SUBSTEPS times, with the same expression and the same
-// operands -- so each result is bit-identical to react(). Only the interleaving
-// changes, and interleaving independent chains is not a reordering of any one
-// chain.
-//
-// Note what is deliberately absent: no omp simd on the exp() loop. That would
-// let GCC call glibc's vector exp, which is allowed 4 ULP against the scalar
-// routine's sub-ULP. FMA's roughly 1 ULP was already enough to turn p01 and p03
-// into WA, so 4 ULP is out of the question.
-static void reactBatch(double* x) {
-    for (int s = 0; s < SUBSTEPS; s++) {
-        double prev[REACT_BATCH];
-        for (int v = 0; v < REACT_BATCH; v++) prev[v] = x[v];
-        for (int n = 0; n < NEWTON; n++) {
-            double ex[REACT_BATCH];
-            for (int v = 0; v < REACT_BATCH; v++) ex[v] = exp(x[v]);
-            for (int v = 0; v < REACT_BATCH; v++)
-                x[v] -= (x[v] + R * (ex[v] - 1.0) - prev[v]) / (1.0 + R * ex[v]);
-        }
-    }
-}
-
 int main(int argc, char** argv) {
     if (argc != 6) {
         fprintf(stderr, "usage: %s <N> <T> <seed> <theta> <output>\n", argv[0]);
@@ -220,15 +184,17 @@ int main(int argc, char** argv) {
     // places each page on the NUMA node of the thread that will keep using it.
     // The halo stays zero either way, so the boundary semantics are unchanged.
     const size_t cells = (size_t)M * M * M;
-    // u + unew + a, all double. The reactive set used to be a fourth array of
-    // one byte per cell; it is a list of runs now. Both the PP_TIMING line and
-    // the out-of-memory message report through this, so keep it in step when an
-    // array is added or removed.
-    const double BYTES_PER_CELL = 24.0;
+    // Two O(N^3) arrays, u and a, both double. There used to be a third, unew,
+    // and a fourth of one byte per cell for the reactive set; the reactive set
+    // is a list of runs now, and the step updates u in place. At N=960 that is
+    // the difference between 22.3 GB and 14.2 GB against a 16 GB limit -- the
+    // spec says outright that the provided program exceeds it for large N.
+    // Both the PP_TIMING line and the out-of-memory message report through
+    // this, so keep it in step when an array is added or removed.
+    const double BYTES_PER_CELL = 16.0;
     double* u = (double*)calloc(cells, sizeof(double));
-    double* unew = (double*)calloc(cells, sizeof(double));
     double* a = (double*)calloc(cells, sizeof(double));
-    if (!u || !unew || !a) {
+    if (!u || !a) {
         fprintf(stderr, "out of memory for N=%ld (%.2f GB)\n",
                 N, cells * BYTES_PER_CELL / (1024.0 * 1024.0 * 1024.0));
         return 1;
@@ -310,15 +276,24 @@ int main(int argc, char** argv) {
     // mean -- the barrier columns are where imbalance actually shows up.
     std::vector<double> tprof((size_t)nthreads * TPROF_STRIDE, 0.0);
 
+    // Scratch for the in-place update. Writing the new u[i] destroys values
+    // that plane i+1, row j+1 and cell k+1 still need, so each thread carries
+    // the old plane i-1, the old row j-1 and the old row j, and reads the three
+    // "+1" neighbours straight out of u while they are still untouched.
+    // firstPlane is how a thread publishes its own first plane to the thread
+    // below, whose last plane needs it after this thread has overwritten it.
+    // These are O(N^2), so 118 MB at N=960 against the 7.1 GB that unew cost.
+    const size_t planeDoubles = (size_t)M * M;
+    double* planeBufs = (double*)calloc((size_t)nthreads * planeDoubles, sizeof(double));
+    double* firstPlanes = (double*)calloc((size_t)nthreads * planeDoubles, sizeof(double));
+    double* rowBufs = (double*)calloc((size_t)nthreads * 2 * M, sizeof(double));
+    if (!planeBufs || !firstPlanes || !rowBufs) {
+        fprintf(stderr, "out of memory for the in-place scratch buffers\n");
+        return 1;
+    }
+
     while (steps < T) {
         const double s0 = nowMs();
-
-        // __restrict: these are three separate calloc blocks, but as plain
-        // double* the compiler has to assume they might overlap, and that alone
-        // stops the k loop from vectorising.
-        const double* __restrict U = u;
-        const double* __restrict A = a;
-        double* __restrict UN = unew;
 
         double e = 0.0;
 
@@ -327,44 +302,93 @@ int main(int argc, char** argv) {
         // from the work.
         #pragma omp parallel reduction(+ : e)
         {
-            double* tp = &tprof[(size_t)omp_get_thread_num() * TPROF_STRIDE];
+            const int tid = omp_get_thread_num();
+            const int P = omp_get_num_threads();
+            double* tp = &tprof[(size_t)tid * TPROF_STRIDE];
+
+            // A manual slab split rather than omp for: the rolling buffers have
+            // to know exactly which planes this thread owns, and which plane the
+            // thread above is about to overwrite. Uniform work per plane, so an
+            // even split is the right one -- the reaction, which is what made
+            // the old fused loop need dynamic, is pass 2's problem now.
+            const long chunk = (N + P - 1) / P;
+            const long lo = 1 + (long)tid * chunk;
+            const long hi = (lo + chunk - 1 < N) ? lo + chunk - 1 : N;
+            const bool mine = (lo <= N);
+
+            double* plane = planeBufs + (size_t)tid * planeDoubles;
+            double* myFirst = firstPlanes + (size_t)tid * planeDoubles;
+            double* row = rowBufs + (size_t)tid * 2 * M;
+            double* cur = row + M;
+
             const double w0 = omp_get_wtime();
 
-            // Pass 1: plain diffusion for every cell. No branch and no call in
-            // the k loop now that the reaction has moved out, and static,
-            // because with react() gone every cell costs the same. (It needed
-            // dynamic before: reactive cells run ~30x a plain one and sit
-            // inside spheres spanning only ~0.3 N planes, so a fixed split left
-            // most threads idle.)
+            // Seed the rolling plane with the old plane below this slab, and
+            // publish this slab's own first plane, both before anyone starts
+            // overwriting. Plane 0 and plane N+1 are halo and never written, so
+            // the outermost threads need nothing from a neighbour.
+            if (mine) {
+                memcpy(plane, u + (lo - 1) * SI, planeDoubles * sizeof(double));
+                memcpy(myFirst, u + lo * SI, planeDoubles * sizeof(double));
+            }
+            #pragma omp barrier
+
+            // Pass 1: plain diffusion for every cell, in place. The k loop has
+            // no branch and no call now that the reaction has moved to pass 2,
+            // and every value it reads comes from a buffer or from a part of u
+            // this thread has not reached yet, so there is no dependence between
+            // iterations and it vectorises.
             //
-            // omp simd is what would make the reduction legal to vectorise:
-            // e += r * r needs its additions regrouped, and GCC will not do
-            // that unprompted without -ffast-math, which we cannot afford
-            // globally. Whether it is worth doing is another question -- see
-            // STENCIL_SIMD. The temperatures are unaffected either way, since
-            // every UN[p] is the same expression evaluated in the same order.
-            #pragma omp for schedule(static) nowait
-            for (long i = 1; i <= N; i++)
-                for (long j = 1; j <= N; j++) {
-                    const long base = i * SI + j * SJ;
+            // omp simd is what makes the reduction legal to vectorise: e += r*r
+            // needs its additions regrouped, and GCC will not do that unprompted
+            // without -ffast-math, which we cannot afford globally. It also
+            // spares the runtime aliasing check GCC otherwise inserts around the
+            // u[p] write and the u[p + SJ] read. The temperatures are unaffected
+            // either way -- every u[p] is the same expression in the same order.
+            if (mine) {
+                for (long i = lo; i <= hi; i++) {
+                    // Old plane i+1. Inside the slab it is still untouched; at
+                    // the top of the slab the thread above overwrites its first
+                    // plane immediately, so read the copy it published.
+                    const double* up1 =
+                        (i < hi) ? (u + (i + 1) * SI)
+                                 : ((tid + 1 < P && hi < N)
+                                        ? firstPlanes + (size_t)(tid + 1) * planeDoubles
+                                        : u + (hi + 1) * SI);
+
+                    // Row 0 of this plane is halo, so it is still the old row.
+                    memcpy(row, u + i * SI, M * sizeof(double));
+
+                    for (long j = 1; j <= N; j++) {
+                        const long base = i * SI + j * SJ;
+                        const long qb = j * SJ;
+                        // Stash the old row before overwriting any of it, so the
+                        // k-1 and k+1 neighbours stay available and the loop
+                        // carries no dependence.
+                        memcpy(cur, u + base, M * sizeof(double));
 #if STENCIL_SIMD
-                    #pragma omp simd reduction(+ : e)
+                        #pragma omp simd reduction(+ : e)
 #endif
-                    for (long k = 1; k <= N; k++) {
-                        const long p = base + k;
-                        const double up = U[p], ap = A[p];
-                        double flux = 0.0;
-                        flux += (ap + A[p - SI]) * (U[p - SI] - up);
-                        flux += (ap + A[p + SI]) * (U[p + SI] - up);
-                        flux += (ap + A[p - SJ]) * (U[p - SJ] - up);
-                        flux += (ap + A[p + SJ]) * (U[p + SJ] - up);
-                        flux += (ap + A[p - 1]) * (U[p - 1] - up);
-                        flux += (ap + A[p + 1]) * (U[p + 1] - up);
-                        const double r = up + flux * (1.0 / 12.0);
-                        UN[p] = r;
-                        e += r * r;
+                        for (long k = 1; k <= N; k++) {
+                            const long p = base + k;
+                            const long q = qb + k;
+                            const double up = cur[k], ap = a[p];
+                            double flux = 0.0;
+                            flux += (ap + a[p - SI]) * (plane[q] - up);
+                            flux += (ap + a[p + SI]) * (up1[q] - up);
+                            flux += (ap + a[p - SJ]) * (row[k] - up);
+                            flux += (ap + a[p + SJ]) * (u[p + SJ] - up);
+                            flux += (ap + a[p - 1]) * (cur[k - 1] - up);
+                            flux += (ap + a[p + 1]) * (cur[k + 1] - up);
+                            const double r = up + flux * (1.0 / 12.0);
+                            plane[q] = up;   // this plane becomes "i-1" next
+                            u[p] = r;
+                            e += r * r;
+                        }
+                        std::swap(row, cur);   // this row becomes "j-1" next
                     }
                 }
+            }
 
             const double w1 = omp_get_wtime();
             #pragma omp barrier
@@ -379,22 +403,11 @@ int main(int argc, char** argv) {
             for (long t = 0; t < nRuns; t++) {
                 const long p0 = runs[t].p;
                 const int len = runs[t].len;
-                int m = 0;
-                for (; m + REACT_BATCH <= len; m += REACT_BATCH) {
-                    double x[REACT_BATCH], pre[REACT_BATCH];
-                    for (int v = 0; v < REACT_BATCH; v++)
-                        pre[v] = x[v] = UN[p0 + m + v];
-                    reactBatch(x);
-                    for (int v = 0; v < REACT_BATCH; v++) {
-                        UN[p0 + m + v] = x[v];
-                        e += x[v] * x[v] - pre[v] * pre[v];
-                    }
-                }
-                for (; m < len; m++) {   // tail of a run shorter than a batch
+                for (int m = 0; m < len; m++) {
                     const long p = p0 + m;
-                    const double pre = UN[p];
+                    const double pre = u[p];
                     const double post = react(pre);
-                    UN[p] = post;
+                    u[p] = post;
                     e += post * post - pre * pre;
                 }
             }
@@ -409,7 +422,6 @@ int main(int argc, char** argv) {
             tp[3] += (w4 - w3) * 1000.0;   // waiting at the barrier after pass 2
         }
 
-        std::swap(u, unew);
         steps++;
         energy = e;
         const double s1 = nowMs();
@@ -470,7 +482,9 @@ int main(int argc, char** argv) {
     }
 
     free(u);
-    free(unew);
     free(a);
+    free(planeBufs);
+    free(firstPlanes);
+    free(rowBufs);
     return 0;
 }
