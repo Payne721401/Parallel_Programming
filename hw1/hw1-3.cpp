@@ -41,6 +41,26 @@ initial energy or less.
 #include <chrono>
 #include <omp.h>
 #include <sched.h>
+#include <sys/mman.h>
+
+// Ask the kernel for transparent huge pages. A 7 GB array needs 1.7M 4 KB page
+// faults to materialise, and 1.7M TLB entries to address, against a TLB that
+// holds one or two thousand -- so the stencil misses on nearly every access.
+// 2 MB pages cut both by 512. glibc returns a pointer just past a chunk header
+// rather than on a page boundary, so round up first; losing the leading partial
+// page costs nothing against gigabytes.
+static void adviseHuge(void* p, size_t bytes) {
+#ifdef MADV_HUGEPAGE
+    const uintptr_t pg = 4096;
+    const uintptr_t start = (uintptr_t)p;
+    const uintptr_t aligned = (start + pg - 1) & ~(pg - 1);
+    const size_t skip = (size_t)(aligned - start);
+    if (bytes > skip) madvise((void*)aligned, bytes - skip, MADV_HUGEPAGE);
+#else
+    (void)p;
+    (void)bytes;
+#endif
+}
 
 // Set -DSTENCIL_SIMD=0 to drop the omp simd directive on the diffusion loop and
 // let GCC's cost model decide instead. The stencil is memory-bound at roughly
@@ -199,6 +219,8 @@ int main(int argc, char** argv) {
                 N, cells * BYTES_PER_CELL / (1024.0 * 1024.0 * 1024.0));
         return 1;
     }
+    adviseHuge(u, cells * sizeof(double));
+    adviseHuge(a, cells * sizeof(double));
 
     const double tAlloc = nowMs();
 
@@ -291,6 +313,8 @@ int main(int argc, char** argv) {
         fprintf(stderr, "out of memory for the in-place scratch buffers\n");
         return 1;
     }
+    adviseHuge(planeBufs, (size_t)nthreads * planeDoubles * sizeof(double));
+    adviseHuge(firstPlanes, (size_t)nthreads * planeDoubles * sizeof(double));
 
     while (steps < T) {
         const double s0 = nowMs();
@@ -311,10 +335,15 @@ int main(int argc, char** argv) {
             // thread above is about to overwrite. Uniform work per plane, so an
             // even split is the right one -- the reaction, which is what made
             // the old fused loop need dynamic, is pass 2's problem now.
-            const long chunk = (N + P - 1) / P;
-            const long lo = 1 + (long)tid * chunk;
-            const long hi = (lo + chunk - 1 < N) ? lo + chunk - 1 : N;
-            const bool mine = (lo <= N);
+            // Spread the remainder one plane at a time rather than rounding the
+            // chunk up: at N=700 with 8 threads, ceil(700/8) = 89 gives seven
+            // threads 89 planes and the last one 77, a 13% gap that the whole
+            // team then waits on. This gives four threads 88 and four 87.
+            const long span = N / P, extra = N % P;
+            const long cnt = span + (tid < extra ? 1 : 0);
+            const long lo = 1 + (long)tid * span + (tid < extra ? tid : extra);
+            const long hi = lo + cnt - 1;
+            const bool mine = (cnt > 0);
 
             double* plane = planeBufs + (size_t)tid * planeDoubles;
             double* myFirst = firstPlanes + (size_t)tid * planeDoubles;
