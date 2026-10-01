@@ -229,35 +229,69 @@ int main(int argc, char** argv) {
 
     // field() is a pure function of the index, so every cell is independent --
     // no sequential PRNG state to carry. Running it in parallel also first-
-    // touches the pages from the thread that will keep using them.
+    // touches the pages from the thread that will keep using them. Nothing else
+    // is in this loop, so it is straight integer hashing over consecutive
+    // indices with no branch and no call that cannot be inlined.
+    #pragma omp parallel for schedule(static)
+    for (long i = 1; i <= N; i++)
+        for (long j = 1; j <= N; j++) {
+            const long base = i * SI + j * SJ;
+            const uint64_t idxBase = (uint64_t)((i - 1) * N + (j - 1)) * N;
+            for (long k = 1; k <= N; k++) {
+                u[base + k] = field(seed, idxBase + (uint64_t)(k - 1), 0);
+                a[base + k] = field(seed, idxBase + (uint64_t)(k - 1), 1);
+            }
+        }
+
+    // The reactive set, as runs of consecutive k.
     //
-    // The same sweep records the reactive set. It already evaluates reactive()
-    // for every cell, so tracking where the predicate turns on and off along k
-    // is free, and the resulting runs replace the per-cell mat array entirely.
+    // An inclusion is a sphere, so cell (i, j, k) is inside it when
+    // dk^2 <= r^2 - di^2 - dj^2; for a given (i, j) that is one interval of k,
+    // bounded by ck +- sqrt(r^2 - di^2 - dj^2). Taking those bounds a cell wide
+    // on each side gives a window that certainly contains every reactive k, and
+    // reactive() itself then decides each k inside the window -- so the set is
+    // exactly what a full scan would produce, while the number of predicate
+    // evaluations drops from N^3 to roughly the number of reactive cells.
+    //
     // Each thread owns whole i planes, so the per-plane buffers need no locking,
     // and concatenating them in i order afterwards keeps the list deterministic.
     std::vector<std::vector<Run> > runsPerPlane(N + 1);
 
-    #pragma omp parallel for schedule(static)
-    for (long i = 1; i <= N; i++) {
-        std::vector<Run>& out = runsPerPlane[i];
-        for (long j = 1; j <= N; j++) {
-            long runStart = -1;
-            for (long k = 1; k <= N; k++) {
-                const long p = i * SI + j * SJ + k;
-                const uint64_t index = ((i - 1) * N + (j - 1)) * N + (k - 1);
-                u[p] = field(seed, index, 0);
-                a[p] = field(seed, index, 1);
-                if (reactive(inc, B, i, j, k)) {
-                    if (runStart < 0) runStart = p;
-                } else if (runStart >= 0) {
-                    out.push_back(Run{runStart, (int)(p - runStart)});
-                    runStart = -1;
+    if (B > 0) {
+        #pragma omp parallel for schedule(static)
+        for (long i = 1; i <= N; i++) {
+            std::vector<Run>& out = runsPerPlane[i];
+            for (long j = 1; j <= N; j++) {
+                long wLo = N + 1, wHi = 0;
+                for (int b = 0; b < B; b++) {
+                    const double di = (double)i - inc[b].ci;
+                    const double dj = (double)j - inc[b].cj;
+                    const double rest = inc[b].r2 - di * di - dj * dj;
+                    if (rest < 0.0) continue;
+                    const double half = std::sqrt(rest);
+                    long lo = (long)std::floor(inc[b].ck - half) - 1;
+                    long hi = (long)std::ceil(inc[b].ck + half) + 1;
+                    if (lo < 1) lo = 1;
+                    if (hi > N) hi = N;
+                    if (lo < wLo) wLo = lo;
+                    if (hi > wHi) wHi = hi;
                 }
-            }
-            if (runStart >= 0) {   // the run reached the far face
-                const long pEnd = i * SI + j * SJ + (N + 1);
-                out.push_back(Run{runStart, (int)(pEnd - runStart)});
+                if (wLo > wHi) continue;   // this (i, j) misses every inclusion
+
+                long runStart = -1;
+                for (long k = wLo; k <= wHi; k++) {
+                    const long p = i * SI + j * SJ + k;
+                    if (reactive(inc, B, i, j, k)) {
+                        if (runStart < 0) runStart = p;
+                    } else if (runStart >= 0) {
+                        out.push_back(Run{runStart, (int)(p - runStart)});
+                        runStart = -1;
+                    }
+                }
+                if (runStart >= 0) {
+                    const long pEnd = i * SI + j * SJ + (wHi + 1);
+                    out.push_back(Run{runStart, (int)(pEnd - runStart)});
+                }
             }
         }
     }

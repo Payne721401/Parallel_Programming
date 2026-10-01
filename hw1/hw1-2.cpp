@@ -42,7 +42,18 @@ struct RGB {
     int r, g, b;
 };
 
-using Mat = std::vector<std::vector<double>>;
+// Flat storage behind a row-indexing interface, so m[y][x] reads exactly as
+// before while the rows are actually contiguous -- which a vector of vectors
+// never guarantees -- and each Mat is one allocation instead of height + 1.
+// At 2640x1980 a Mat is 41 MB, and the pyramid builds 44 of them per image.
+struct Mat {
+    int h, w;
+    std::vector<double> d;
+    Mat() : h(0), w(0) {}
+    Mat(int H, int W) : h(H), w(W), d((size_t)H * W, 0.0) {}
+    double* operator[](int y) { return d.data() + (size_t)y * w; }
+    const double* operator[](int y) const { return d.data() + (size_t)y * w; }
+};
 
 // The two images decode independently -- separate files, separate FILE* and
 // separate png_structp, and libpng is reentrant per struct -- so main runs these
@@ -113,7 +124,7 @@ static png_byte* read_png_raw(const char* file_name, int* out_w, int* out_h,
 // Same expression and the same order as before -- the luminance weights are
 // inexact in binary, and every later extremum decision rests on these values.
 Mat toGrayscale(const png_byte* raw, size_t rowbytes, int height, int width) {
-    Mat gray(height, std::vector<double>(width));
+    Mat gray(height, width);
     // Row y reads only row y and writes only row y. Uniform work per row, so
     // static: no imbalance to fix and nothing to gain from paying for dynamic.
     #pragma omp parallel for schedule(static)
@@ -129,7 +140,11 @@ Mat toGrayscale(const png_byte* raw, size_t rowbytes, int height, int width) {
 // Separable Gaussian blur. Two independent passes (row-wise, then column-wise)
 // -- each row/column is independent, this is the main parallelization target
 // in the detection stage.
-Mat gaussianBlur(const Mat& in, int height, int width, double sigma) {
+// tmp and out come from the caller. Allocating them here meant two full-size
+// Mats per call, and buildPyramid makes 20 calls per image -- 80 allocations of
+// up to 41 MB each, every one of them zero-filled before being overwritten.
+void gaussianBlur(const Mat& in, Mat& tmp, Mat& out, int height, int width,
+                  double sigma) {
     int radius = std::max(1, (int)std::ceil(3 * sigma));
     std::vector<double> kernel(2 * radius + 1);
     double sum = 0.0;
@@ -151,14 +166,13 @@ Mat gaussianBlur(const Mat& in, int height, int width, double sigma) {
     const int xLo = std::min(radius, width);
     const int xHi = std::max(xLo, width - radius);
 
-    Mat tmp(height, std::vector<double>(width));
     // Row y of the horizontal pass reads only row y of `in`, so rows are
     // independent and each output element is still summed by one thread in the
     // original order -- the result stays bit-identical.
     #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
-        const double* src = in[y].data();
-        double* dst = tmp[y].data();
+        const double* src = in[y];
+        double* dst = tmp[y];
         std::fill(dst, dst + width, 0.0);
         for (int i = -radius; i <= radius; i++) {
             const double kv = kernel[i + radius];
@@ -171,28 +185,26 @@ Mat gaussianBlur(const Mat& in, int height, int width, double sigma) {
         }
     }
 
-    Mat out(height, std::vector<double>(width));
     // The vertical pass reads rows y-radius..y+radius of `tmp`, but only ever
     // reads them, and writes only out[y]. Overlapping reads are not a race.
     #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
-        double* dst = out[y].data();
+        double* dst = out[y];
         std::fill(dst, dst + width, 0.0);
         for (int i = -radius; i <= radius; i++) {
             // The row index is invariant in x, so the clamp and the row lookup
             // happen once per i here rather than once per tap.
-            const double* src = tmp[std::min(std::max(y + i, 0), height - 1)].data();
+            const double* src = tmp[std::min(std::max(y + i, 0), height - 1)];
             const double kv = kernel[i + radius];
             for (int x = 0; x < width; x++)
                 dst[x] += src[x] * kv;
         }
     }
-    return out;
 }
 
 Mat downsample2x(const Mat& in, int height, int width) {
     int nh = height / 2, nw = width / 2;
-    Mat out(nh, std::vector<double>(nw));
+    Mat out(nh, nw);
     #pragma omp parallel for schedule(static)
     for (int y = 0; y < nh; y++)
         for (int x = 0; x < nw; x++)
@@ -228,15 +240,17 @@ std::vector<Octave> buildPyramid(const Mat& gray, int height, int width) {
         oct.width = w;
         oct.gaussian.resize(NUM_SCALES);
         oct.gaussian[0] = base;
+        Mat scratch(h, w);   // the horizontal pass's intermediate, reused by all five
         for (int s = 1; s < NUM_SCALES; s++) {
             double sigma = SIGMA0 * std::pow(k, s);
-            oct.gaussian[s] = gaussianBlur(base, h, w, sigma);
+            oct.gaussian[s] = Mat(h, w);
+            gaussianBlur(base, scratch, oct.gaussian[s], h, w, sigma);
         }
         // Allocate first, then subtract: collapse(2) needs a perfectly nested
         // pair, and the allocation is not something to run concurrently anyway.
         oct.dog.resize(NUM_SCALES - 1);
         for (int s = 0; s < NUM_SCALES - 1; s++)
-            oct.dog[s] = Mat(h, std::vector<double>(w));
+            oct.dog[s] = Mat(h, w);
 
         // collapse(2) rather than parallelising s alone: the deepest octave is
         // only ~250 rows and there are just 5 layers, so flattening (s, y) is
@@ -244,9 +258,9 @@ std::vector<Octave> buildPyramid(const Mat& gray, int height, int width) {
         #pragma omp parallel for collapse(2) schedule(static)
         for (int s = 0; s < NUM_SCALES - 1; s++)
             for (int y = 0; y < h; y++) {
-                double* d = oct.dog[s][y].data();
-                const double* hi = oct.gaussian[s + 1][y].data();
-                const double* lo = oct.gaussian[s][y].data();
+                double* d = oct.dog[s][y];
+                const double* hi = oct.gaussian[s + 1][y];
+                const double* lo = oct.gaussian[s][y];
                 for (int x = 0; x < w; x++) d[x] = hi[x] - lo[x];
             }
 

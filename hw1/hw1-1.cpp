@@ -52,10 +52,37 @@ int determineKernelSize(double brightness) {
     return brightness > 128 ? 11 : 5;
 }
 
+// The largest radius determineKernelSize can produce: 11 / 2 == 5.
+static const int RMAX = 5;
+
+// Border cells, where y + j runs off the row and has to be clamped. Only RMAX
+// columns at each end, so 10 of 4930 on the largest public case.
+static inline int clampedBox(const unsigned char* const* rows, int rad, int y, int width) {
+    int s = 0;
+    for (int i = -rad; i <= rad; i++) {
+        const unsigned char* r = rows[i + RMAX];
+        for (int j = -rad; j <= rad; j++)
+            s += r[std::min(std::max(y + j, 0), width - 1)];
+    }
+    const int n = 2 * rad + 1;
+    return s / (n * n);
+}
+
+// Flat unsigned char planes rather than vector<vector<int>>: the values are
+// always 0..255, so a byte per sample is a quarter of the memory traffic of an
+// int, and a flat plane makes consecutive rows actually consecutive, which a
+// vector of vectors never is.
+//
+// Two further changes to the inner loops. The row lookups are clamped once per
+// output row instead of once per tap. And y is split so that the interior needs
+// no clamping at all, which lets the radius be branched on once per pixel and
+// the resulting loops have compile-time trip counts -- 11x11 or 5x5 -- so they
+// can be unrolled and vectorised. Integer addition is associative, so none of
+// this changes the sum.
 void applyFilterToChannel(
-    const std::vector<std::vector<int>>& input, 
-    std::vector<std::vector<int>>& output, 
-    const std::vector<std::vector<int>>& kernelSizes, 
+    const unsigned char* input,
+    unsigned char* output,
+    const unsigned char* radii,
     int height,
     int width
 ) {
@@ -66,79 +93,75 @@ void applyFilterToChannel(
     // noise leaves every row with much the same mix of large and small kernels.
     #pragma omp parallel for schedule(runtime)
     for (int x = 0; x < height; x++) {
-        for (int y = 0; y < width; y++) {
-            int kernelRadius = kernelSizes[x][y] / 2;
-            // The border clamps rather than skipping, so every (i, j) pair runs
-            // and the divisor is a constant -- no point counting it tap by tap.
-            int taps = (2 * kernelRadius + 1) * (2 * kernelRadius + 1);
-            // int, not double: a window sums at most 121 * 255 = 30855, exact
-            // either way, but integer add is 1 cycle instead of 4 and is
-            // associative, which is what lets the reduction vectorize.
-            int filteredPixel = 0;
+        const unsigned char* rows[2 * RMAX + 1];
+        for (int i = -RMAX; i <= RMAX; i++)
+            rows[i + RMAX] =
+                input + (size_t)std::min(std::max(x + i, 0), height - 1) * width;
 
-            for (int i = -kernelRadius; i <= kernelRadius; i++) {
-                // The row index does not depend on j. Hoisting the lookup here
-                // turns two dependent loads per tap into one.
-                const std::vector<int>& row =
-                    input[std::min(std::max(x + i, 0), height - 1)];
-                for (int j = -kernelRadius; j <= kernelRadius; j++) {
-                    filteredPixel += row[std::min(std::max(y + j, 0), width - 1)];
+        const unsigned char* rad = radii + (size_t)x * width;
+        unsigned char* out = output + (size_t)x * width;
+
+        const int yLo = std::min(RMAX, width);
+        const int yHi = std::max(yLo, width - RMAX);
+
+        for (int y = 0; y < yLo; y++) out[y] = (unsigned char)clampedBox(rows, rad[y], y, width);
+        for (int y = yHi; y < width; y++) out[y] = (unsigned char)clampedBox(rows, rad[y], y, width);
+
+        for (int y = yLo; y < yHi; y++) {
+            if (rad[y] == RMAX) {
+                int s = 0;
+                for (int i = 0; i < 2 * RMAX + 1; i++) {
+                    const unsigned char* r = rows[i] + y - RMAX;
+                    for (int j = 0; j < 2 * RMAX + 1; j++) s += r[j];
                 }
+                out[y] = (unsigned char)(s / ((2 * RMAX + 1) * (2 * RMAX + 1)));
+            } else {
+                int s = 0;
+                for (int i = RMAX - 2; i <= RMAX + 2; i++) {
+                    const unsigned char* r = rows[i] + y - 2;
+                    for (int j = 0; j < 5; j++) s += r[j];
+                }
+                out[y] = (unsigned char)(s / 25);
             }
-
-            // Both operands are non-negative, so integer division truncates the
-            // same way static_cast<int>(double / double) did: bit-identical.
-            output[x][y] = filteredPixel / taps;
         }
     }
 }
 
-// Takes the channel planes the decoder already produced, rather than an
-// interleaved image it would have to split again. That removes a 219 MB
-// vector<vector<RGB>> at 18 Mpixel -- allocated and zero-filled before being
-// overwritten -- along with the whole pass that copied it into planes.
+// Writes straight into the output planes the encoder will read, so there is no
+// interleaved vector<vector<RGB>> in between -- another 219 MB at 18 Mpixel,
+// allocated and zero-filled before being overwritten.
 void adaptiveFilterRGB(
-    const std::vector<std::vector<int>>& redChannel,
-    const std::vector<std::vector<int>>& greenChannel,
-    const std::vector<std::vector<int>>& blueChannel,
-    std::vector<std::vector<RGB>>& outputImage,
-    int height, 
+    const unsigned char* redChannel,
+    const unsigned char* greenChannel,
+    const unsigned char* blueChannel,
+    unsigned char* outRed,
+    unsigned char* outGreen,
+    unsigned char* outBlue,
+    int height,
     int width
 ) {
-    std::vector<std::vector<int>> kernelSizes(height, std::vector<int>(width));
+    // The radius, not the kernel size, and one byte instead of an int.
+    std::vector<unsigned char> radii((size_t)height * width);
 
     #pragma omp parallel for schedule(static)
-    for (int x = 0; x < height; x++) {
+    for (int x = 0; x < height; x++)
         for (int y = 0; y < width; y++) {
+            const size_t p = (size_t)x * width + y;
             // Assembled back into an RGB so calculateLuminance evaluates the
             // same double expression in the same order. The integer form
             // 299r + 587g + 114b > 128000 is not equivalent: 0.299, 0.587 and
             // 0.114 are inexact in binary, so a flat mid-grey region would pick
             // a different kernel for every one of its pixels.
             RGB px;
-            px.r = redChannel[x][y];
-            px.g = greenChannel[x][y];
-            px.b = blueChannel[x][y];
-            kernelSizes[x][y] = determineKernelSize(calculateLuminance(px));
+            px.r = redChannel[p];
+            px.g = greenChannel[p];
+            px.b = blueChannel[p];
+            radii[p] = (unsigned char)(determineKernelSize(calculateLuminance(px)) / 2);
         }
-    }
 
-    std::vector<std::vector<int>> tempRed(height, std::vector<int>(width));
-    std::vector<std::vector<int>> tempGreen(height, std::vector<int>(width));
-    std::vector<std::vector<int>> tempBlue(height, std::vector<int>(width));
-
-    applyFilterToChannel(redChannel, tempRed, kernelSizes, height, width);
-    applyFilterToChannel(greenChannel, tempGreen, kernelSizes, height, width);
-    applyFilterToChannel(blueChannel, tempBlue, kernelSizes, height, width);
-
-    #pragma omp parallel for schedule(static)
-    for (int x = 0; x < height; x++) {
-        for (int y = 0; y < width; y++) {
-            outputImage[x][y].r = tempRed[x][y];
-            outputImage[x][y].g = tempGreen[x][y];
-            outputImage[x][y].b = tempBlue[x][y];
-        }
-    }
+    applyFilterToChannel(redChannel, outRed, radii.data(), height, width);
+    applyFilterToChannel(greenChannel, outGreen, radii.data(), height, width);
+    applyFilterToChannel(blueChannel, outBlue, radii.data(), height, width);
 }
 
 // ---------- shared PNG I/O ----------
@@ -150,9 +173,10 @@ void adaptiveFilterRGB(
 // for all the rows instead of a malloc per row, which was 3700 allocations on
 // the largest public case.
 void read_png_planes(char* file_name,
-                     std::vector<std::vector<int>>& redChannel,
-                     std::vector<std::vector<int>>& greenChannel,
-                     std::vector<std::vector<int>>& blueChannel) {
+                     std::vector<unsigned char>& redChannel,
+                     std::vector<unsigned char>& greenChannel,
+                     std::vector<unsigned char>& blueChannel,
+                     int* out_w, int* out_h) {
     FILE *fp = fopen(file_name, "rb");
     if (!fp) {
         std::cerr << "Error: Cannot open file " << file_name << std::endl;
@@ -223,27 +247,30 @@ void read_png_planes(char* file_name,
 
     fclose(fp);
 
-    redChannel.assign(height, std::vector<int>(width));
-    greenChannel.assign(height, std::vector<int>(width));
-    blueChannel.assign(height, std::vector<int>(width));
+    redChannel.resize((size_t)height * width);
+    greenChannel.resize((size_t)height * width);
+    blueChannel.resize((size_t)height * width);
     #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
         const png_byte* row = raw + (size_t)y * rowbytes;
+        const size_t base = (size_t)y * width;
         for (int x = 0; x < width; x++) {
-            redChannel[y][x] = row[x * 3];
-            greenChannel[y][x] = row[x * 3 + 1];
-            blueChannel[y][x] = row[x * 3 + 2];
+            redChannel[base + x] = row[x * 3];
+            greenChannel[base + x] = row[x * 3 + 1];
+            blueChannel[base + x] = row[x * 3 + 2];
         }
     }
     free(row_pointers);
     free(raw);
+    *out_w = width;
+    *out_h = height;
 
     png_destroy_read_struct(&png, &info, nullptr);
 }
 
-void write_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
-    int width = image[0].size();
-    int height = image.size();
+void write_png_file(char* file_name, const unsigned char* R,
+                    const unsigned char* G, const unsigned char* B,
+                    int width, int height) {
 
     FILE *fp = fopen(file_name, "wb");
     if (!fp) {
@@ -294,25 +321,30 @@ void write_png_file(char* file_name, std::vector<std::vector<RGB>>& image) {
     );
     png_write_info(png, info);
 
+    const size_t rowbytes = png_get_rowbytes(png, info);
+    png_byte* raw = (png_byte*)malloc(rowbytes * (size_t)height);
     png_bytep* row_pointers = (png_bytep*)malloc(sizeof(png_bytep) * height);
-    size_t rowbytes = png_get_rowbytes(png, info);
+    if (!raw || !row_pointers) {
+        std::cerr << "Error: out of memory for " << width << "x" << height << std::endl;
+        exit(EXIT_FAILURE);
+    }
     #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; y++) {
-        row_pointers[y] = (png_byte*)malloc(rowbytes);
+        png_byte* row = raw + (size_t)y * rowbytes;
+        row_pointers[y] = row;
+        const size_t base = (size_t)y * width;
         for (int x = 0; x < width; x++) {
-            row_pointers[y][x * 3] = image[y][x].r;
-            row_pointers[y][x * 3 + 1] = image[y][x].g;
-            row_pointers[y][x * 3 + 2] = image[y][x].b;
+            row[x * 3] = R[base + x];
+            row[x * 3 + 1] = G[base + x];
+            row[x * 3 + 2] = B[base + x];
         }
     }
 
     png_write_image(png, row_pointers);
     png_write_end(png, nullptr);
 
-    for (int y = 0; y < height; y++) {
-        free(row_pointers[y]);
-    }
     free(row_pointers);
+    free(raw);
 
     png_destroy_write_struct(&png, &info);
     fclose(fp);
@@ -343,23 +375,25 @@ int main(int argc, char** argv) {
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    std::vector<std::vector<int>> redChannel, greenChannel, blueChannel;
-    read_png_planes(input_file, redChannel, greenChannel, blueChannel);
-
-    int height = redChannel.size();
-    int width = redChannel[0].size();
+    std::vector<unsigned char> redChannel, greenChannel, blueChannel;
+    int width = 0, height = 0;
+    read_png_planes(input_file, redChannel, greenChannel, blueChannel, &width, &height);
 
     auto t1 = std::chrono::high_resolution_clock::now();
 
-    std::vector<std::vector<RGB>> outputImage(height, std::vector<RGB>(width));
+    std::vector<unsigned char> outRed((size_t)height * width),
+                               outGreen((size_t)height * width),
+                               outBlue((size_t)height * width);
 
     auto t2 = std::chrono::high_resolution_clock::now();
 
-    adaptiveFilterRGB(redChannel, greenChannel, blueChannel, outputImage, height, width);
+    adaptiveFilterRGB(redChannel.data(), greenChannel.data(), blueChannel.data(),
+                      outRed.data(), outGreen.data(), outBlue.data(), height, width);
 
     auto t3 = std::chrono::high_resolution_clock::now();
 
-    write_png_file(output_file, outputImage);
+    write_png_file(output_file, outRed.data(), outGreen.data(),
+                   outBlue.data(), width, height);
 
     auto t4 = std::chrono::high_resolution_clock::now();
 
