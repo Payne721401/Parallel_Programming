@@ -1,4 +1,5 @@
 *.pdf
+*.tar
 
 # Compiled object files
 *.o
