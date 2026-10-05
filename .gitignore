@@ -38,10 +38,13 @@ hw1/hw1-3
 # Course-provided shared test data / symlinks
 cases
 
-# Personal notes / write-ups, not part of the submission
-*.md
+# Personal notes and write-ups. Everything else in Markdown is tracked on
+# purpose: each lab ships its own README.md / TIMING.md, and the repo's own
+# README belongs here too.
+*-report.md
+*.local.md
+notes/
 
-# Program output
+# Program output.
 *.png
 *.txt
-!cases/**
