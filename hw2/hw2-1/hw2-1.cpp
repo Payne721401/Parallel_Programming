@@ -10,6 +10,14 @@
 //             once to size its adjacency lists, once to fill them into the shared CSR. The edges
 //             come from FastGen, a bit-exact rendition of graph_gen.cpp's generator that is
 //             checked against the official one before it is trusted.
+//   slots     between the passes, vertices get new numbers ("slots"), heaviest first, and the
+//             isolated ones none: the arc ends that relaxations read cluster in a few MB of each
+//             distance array instead of spreading over all of it, and the arrays shrink by the
+//             isolated share (about half the vertices at scale 23-24).
+//   memory    one window for the whole run, reused by lifetime: the generated edges' space then
+//             holds the CSR, the outbox's space the search's arrays. Nothing is freed until the
+//             end; freeing a window is the kernel handing back its pages one process at a time,
+//             and mapping fresh pages costs a page fault each.
 //   traverse  all distinct sources at once, one distance value per round. Weights are integers
 //             >= 1, so every (source, vertex) whose tentative distance equals the round's value d
 //             is final: each is expanded exactly once. A round publishes the frontier to a shared
@@ -26,8 +34,8 @@
 // and fastest rank's time and the most page faults any rank took, time spent waiting at barriers
 // under "wait", timings nested inside phases (window alloc/free, the traversal's parts) and
 // counters. There, PP_STATS=1 adds the graph's shape and PP_PRETOUCH=1 touches the CSR's pages
-// before filling it. In any build, PP_BATCH=n caps the sources searched together and
-// PP_FASTGEN=0 uses the official generator.
+// before filling it. In any build, PP_BATCH=n caps the sources searched together, PP_FASTGEN=0
+// uses the official generator and PP_RELABEL=0 keeps the original vertex numbers.
 #include <mpi.h>
 #ifdef HW21_PROF
 #include <sys/resource.h>
@@ -453,23 +461,36 @@ private:
     std::vector<Window> wins;
 };
 
-// Adjacency of v: col/w[start, start + deg).
+// Adjacency of a slot: col/w[start, start + deg).
 struct Adj {
     u32 start, deg;
 };
 
+// The graph over slots. With relabeling (the default) the slots are degree-ordered and the
+// isolated vertices have none; with PP_RELABEL=0 a vertex's slot is its own number.
 struct Graph {
-    Adj *adj;   // [N]
-    u32 *col;   // [arcs]
-    u8 *w;      // [arcs]
+    u64 n;           // slots: the non-isolated vertices, or N
+    Adj *adj;        // [n]
+    u32 *col;        // [arcs], the far end's slot
+    u8 *w;           // [arcs]
     u64 arcs;
+    bool relabeled;
+    u32 *newid;      // [N]: a vertex's slot, INF for an isolated one (relabeled only)
+    u32 *oldid;      // [n]: a slot's vertex (relabeled only)
+    char *spare;     // the outbox's space, free once the graph is built
+    u64 spare_bytes;
+
+    u32 slot(u32 v) const { return relabeled ? newid[v] : v; }
+    u32 vertex(u32 s) const { return relabeled ? oldid[s] : s; }
 };
+
+inline u64 page_up(u64 x) { return (x + 4095) & ~u64(4095); }
 
 #ifdef HW21_PROF
 // PP_STATS=1: the graph's shape at the real size. Owners look at their own vertices: isolated
 // ones, duplicate arcs, leaves (one distinct neighbour), and per log2(degree) bucket the vertices
 // and their arcs, i.e. how many of the arcs' far ends land on the heaviest vertices, which is what
-// a degree-ordered relabel would keep together in the caches.
+// the degree-ordered slots keep together in the caches.
 void graph_stats(Node &node, const Graph &g, u64 N, const Mix &mix, u64 nloc)
 {
     const int P = node.size, r = node.rank;
@@ -477,11 +498,12 @@ void graph_stats(Node &node, const Graph &g, u64 N, const Mix &mix, u64 nloc)
     std::vector<u64> mine(4 + 2 * B, 0), all(4 + 2 * B, 0);   // isolated, dup, leaves, maxdeg | count[B] | arcs[B]
     std::vector<u32> tmp;
     for (u64 li = 0; li < nloc; li++) {
-        const Adj a = g.adj[mix.inv(u32(r + li * P))];
-        if (!a.deg) {
+        const u32 s = g.slot(mix.inv(u32(r + li * P)));
+        if (s == INF || !g.adj[s].deg) {
             mine[0]++;
             continue;
         }
+        const Adj a = g.adj[s];
         tmp.assign(g.col + a.start, g.col + a.start + a.deg);
         std::sort(tmp.begin(), tmp.end());
         const u64 uniq = u64(std::unique(tmp.begin(), tmp.end()) - tmp.begin());
@@ -515,19 +537,26 @@ void graph_stats(Node &node, const Graph &g, u64 N, const Mix &mix, u64 nloc)
 }
 #endif
 
-// Generates this rank's slice of the edges and builds the shared CSR. Vertex v belongs to owner
-// mix(v) mod P, in local slot mix(v) / P.
+// Generates this rank's slice of the edges and builds the shared CSR over slots. Vertex v belongs
+// to owner mix(v) mod P, in local position mix(v) / P.
 Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
 {
     const int P = node.size, r = node.rank;
     const u64 N = num_vertices(p), M = num_edges(p);
     const Mix mix(p.scale, p.scramble == 0);
+    const char *re = std::getenv("PP_RELABEL");
+    const bool relabel = !(re && re[0] == '0');
 
-    // Generate edges [M r / P, M (r + 1) / P), self-loops dropped, packed (u | v << 26 | w << 52),
-    // into this rank's stretch of a shared window: M / P edges privately would be 1 GiB at
-    // scale 26 with P = 8, too close to the 1200 MiB cap.
+    // One window for the run, carved by lifetime. X: the generated edges (8 B each), then col and
+    // w (5 B per arc, 2 arcs per edge at most). Y: the outbox (8 B per arc), then the search's
+    // arrays. Z: adj, newid, oldid (16 B per vertex at most). Pages cost nothing until touched.
+    const u64 X = page_up(10 * M + 4096), Y = page_up(16 * M), Z = page_up(16 * N);
+    char *arena = node.alloc<char>(X + Y + Z, "arena");
+    u64 *const edges = reinterpret_cast<u64 *>(arena);
+    u64 *const outbox = reinterpret_cast<u64 *>(arena + X);
+
+    // Generate edges [M r / P, M (r + 1) / P), self-loops dropped, packed (u | v << 26 | w << 52).
     const u64 e0 = M * r / P, e1 = M * (r + 1) / P;
-    u64 *edges = node.alloc<u64>(M, "edges");
     const FastGen fg(p);
     const char *fe = std::getenv("PP_FASTGEN");
     const bool fast = !(fe && fe[0] == '0') && fastgen_matches(p, fg, e0, e1);
@@ -555,7 +584,7 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     prof.mark("generate");
 
     // Outbox: rank q's segment, and inside it one run per owner. sent[q * P + o] = arcs q -> o.
-    // An arc is packed (mix(src) | dst << 26 | w << 52): the owner needs src only as a slot.
+    // An arc is packed (mix(src) | dst << 26 | w << 52): the owner needs src only as a position.
     std::vector<u64> sent(u64(P) * P);
     MPI_Allgather(to_owner.data(), P, MPI_UINT64_T, sent.data(), P, MPI_UINT64_T, node.comm);
     std::vector<u64> run_begin(u64(P) * P);   // [q * P + o]: where q's run for o starts
@@ -565,7 +594,6 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
             run_begin[u64(q) * P + o] = total;
             total += sent[u64(q) * P + o];
         }
-    u64 *outbox = node.alloc<u64>(total, "outbox");
     prof.mark("wait");
     {
         std::vector<u64> cur(run_begin.begin() + u64(r) * P, run_begin.begin() + u64(r + 1) * P);
@@ -578,11 +606,10 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
         }
     }
     prof.mark("scatter");
-    node.sync();
-    node.release(edges);
+    node.sync();   // the edges are dead from here: X becomes the CSR
     prof.mark("wait");
 
-    // Owner r: slots h = r + li * P, vertex mix^-1(h). First pass sizes their lists.
+    // Owner r: positions h = r + li * P, vertex mix^-1(h). First pass sizes their lists.
     const u64 nloc = N > u64(r) ? (N - 1 - r) / P + 1 : 0;
     std::vector<u32> pos(nloc, 0);
     auto for_my_arcs = [&](auto &&f) {
@@ -594,10 +621,16 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     };
     for_my_arcs([&](u64 a) { pos[fd.div(u32(a & VMASK))]++; });
     u64 mine = 0;
-    for (u64 li = 0; li < nloc; li++) mine += pos[li];
+    u64 cls[32] = {};   // my non-isolated vertices per log2(degree)
+    for (u64 li = 0; li < nloc; li++)
+        if (pos[li]) {
+            mine += pos[li];
+            cls[31 - __builtin_clz(pos[li])]++;
+        }
     prof.mark("count");
-    std::vector<u64> owned(P);
+    std::vector<u64> owned(P), classes(32 * u64(P));
     MPI_Allgather(&mine, 1, MPI_UINT64_T, owned.data(), 1, MPI_UINT64_T, node.comm);
+    MPI_Allgather(cls, 32, MPI_UINT64_T, classes.data(), 32, MPI_UINT64_T, node.comm);
     prof.mark("wait");
     u64 base = 0, arcs = 0;
     for (int q = 0; q < P; q++) {
@@ -607,16 +640,50 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
 
     Graph g;
     g.arcs = arcs;
-    g.adj = node.alloc<Adj>(N, "adj");
-    g.col = node.alloc<u32>(arcs, "col");
-    g.w = node.alloc<u8>(arcs, "w");
+    g.relabeled = relabel;
+    g.col = reinterpret_cast<u32 *>(arena);
+    g.w = reinterpret_cast<u8 *>(arena + page_up(4 * arcs));
+    g.adj = reinterpret_cast<Adj *>(arena + X + Y);
+    g.newid = reinterpret_cast<u32 *>(arena + X + Y + 8 * N);
+    g.oldid = reinterpret_cast<u32 *>(arena + X + Y + 12 * N);
+    g.spare = arena + X;
+    g.spare_bytes = Y;
+
+    // Slots. Relabeled: classes from the heaviest down, then owners in rank order, then positions;
+    // my first slot in class c follows every heavier class and the lower ranks' share of c.
+    u64 next[32] = {};
+    if (relabel) {
+        u64 acc = 0;
+        for (int c = 31; c >= 0; c--) {
+            next[c] = acc;
+            for (int q = 0; q < P; q++) {
+                if (q < r) next[c] += classes[u64(q) * 32 + c];
+                acc += classes[u64(q) * 32 + c];
+            }
+        }
+        g.n = acc;
+    } else {
+        g.n = N;
+    }
     for (u64 li = 0, at = base; li < nloc; li++) {
-        g.adj[mix.inv(u32(r + li * P))] = {u32(at), pos[li]};
-        const u64 d = pos[li];
+        const u32 v = mix.inv(u32(r + li * P)), d = pos[li];
+        u32 s = v;
+        if (relabel) {
+            if (!d) {
+                g.newid[v] = INF;
+                continue;
+            }
+            s = u32(next[31 - __builtin_clz(d)]++);
+            g.newid[v] = s;
+            g.oldid[s] = v;
+        }
+        g.adj[s] = {u32(at), d};
         pos[li] = u32(at);   // now the fill cursor
         at += d;
     }
-    prof.mark("alloc");
+    prof.mark("slots");
+    node.sync();   // every newid is in place before any owner translates its arcs' far ends
+    prof.mark("wait");
 #ifdef HW21_PROF
     // Experiment: take the first touch of this owner's CSR pages out of the fill.
     if (std::getenv("PP_PRETOUCH")) {
@@ -629,13 +696,12 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     // Second pass fills them.
     for_my_arcs([&](u64 a) {
         const u32 at = pos[fd.div(u32(a & VMASK))]++;
-        g.col[at] = u32((a >> VBITS) & VMASK);
+        g.col[at] = g.slot(u32((a >> VBITS) & VMASK));
         g.w[at] = u8(a >> 52);
     });
     std::vector<u32>().swap(pos);
     prof.mark("fill");
-    node.sync();
-    node.release(outbox);
+    node.sync();   // the outbox is dead from here: Y becomes the search's
     prof.mark("wait");
 #ifdef HW21_PROF
     if (std::getenv("PP_STATS")) {
@@ -655,33 +721,40 @@ inline bool lower(u32 *slot, u32 nd)
     return false;
 }
 
-// One batch of distinct sources, searched together. Items are packed (s << 26 | v).
+// One batch of distinct sources, searched together over slots. Items are packed (s << 26 | slot).
 class Search {
 public:
-    Search(Node &node, const Graph &g, u64 N, int cap, Prof &prof)
-        : node(node), g(g), N(N), prof(prof), P(node.size), r(node.rank)
+    Search(Node &node, const Graph &g, int cap, Prof &prof)
+        : node(node), g(g), n(g.n), prof(prof), P(node.size), r(node.rank)
     {
-        // A vertex is settled at most once per source, so N * cap bounds one round's frontier;
-        // the coarse prefix keeps one entry per 64 items plus two per rank.
-        dist = node.alloc<u32>(N * cap, "dist");
-        front = node.alloc<u32>(N * cap, "front");
-        coarse = node.alloc<u64>(N * cap / 64 + 2 * u64(P) + 1, "coarse");
+        // A slot is settled at most once per source, so n * cap bounds one round's frontier; the
+        // coarse prefix keeps one entry per 64 items plus two per rank. All three go in the
+        // outbox's old space when they fit (they do unless edgefactor is tiny), else new windows.
+        const u64 nd = page_up(4 * n * cap), nc = n * cap / 64 + 2 * u64(P) + 1;
+        if (2 * nd + 8 * nc <= g.spare_bytes) {
+            dist = reinterpret_cast<u32 *>(g.spare);
+            front = reinterpret_cast<u32 *>(g.spare + nd);
+            coarse = reinterpret_cast<u64 *>(g.spare + 2 * nd);
+        } else {
+            dist = node.alloc<u32>(n * cap, "dist");
+            front = node.alloc<u32>(n * cap, "front");
+            coarse = node.alloc<u64>(nc, "coarse");
+        }
         info.resize(3 * u64(P));
         off.resize(P);
         coff.resize(P);
         arc0.resize(P + 1);
     }
 
-    // Distances of srcs[0..n) into dist[s * N + v]; INF where unreachable.
-    void run(const u32 *srcs, int n)
+    // Distances from slots srcs[0..k) into dist[s * n + slot]; INF where unreachable.
+    void run(const u32 *srcs, int k)
     {
-        sb = n;
-        const u64 len = N * u64(n), lo = len * r / P, hi = len * (r + 1) / P;
+        const u64 len = n * u64(k), lo = len * r / P, hi = len * (r + 1) / P;
         std::fill(dist + lo, dist + hi, INF);
         node.sync();
-        for (int s = 0; s < n; s++)
+        for (int s = 0; s < k; s++)
             if (s % P == r) {
-                dist[u64(s) * N + srcs[s]] = 0;
+                dist[u64(s) * n + srcs[s]] = 0;
                 ring[0].push_back(u32(s) << VBITS | srcs[s]);
             }
 
@@ -700,19 +773,19 @@ public:
             for (u64 x = next; x < next + RING; x++) {
                 std::vector<u32> &b = ring[x % RING];
                 if (b.empty()) continue;
-                size_t k = 0;
+                size_t m = 0;
                 u64 a = 0;
                 for (const u32 it : b) {
                     const u32 v = it & VMASK;
-                    if (__atomic_load_n(&dist[u64(it >> VBITS) * N + v], __ATOMIC_RELAXED) == x) {
-                        b[k++] = it;
+                    if (__atomic_load_n(&dist[u64(it >> VBITS) * n + v], __ATOMIC_RELAXED) == x) {
+                        b[m++] = it;
                         a += g.adj[v].deg;
                     }
                 }
-                b.resize(k);
-                if (k) {
+                b.resize(m);
+                if (m) {
                     mine[0] = x;
-                    mine[1] = k;
+                    mine[1] = m;
                     mine[2] = a;
                     break;
                 }
@@ -750,7 +823,12 @@ public:
                     a += g.adj[b[j] & VMASK].deg;
                 }
                 coarse[coff[r] + (b.size() + 63) / 64] = a;
-                b.clear();
+                // Published, so the private copy can go; a big one goes for good, or 256 buckets
+                // each keeping its peak capacity outgrow the private cap (scale 24 at P = 1 did).
+                if (b.capacity() > (u64(1) << 16))
+                    std::vector<u32>().swap(b);
+                else
+                    b.clear();
             }
             const double t3 = tick();
             node.sync();
@@ -786,10 +864,9 @@ public:
 private:
     Node &node;
     const Graph &g;
-    const u64 N;
+    const u64 n;
     Prof &prof;
     const int P, r;
-    int sb = 0;
     u32 *dist, *front;
     u64 *coarse;
     std::vector<u32> ring[RING];
@@ -846,14 +923,14 @@ private:
         }
     }
 
-    void relax(u32 s, u32 d, u64 e0, u64 n)
+    void relax(u32 s, u32 d, u64 e0, u64 k)
     {
-        u32 *ds = dist + u64(s) * N;
+        u32 *ds = dist + u64(s) * n;
         const u32 *col = g.col + e0;
         const u8 *w = g.w + e0;
         constexpr u64 PF = 16;
-        for (u64 e = 0; e < n; e++) {
-            if (e + PF < n) __builtin_prefetch(ds + col[e + PF]);
+        for (u64 e = 0; e < k; e++) {
+            if (e + PF < k) __builtin_prefetch(ds + col[e + PF]);
             const u32 y = col[e], nd = d + w[e];
             if (lower(ds + y, nd)) {
                 ring[nd % RING].push_back(s << VBITS | y);
@@ -887,8 +964,10 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
         const u64 N = num_vertices(p);
 
         const Graph g = build(node, p, fd, prof);
+        const std::vector<u32> samples = r == 0 ? sample_vertices(p) : std::vector<u32>();
 
-        // Distinct sources, first-occurrence order; repeats copy their twin's result.
+        // Distinct sources, first-occurrence order; repeats copy their twin's result. A source
+        // with no slot is isolated: it reaches itself alone, and needs no search.
         std::vector<u32> uniq;
         std::vector<int> which(sources.size());
         for (size_t i = 0; i < sources.size(); i++) {
@@ -896,55 +975,73 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
             which[i] = int(it - uniq.begin());
             if (it == uniq.end()) uniq.push_back(sources[i]);
         }
-
-        // dist + frontier + coarse prefix cost about 8.125 N bytes per source searched together.
-        const u64 budget = u64(20) << 30;
-        int cap = int(std::max<u64>(1, std::min<u64>(uniq.size(), budget / (N * 8 + N / 8 + 1))));
-        if (const char *e = std::getenv("PP_BATCH")) cap = std::max(1, std::min(cap, std::atoi(e)));
-        prof.count("batches", r == 0 ? (uniq.size() + cap - 1) / cap : 0);
-
-        Search search(node, g, N, cap, prof);
-        const std::vector<u32> samples = r == 0 ? sample_vertices(p) : std::vector<u32>();
         std::vector<SourceResult> found(uniq.size());
+        std::vector<u32> todo, todo_slot;   // the searched ones: index into uniq, and slot
+        for (size_t u = 0; u < uniq.size(); u++) {
+            const u32 s = g.slot(uniq[u]);
+            if (s != INF) {
+                todo.push_back(u32(u));
+                todo_slot.push_back(s);
+            } else if (r == 0) {
+                SourceResult &res = found[u];
+                res.n_reached = 1;
+                res.checksum = 0;
+                res.digest1 = distance_digest(uniq[u], 0, 0);
+                res.digest2 = distance_digest(uniq[u], 0, 1);
+                res.sample_dist.resize(samples.size());
+                for (size_t k = 0; k < samples.size(); k++) res.sample_dist[k] = samples[k] == uniq[u] ? 0 : -1;
+            }
+        }
+
+        // dist + frontier + coarse prefix cost about 8.125 bytes per slot and source.
+        const u64 budget = u64(20) << 30;
+        int cap = int(std::max<u64>(1, std::min<u64>(todo.size(), budget / (g.n * 8 + g.n / 8 + 1))));
+        if (const char *e = std::getenv("PP_BATCH")) cap = std::max(1, std::min(cap, std::atoi(e)));
+        prof.count("batches", r == 0 ? (todo.size() + cap - 1) / cap : 0);
+
+        Search search(node, g, cap, prof);
         prof.mark("setup");
 
-        for (size_t b0 = 0; b0 < uniq.size(); b0 += cap) {
-            const int n = int(std::min<size_t>(cap, uniq.size() - b0));
-            search.run(uniq.data() + b0, n);
+        for (size_t b0 = 0; b0 < todo.size(); b0 += cap) {
+            const int k = int(std::min<size_t>(cap, todo.size() - b0));
+            search.run(todo_slot.data() + b0, k);
             prof.mark("traverse");
 
-            // n_reached, checksum, digest1, digest2 over my slice of the vertices.
+            // n_reached, checksum, digest1, digest2 over my slice of the slots.
             const u32 *dist = search.distances();
-            std::vector<u64> sums(4 * u64(n), 0), total(4 * u64(n), 0);
-            const u64 v0 = N * r / P, v1 = N * (r + 1) / P;
-            for (int s = 0; s < n; s++) {
-                const u32 *ds = dist + u64(s) * N;
+            std::vector<u64> sums(4 * u64(k), 0), total(4 * u64(k), 0);
+            const u64 s0 = g.n * r / P, s1 = g.n * (r + 1) / P;
+            for (int s = 0; s < k; s++) {
+                const u32 *ds = dist + u64(s) * g.n;
                 u64 cnt = 0, cs = 0, d1 = 0, d2 = 0;
-                for (u64 v = v0; v < v1; v++) {
-                    const u32 dv = ds[v];
+                for (u64 x = s0; x < s1; x++) {
+                    const u32 dv = ds[x];
                     if (dv == INF) continue;
+                    const u32 v = g.vertex(u32(x));
                     cnt++;
-                    cs += u64(dv) * (v + 1);
-                    d1 += distance_digest(u32(v), dv, 0);
-                    d2 += distance_digest(u32(v), dv, 1);
+                    cs += u64(dv) * (u64(v) + 1);
+                    d1 += distance_digest(v, dv, 0);
+                    d2 += distance_digest(v, dv, 1);
                 }
                 sums[4 * s] = cnt;
                 sums[4 * s + 1] = cs;
                 sums[4 * s + 2] = d1;
                 sums[4 * s + 3] = d2;
             }
-            MPI_Reduce(sums.data(), total.data(), 4 * n, MPI_UINT64_T, MPI_SUM, 0, comm);
+            MPI_Reduce(sums.data(), total.data(), 4 * k, MPI_UINT64_T, MPI_SUM, 0, comm);
             if (r == 0)
-                for (int s = 0; s < n; s++) {
-                    SourceResult &res = found[b0 + s];
+                for (int s = 0; s < k; s++) {
+                    SourceResult &res = found[todo[b0 + s]];
                     res.n_reached = int64_t(total[4 * s]);
                     res.checksum = total[4 * s + 1];
                     res.digest1 = total[4 * s + 2];
                     res.digest2 = total[4 * s + 3];
-                    const u32 *ds = dist + u64(s) * N;
+                    const u32 *ds = dist + u64(s) * g.n;
                     res.sample_dist.resize(samples.size());
-                    for (size_t k = 0; k < samples.size(); k++)
-                        res.sample_dist[k] = ds[samples[k]] == INF ? -1 : int32_t(ds[samples[k]]);
+                    for (size_t j = 0; j < samples.size(); j++) {
+                        const u32 x = g.slot(samples[j]);
+                        res.sample_dist[j] = x == INF || ds[x] == INF ? -1 : int32_t(ds[x]);
+                    }
                 }
             node.sync();   // rank 0 is done reading before the next batch overwrites dist
             prof.mark("results");
@@ -963,9 +1060,10 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
         node.release_all();
         prof.mark("release");
         if (Prof::on && r == 0)
-            std::fprintf(stderr, "[hw2-1] P=%d N=%llu M=%llu arcs=%llu sources=%zu distinct=%zu batch=%d\n", P,
-                         (unsigned long long)N, (unsigned long long)num_edges(p), (unsigned long long)g.arcs,
-                         sources.size(), uniq.size(), cap);
+            std::fprintf(stderr,
+                         "[hw2-1] P=%d N=%llu M=%llu arcs=%llu slots=%llu sources=%zu distinct=%zu searched=%zu batch=%d\n",
+                         P, (unsigned long long)N, (unsigned long long)num_edges(p), (unsigned long long)g.arcs,
+                         (unsigned long long)g.n, sources.size(), uniq.size(), todo.size(), cap);
         prof.report(comm, r);
     }
     MPI_Comm_free(&comm);
