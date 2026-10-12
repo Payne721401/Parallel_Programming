@@ -10,28 +10,41 @@ set -euo pipefail
 #
 # Modes: public (public cases against their goldens, at PUBLIC_NP ranks), custom (edge cases
 # against the starter, at several rank counts), knobs (the custom cases under each PP_* knob),
-# all (the three). The practice QoS `hw` allows at most 8 tasks, and caps a job's memory below
-# what scale 25-26 need at 8 ranks, so 09 and 10 are left to `hw2-1-judge`, which also gives
-# the official 24-rank times (`hw2-1-judge 09`: one case, no cooldown, scoreboard untouched).
+# all (the three), and ab: this hw2-1.cpp against an earlier one from git, the two alternating
+# on the same node in the same allocation, which is the only fair way to tell whether a change
+# made things faster. The practice QoS `hw` allows at most 8 tasks (cpu=16 with nomultithread)
+# and 32G per job, so 09 and 10 are left to `hw2-1-judge`, which also gives the official
+# 24-rank times (`hw2-1-judge 09`: one case, no cooldown, scoreboard untouched).
+#
+#   salloc -N1 -n8 -c1 --hint=nomultithread --mem=32G -t 30 bash ../tests/run_hw2-1.sh ab
 #
 # Env overrides:
-#   CASES="01 04"      public subset (default: all but 09 and 10; CASES=all for every case)
-#   PUBLIC_NP=8        ranks for the public cases
-#   REPEAT=3           runs per public case; the table shows the best and the median
+#   CASES="01 04"      cases (public default: all but 09 and 10, CASES=all for every case;
+#                      ab default: 04 05 07 08 12 13)
+#   PUBLIC_NP=8        ranks for the public and ab runs
+#   REPEAT=3           runs per case (ab default 3); tables show the best and the median
+#   AB_REF=<git rev>   ab's baseline (default: HEAD if hw2-1.cpp has uncommitted changes, else
+#                      the version before its last commit)
 #   RANKS="1 3 8"      rank counts for custom
 #   KNOBS="PP_BATCH=1 PP_BATCH=3"   one extra pass of the custom cases per knob
 #   KNOB_RANKS="8"     rank counts for the knob passes
-#   TIMING=1           pass PP_TIMING=1 and show the per-phase breakdown
+#   TIMING=1           public runs get PP_TIMING=1; each shows its phases' slowest rank on one line
+#   VERBOSE=1          custom and knob runs print a line per run (default: a dot per pass)
 #   CASES_DIR, OUT_ROOT
+#
+# Every run's output is checked with hw2-1-check, which compares every field (n_reached,
+# checksum, both digests, every sampled distance), against the course's golden for the public
+# cases and against the starter's own output (hw2-1-seq, one rank) for the custom ones. Logs of
+# each run stay under OUT_ROOT.
 #
 # Every run is under `ulimit -d 1228800`, the judge's 1200 MiB private-data cap. Exits nonzero
 # if anything fails.
 
 mode="${1:-public}"
 case "$mode" in
-    public|custom|knobs|all) ;;
+    public|custom|knobs|all|ab) ;;
     *)
-        echo "usage: $0 [public|custom|knobs|all]" >&2
+        echo "usage: $0 [public|custom|knobs|all|ab]" >&2
         exit 2
         ;;
 esac
@@ -46,8 +59,13 @@ if [[ ! -d "$cases_dir/hw2-1" && -d /home/share/pp26/cases/hw2-1 ]]; then
     cases_dir=/home/share/pp26/cases
 fi
 out_root="${OUT_ROOT:-tmp/hw2-1-tests}"
-repeat="${REPEAT:-1}"
-public_cases="${CASES:-01 02 03 04 05 06 07 08 11 12 13 14 15 16 17}"
+if [[ "$mode" == ab ]]; then
+    repeat="${REPEAT:-3}"
+    public_cases="${CASES:-04 05 07 08 12 13}"
+else
+    repeat="${REPEAT:-1}"
+    public_cases="${CASES:-01 02 03 04 05 06 07 08 11 12 13 14 15 16 17}"
+fi
 if [[ "$public_cases" == all ]]; then
     public_cases="01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17"
 fi
@@ -83,25 +101,36 @@ require_path() {
 }
 
 public_shape=(srun -N1 -n"$public_np" -c1 --hint=nomultithread)
+bin=./hw2-1    # the program run_one runs (ab swaps in the baseline)
 passed=0
 failed=0
 failures=()
+timing_now=0   # PP_TIMING for this batch of runs (the public ones, when TIMING=1)
+quiet_now=0    # passes print a dot instead of a line (custom and knobs, unless VERBOSE=1)
+dots_open=0    # a line of dots is waiting for its newline
+
+# The PP_TIMING breakdown on one line: each phase's slowest rank, then the round count.
+compact_timing() {
+    awk '/^\[hw2-1\] [a-z]+ +max/ { printf "%s %s  ", $2, $4 }
+         /^\[hw2-1\] rounds/      { printf "rounds %s", $4 }
+         END                      { print "" }' "$1"
+}
 
 # run_one <label> <log prefix> <golden> <input> <output> <env...> -- <launcher...>
-# Runs the program once, checks it, and prints one line. Leaves time/threads in $last_time and
-# $last_threads.
+# Runs the program once and checks its output with hw2-1-check against the golden. Leaves
+# time/threads in $last_time and $last_threads.
 run_one() {
     local label="$1" log="$2" golden="$3" input="$4" output="$5"
     shift 5
     local envs=()
     while [[ "$1" != "--" ]]; do envs+=("$1"); shift; done
     shift
-    [[ "${TIMING:-0}" == "1" ]] && envs+=(PP_TIMING=1)
+    ((timing_now)) && envs+=(PP_TIMING=1)
 
     local status
     rm -f "$output"
     # </dev/null: srun forwards stdin to task 0, which would swallow the case list being read.
-    if env ${envs[@]+"${envs[@]}"} "$@" ./hw2-1 "$input" "$output" </dev/null >"$log.out" 2>"$log.err"; then
+    if env ${envs[@]+"${envs[@]}"} "$@" "$bin" "$input" "$output" </dev/null >"$log.out" 2>"$log.err"; then
         if [[ ! -f "$output" ]]; then
             status=NO
         elif hw2-1-check "$golden" "$output" >"$log.check" 2>&1; then
@@ -116,16 +145,24 @@ run_one() {
     last_threads="$(sed -n 's/^Threads: \([0-9-]*\).*/\1/p' "$log.out")"
     last_time="${last_time:--}"
     last_threads="${last_threads:--}"
-    printf '%-4s %-34s time %-12s threads %s\n' "$status" "$label" "$last_time" "$last_threads"
-    if [[ "${TIMING:-0}" == "1" ]]; then grep '^\[hw2-1\]' "$log.err" | sed 's/^/       /' || true; fi
+    last_status="$status"
     if [[ "$status" == PASS ]]; then
         passed=$((passed + 1))
-    else
+        if ((quiet_now)) && [[ "${VERBOSE:-0}" != "1" ]]; then
+            printf '.'
+            dots_open=1
+            return
+        fi
+    fi
+    ((dots_open)) && echo
+    dots_open=0
+    printf '%-4s %-34s time %-12s threads %s\n' "$status" "$label" "$last_time" "$last_threads"
+    if ((timing_now)); then printf '       %s\n' "$(compact_timing "$log.err")"; fi
+    if [[ "$status" != PASS ]]; then
         failed=$((failed + 1))
         failures+=("$label ($status, see $log.*)")
         sed 's/^/       /' "$log.err" | tail -n 5 || true
     fi
-    last_status="$status"
 }
 
 build() {
@@ -144,6 +181,8 @@ run_public() {
     printf 'case\trep\tstatus\ttime\tthreads\n' >"$summary"
 
     echo "== public cases: ${public_shape[*]}, REPEAT=$repeat =="
+    [[ "${TIMING:-0}" == "1" ]] && timing_now=1
+    quiet_now=0
     local c rep
     for c in $public_cases; do
         local input="$cases_dir/hw2-1/$c.txt" golden="$cases_dir/hw2-1/$c.golden.bin"
@@ -154,6 +193,7 @@ run_public() {
             printf '%s\t%s\t%s\t%s\t%s\n' "$c" "$rep" "$last_status" "$last_time" "$last_threads" >>"$summary"
         done
     done
+    timing_now=0
 
     # Best and median per case, next to the previous run's.
     echo "== public summary (seconds; prev = last run of this mode) =="
@@ -218,17 +258,90 @@ make_goldens() {
 run_custom() {
     local title="$1" rks="$2"
     shift 2
-    local dir="$out_root/custom" n name args
+    local dir="$out_root/custom" n name args before=$failed runs=0
     echo "== $title =="
+    quiet_now=1
     while read -r name args; do
         for n in $rks; do
             run_one "$name -n$n${1:+ $*}" "$dir/$name.n$n${1:+.${1//=/}}" "$dir/$name.golden.bin" \
                 "$dir/$name.txt" "$dir/$name.out.bin" "$@" -- srun -N1 -n"$n" -c1 --hint=nomultithread
+            runs=$((runs + 1))
         done
     done < <(custom_inputs)
+    quiet_now=0
+    ((dots_open)) && echo
+    dots_open=0
+    echo "   $runs runs, $((failed - before)) failed"
+}
+
+# median of the numbers on stdin, one per line
+median() {
+    sort -g | awk '{a[NR]=$1} END{if (NR) print a[int((NR+1)/2)]; else print "-"}'
+}
+
+# The baseline for ab: AB_REF, or HEAD when hw2-1.cpp has uncommitted changes, or else the
+# version just before the last commit that changed it.
+ab_ref() {
+    if [[ -n "${AB_REF:-}" ]]; then
+        echo "$AB_REF"
+    elif ! git diff --quiet HEAD -- hw2-1.cpp; then
+        echo HEAD
+    else
+        echo "$(git log -n 1 --format=%H -- hw2-1.cpp)^"
+    fi
+}
+
+run_ab() {
+    local dir="$out_root/ab" ref
+    mkdir -p "$dir"
+    ref="$(ab_ref)"
+    git show "$ref:./hw2-1.cpp" >"$dir/base.cpp"
+    mpicxx -std=c++17 -O3 -march=native -I. -c "$dir/base.cpp" -o "$dir/base.o"
+    mpicxx -std=c++17 -O3 -march=native -o "$dir/hw2-1-base" main.o graph_gen.o "$dir/base.o"
+    echo "== ab: base = hw2-1.cpp at $(git log -n 1 --format='%h "%s"' "$ref" | cut -c1-70)"
+    echo "         new  = hw2-1.cpp in the working tree; ${public_shape[*]}, REPEAT=$repeat =="
+
+    local tsv="$dir/ab.tsv" c rep which
+    printf 'case\twhich\trep\tstatus\ttime\n' >"$tsv"
+    quiet_now=1
+    for c in $public_cases; do
+        local input="$cases_dir/hw2-1/$c.txt" golden="$cases_dir/hw2-1/$c.golden.bin"
+        require_path "$input"
+        require_path "$golden"
+        for ((rep = 1; rep <= repeat; rep++)); do
+            # Alternate who goes first, so neither side always runs on a warmer node.
+            local order="base new"
+            ((rep % 2 == 0)) && order="new base"
+            for which in $order; do
+                if [[ "$which" == base ]]; then bin="$dir/hw2-1-base"; else bin=./hw2-1; fi
+                run_one "ab $c $which #$rep" "$dir/$c.$which.$rep" "$golden" "$input" "$dir/$c.out.bin" \
+                    -- "${public_shape[@]}"
+                printf '%s\t%s\t%s\t%s\t%s\n' "$c" "$which" "$rep" "$last_status" "$last_time" >>"$tsv"
+            done
+        done
+    done
+    bin=./hw2-1
+    quiet_now=0
+    ((dots_open)) && echo
+    dots_open=0
+
+    echo "== ab summary (seconds; change = new median vs base median) =="
+    printf '%-5s %-10s %-10s %-10s %-10s %s\n' case base_best base_med new_best new_med change
+    for c in $public_cases; do
+        local b n bb bm nb nm
+        b="$(awk -F'\t' -v c="$c" '$1==c && $2=="base" && $5!="-"{print $5}' "$tsv")"
+        n="$(awk -F'\t' -v c="$c" '$1==c && $2=="new" && $5!="-"{print $5}' "$tsv")"
+        bb="$(sort -g <<<"$b" | head -n1)"; bm="$(median <<<"$b")"
+        nb="$(sort -g <<<"$n" | head -n1)"; nm="$(median <<<"$n")"
+        printf '%-5s %-10s %-10s %-10s %-10s %s\n' "$c" "${bb:--}" "$bm" "${nb:--}" "$nm" \
+            "$(awk -v b="$bm" -v n="$nm" 'BEGIN{ if (b+0 > 0 && n+0 > 0) printf "%+.1f%%", (n/b - 1) * 100; else print "-" }')"
+    done
 }
 
 build
+if [[ "$mode" == ab ]]; then
+    run_ab
+fi
 if [[ "$mode" == public || "$mode" == all ]]; then
     run_public
 fi
