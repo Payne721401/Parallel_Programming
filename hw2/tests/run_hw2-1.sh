@@ -1,24 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# HW 2-1 tests, for SEIREN. Run from anywhere: the script works in hw2/hw2-1. Run it inside one
-# allocation, so each srun is a job step instead of a fresh job in the queue. The practice QoS
-# `hw` allows at most 8 tasks, so the judge's 24-rank shape is out of reach here: official
-# 24-rank times come from `hw2-1-judge NN` (one case: no cooldown, scoreboard untouched).
+# HW 2-1 tests, for SEIREN. Run from anywhere: the script works in hw2/hw2-1. It must run inside
+# one allocation, where each srun is a job step; outside one, every srun would be a fresh job in
+# the queue, so the script refuses. Hand the script to salloc, so the allocation ends with it
+# (and a refused salloc runs nothing):
 #
-#   salloc -N1 -n8 -c1 --hint=nomultithread --mem=48G -t 60
-#   bash ../tests/run_hw2-1.sh public     # every public case against its golden, at PUBLIC_NP ranks
-#   bash ../tests/run_hw2-1.sh custom     # edge cases against the starter, at several rank counts
-#   bash ../tests/run_hw2-1.sh knobs      # the custom cases again under each PP_* knob
-#   bash ../tests/run_hw2-1.sh all        # all three
+#   salloc -N1 -n8 -c1 --hint=nomultithread -t 30 bash ../tests/run_hw2-1.sh all
+#
+# Modes: public (public cases against their goldens, at PUBLIC_NP ranks), custom (edge cases
+# against the starter, at several rank counts), knobs (the custom cases under each PP_* knob),
+# all (the three). The practice QoS `hw` allows at most 8 tasks, and caps a job's memory below
+# what scale 25-26 need at 8 ranks, so 09 and 10 are left to `hw2-1-judge`, which also gives
+# the official 24-rank times (`hw2-1-judge 09`: one case, no cooldown, scoreboard untouched).
 #
 # Env overrides:
-#   CASES="01 04 10"   public subset (default: all 17)
-#   PUBLIC_NP=8        ranks for the public cases (24 = the judge's shape, where a QoS allows it)
+#   CASES="01 04"      public subset (default: all but 09 and 10; CASES=all for every case)
+#   PUBLIC_NP=8        ranks for the public cases
 #   REPEAT=3           runs per public case; the table shows the best and the median
-#   RANKS="1 2 3 5 8"  rank counts for custom
+#   RANKS="1 3 8"      rank counts for custom
 #   KNOBS="PP_BATCH=1 PP_BATCH=3"   one extra pass of the custom cases per knob
-#   KNOB_RANKS="5 8"   rank counts for the knob passes
+#   KNOB_RANKS="8"     rank counts for the knob passes
 #   TIMING=1           pass PP_TIMING=1 and show the per-phase breakdown
 #   CASES_DIR, OUT_ROOT
 #
@@ -45,11 +47,20 @@ if [[ ! -d "$cases_dir/hw2-1" && -d /home/share/pp26/cases/hw2-1 ]]; then
 fi
 out_root="${OUT_ROOT:-tmp/hw2-1-tests}"
 repeat="${REPEAT:-1}"
-public_cases="${CASES:-01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17}"
+public_cases="${CASES:-01 02 03 04 05 06 07 08 11 12 13 14 15 16 17}"
+if [[ "$public_cases" == all ]]; then
+    public_cases="01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17"
+fi
 public_np="${PUBLIC_NP:-8}"
-ranks="${RANKS:-1 2 3 5 8}"
+ranks="${RANKS:-1 3 8}"
 knobs="${KNOBS:-PP_BATCH=1 PP_BATCH=3}"
-knob_ranks="${KNOB_RANKS:-5 8}"
+knob_ranks="${KNOB_RANKS:-8}"
+
+if [[ -z "${SLURM_JOB_ID:-}" && "${OUTSIDE_OK:-0}" != "1" ]]; then
+    echo "not inside an allocation: every srun would queue as its own job. Run it as" >&2
+    echo "  salloc -N1 -n8 -c1 --hint=nomultithread -t 30 bash $0 $mode" >&2
+    exit 1
+fi
 
 if [[ "${NO_ULIMIT:-0}" != "1" ]]; then
     ulimit -d 1228800   # NO_ULIMIT=1 only for dry runs on machines without RLIMIT_DATA
@@ -118,7 +129,6 @@ run_one() {
 }
 
 build() {
-    make clean >/dev/null
     make
 }
 

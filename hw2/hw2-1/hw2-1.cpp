@@ -5,9 +5,9 @@
 // be split by arcs rather than by who happens to own a vertex.
 //
 //   build     every rank generates M/P edges, drops self-loops, and sorts the two arcs of each
-//             edge into a shared outbox by owner (v mod P, so scramble = 0's low-id hubs spread
-//             out). Each owner then reads its arcs twice: once to size its adjacency lists, once
-//             to fill them into the shared CSR.
+//             edge into a shared outbox by owner (mix(v) mod P, where mix is a bijection that
+//             spreads scramble = 0's degree-laden low bits). Each owner then reads its arcs twice:
+//             once to size its adjacency lists, once to fill them into the shared CSR.
 //   traverse  all distinct sources at once, one distance value per round. Weights are integers
 //             >= 1, so every (source, vertex) whose tentative distance equals the round's value d
 //             is final: each is expanded exactly once. A round publishes the frontier to a shared
@@ -17,7 +17,8 @@
 //   results   each rank sums a contiguous slice of the vertices; MPI_Reduce brings it to rank 0.
 //
 // Phases are separated by MPI_Win_sync + MPI_Barrier, which is what makes one rank's plain stores
-// into a window visible to the others. PP_TIMING=1 prints a per-phase breakdown to stderr;
+// into a window visible to the others. PP_TIMING=1 prints a per-phase breakdown to stderr, with
+// time spent waiting at the barriers under "wait", so max vs min of a phase shows its imbalance;
 // PP_BATCH=n caps the sources searched together (for testing the batching path).
 #include <mpi.h>
 
@@ -50,6 +51,59 @@ struct FastDiv {
     explicit FastDiv(u32 d_) : m(d_ == 1 ? 0 : ~u64(0) / d_ + 1), d(d_) {}
     u32 div(u32 a) const { return d == 1 ? a : u32((__uint128_t(m) * a) >> 64); }
     u32 mod(u32 a) const { return d == 1 ? 0 : u32((__uint128_t(m * a) * d) >> 64); }
+};
+
+// A bijection on [0, 2^bits) that stirs every bit of a vertex id into its low bits. Raw Kronecker
+// ids (scramble = 0) wear their degree in their bits: each 0 bit makes a vertex about three times
+// heavier, so v mod P hands the owner of residue 0 most of the arcs (about 44% at P = 8). Owners
+// and local slots come from mix(v) instead; the graph itself keeps the original ids.
+class Mix {
+public:
+    explicit Mix(int bits)
+        : mask((u64(1) << bits) - 1), sh(std::max(1, bits / 2)), bits(bits),
+          i1(inverse(K1)), i2(inverse(K2)), i3(inverse(K3))
+    {
+    }
+
+    u32 fwd(u32 v) const
+    {
+        u64 x = v;
+        x = (x * K1) & mask;
+        x ^= x >> sh;
+        x = (x * K2) & mask;
+        x ^= x >> sh;
+        return u32((x * K3) & mask);
+    }
+
+    u32 inv(u32 h) const
+    {
+        u64 x = h;
+        x = unshift((x * i3) & mask);
+        x = unshift((x * i2) & mask);
+        return u32((x * i1) & mask);
+    }
+
+private:
+    static constexpr u64 K1 = 0x9e3779b97f4a7c15ULL, K2 = 0xbf58476d1ce4e5b9ULL, K3 = 0x94d049bb133111ebULL;
+    u64 mask;
+    int sh, bits;
+    u64 i1, i2, i3;
+
+    // Inverse of y = x ^ (x >> sh): x = y ^ (y >> sh) ^ (y >> 2 sh) ^ ...
+    u64 unshift(u64 y) const
+    {
+        u64 x = y;
+        for (int s = sh; s < bits; s += sh) x ^= y >> s;
+        return x;
+    }
+
+    // Odd a's inverse modulo 2^64 by Newton's iteration; it is also the inverse modulo 2^bits.
+    static u64 inverse(u64 a)
+    {
+        u64 x = a;
+        for (int i = 0; i < 6; i++) x *= 2 - a * x;
+        return x;
+    }
 };
 
 // The ranks that share memory, and the windows they share. alloc() is collective: rank 0 maps
@@ -172,11 +226,13 @@ struct Graph {
     u64 arcs;
 };
 
-// Generates this rank's slice of the edges and builds the shared CSR. Owner of v: v mod P.
+// Generates this rank's slice of the edges and builds the shared CSR. Vertex v belongs to owner
+// mix(v) mod P, in local slot mix(v) / P.
 Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
 {
     const int P = node.size, r = node.rank;
     const u64 N = num_vertices(p), M = num_edges(p);
+    const Mix mix(p.scale);
 
     // Generate edges [M r / P, M (r + 1) / P), self-loops dropped, packed (u | v << 26 | w << 52),
     // into this rank's stretch of a shared window: M / P edges privately would be 1 GiB at
@@ -195,14 +251,15 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
             for (u64 j = 0; j < n; j++) {
                 if (uu[j] == vv[j]) continue;
                 edges[e0 + kept++] = u64(uu[j]) | u64(vv[j]) << VBITS | u64(ww[j]) << 52;
-                to_owner[fd.mod(uu[j])]++;
-                to_owner[fd.mod(vv[j])]++;
+                to_owner[fd.mod(mix.fwd(uu[j]))]++;
+                to_owner[fd.mod(mix.fwd(vv[j]))]++;
             }
         }
     }
     prof.mark("generate");
 
     // Outbox: rank q's segment, and inside it one run per owner. sent[q * P + o] = arcs q -> o.
+    // An arc is packed (mix(src) | dst << 26 | w << 52): the owner needs src only as a slot.
     std::vector<u64> sent(u64(P) * P);
     MPI_Allgather(to_owner.data(), P, MPI_UINT64_T, sent.data(), P, MPI_UINT64_T, node.comm);
     std::vector<u64> run_begin(u64(P) * P);   // [q * P + o]: where q's run for o starts
@@ -213,20 +270,23 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
             total += sent[u64(q) * P + o];
         }
     u64 *outbox = node.alloc<u64>(total);
+    prof.mark("wait");
     {
         std::vector<u64> cur(run_begin.begin() + u64(r) * P, run_begin.begin() + u64(r + 1) * P);
         for (u64 i = e0; i < e0 + kept; i++) {
-            const u64 e = edges[i];
+            const u64 e = edges[i], w = (e >> 52) << 52;
             const u32 u = u32(e & VMASK), v = u32((e >> VBITS) & VMASK);
-            outbox[cur[fd.mod(u)]++] = e;                                        // u -> v
-            outbox[cur[fd.mod(v)]++] = u64(v) | u64(u) << VBITS | (e >> 52) << 52;   // v -> u
+            const u32 hu = mix.fwd(u), hv = mix.fwd(v);
+            outbox[cur[fd.mod(hu)]++] = u64(hu) | u64(v) << VBITS | w;   // u -> v
+            outbox[cur[fd.mod(hv)]++] = u64(hv) | u64(u) << VBITS | w;   // v -> u
         }
     }
+    prof.mark("scatter");
     node.sync();
     node.release(edges);
-    prof.mark("scatter");
+    prof.mark("wait");
 
-    // Owner r: local vertices v = r + li * P. First pass sizes their lists.
+    // Owner r: slots h = r + li * P, vertex mix^-1(h). First pass sizes their lists.
     const u64 nloc = N > u64(r) ? (N - 1 - r) / P + 1 : 0;
     std::vector<u32> pos(nloc, 0);
     auto for_my_arcs = [&](auto &&f) {
@@ -239,8 +299,10 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     for_my_arcs([&](u64 a) { pos[fd.div(u32(a & VMASK))]++; });
     u64 mine = 0;
     for (u64 li = 0; li < nloc; li++) mine += pos[li];
+    prof.mark("count");
     std::vector<u64> owned(P);
     MPI_Allgather(&mine, 1, MPI_UINT64_T, owned.data(), 1, MPI_UINT64_T, node.comm);
+    prof.mark("wait");
     u64 base = 0, arcs = 0;
     for (int q = 0; q < P; q++) {
         if (q < r) base += owned[q];
@@ -253,12 +315,12 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     g.col = node.alloc<u32>(arcs);
     g.w = node.alloc<u8>(arcs);
     for (u64 li = 0, at = base; li < nloc; li++) {
-        g.adj[r + li * P] = {u32(at), pos[li]};
+        g.adj[mix.inv(u32(r + li * P))] = {u32(at), pos[li]};
         const u64 d = pos[li];
         pos[li] = u32(at);   // now the fill cursor
         at += d;
     }
-    prof.mark("count");
+    prof.mark("alloc");
 
     // Second pass fills them.
     for_my_arcs([&](u64 a) {
@@ -267,9 +329,10 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
         g.w[at] = u8(a >> 52);
     });
     std::vector<u32>().swap(pos);
+    prof.mark("fill");
     node.sync();
     node.release(outbox);
-    prof.mark("fill");
+    prof.mark("wait");
     return g;
 }
 
