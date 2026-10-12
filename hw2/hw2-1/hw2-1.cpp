@@ -56,17 +56,20 @@ struct FastDiv {
 // A bijection on [0, 2^bits) that stirs every bit of a vertex id into its low bits. Raw Kronecker
 // ids (scramble = 0) wear their degree in their bits: each 0 bit makes a vertex about three times
 // heavier, so v mod P hands the owner of residue 0 most of the arcs (about 44% at P = 8). Owners
-// and local slots come from mix(v) instead; the graph itself keeps the original ids.
+// and local slots come from mix(v) instead; the graph itself keeps the original ids. With
+// scramble = 1 the generator's own bijection has already done this (v mod P gives 11.8-13.0% per
+// owner at P = 8), so mix stays the identity and costs nothing.
 class Mix {
 public:
-    explicit Mix(int bits)
-        : mask((u64(1) << bits) - 1), sh(std::max(1, bits / 2)), bits(bits),
+    Mix(int bits, bool on)
+        : on(on), mask((u64(1) << bits) - 1), sh(std::max(1, bits / 2)), bits(bits),
           i1(inverse(K1)), i2(inverse(K2)), i3(inverse(K3))
     {
     }
 
     u32 fwd(u32 v) const
     {
+        if (!on) return v;
         u64 x = v;
         x = (x * K1) & mask;
         x ^= x >> sh;
@@ -77,6 +80,7 @@ public:
 
     u32 inv(u32 h) const
     {
+        if (!on) return h;
         u64 x = h;
         x = unshift((x * i3) & mask);
         x = unshift((x * i2) & mask);
@@ -85,6 +89,7 @@ public:
 
 private:
     static constexpr u64 K1 = 0x9e3779b97f4a7c15ULL, K2 = 0xbf58476d1ce4e5b9ULL, K3 = 0x94d049bb133111ebULL;
+    bool on;
     u64 mask;
     int sh, bits;
     u64 i1, i2, i3;
@@ -232,7 +237,7 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
 {
     const int P = node.size, r = node.rank;
     const u64 N = num_vertices(p), M = num_edges(p);
-    const Mix mix(p.scale);
+    const Mix mix(p.scale, p.scramble == 0);
 
     // Generate edges [M r / P, M (r + 1) / P), self-loops dropped, packed (u | v << 26 | w << 52),
     // into this rank's stretch of a shared window: M / P edges privately would be 1 GiB at
