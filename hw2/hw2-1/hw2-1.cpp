@@ -7,7 +7,9 @@
 //   build     every rank generates M/P edges, drops self-loops, and sorts the two arcs of each
 //             edge into a shared outbox by owner (mix(v) mod P, where mix is a bijection that
 //             spreads scramble = 0's degree-laden low bits). Each owner then reads its arcs twice:
-//             once to size its adjacency lists, once to fill them into the shared CSR.
+//             once to size its adjacency lists, once to fill them into the shared CSR. The edges
+//             come from FastGen, a bit-exact rendition of graph_gen.cpp's generator that is
+//             checked against the official one before it is trusted.
 //   traverse  all distinct sources at once, one distance value per round. Weights are integers
 //             >= 1, so every (source, vertex) whose tentative distance equals the round's value d
 //             is final: each is expanded exactly once. A round publishes the frontier to a shared
@@ -17,16 +19,30 @@
 //   results   each rank sums a contiguous slice of the vertices; MPI_Reduce brings it to rank 0.
 //
 // Phases are separated by MPI_Win_sync + MPI_Barrier, which is what makes one rank's plain stores
-// into a window visible to the others. PP_TIMING=1 prints a per-phase breakdown to stderr, with
-// time spent waiting at the barriers under "wait", so max vs min of a phase shows its imbalance;
-// PP_BATCH=n caps the sources searched together (for testing the batching path).
+// into a window visible to the others.
+//
+// Measurement exists only in a build with -DHW21_PROF (tests/run_hw2-1.sh builds it as
+// hw2-1-prof); the judge's build compiles none of it. That build prints, per phase, the slowest
+// and fastest rank's time and the most page faults any rank took, time spent waiting at barriers
+// under "wait", timings nested inside phases (window alloc/free, the traversal's parts) and
+// counters. There, PP_STATS=1 adds the graph's shape and PP_PRETOUCH=1 touches the CSR's pages
+// before filling it. In any build, PP_BATCH=n caps the sources searched together and
+// PP_FASTGEN=0 uses the official generator.
 #include <mpi.h>
+#ifdef HW21_PROF
+#include <sys/resource.h>
+#endif
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
+#if defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__AVX512BW__)
+#include <immintrin.h>
+#define HW21_AVX512 1
+#endif
 
 #include "graph_gen.hpp"
 
@@ -41,6 +57,100 @@ constexpr u64 NONE = ~u64(0);
 constexpr int VBITS = 26;                   // N <= 2^26, so a vertex id fits 26 bits
 constexpr u64 VMASK = (u64(1) << VBITS) - 1;
 constexpr int RING = 256;                   // > max weight, so pending values never alias
+
+#ifdef HW21_PROF
+// Per-phase wall time and minor page faults (each first touch of a fresh page, shared windows
+// included), timings nested inside phases, and counters; reduced over the ranks at the end.
+class Prof {
+public:
+    static constexpr bool on = true;
+
+    // Closes the phase that has run since the previous mark.
+    void mark(const char *name)
+    {
+        const double t = MPI_Wtime();
+        const u64 f = faults();
+        Item &it = find(phases, name);
+        it.t += t - last;
+        it.faults += f - flt;
+        last = t;
+        flt = f;
+    }
+
+    // A timing inside the current phase, reported apart from the phases.
+    void sub(const char *what, const char *tag, double t) { find(subs, std::string(what) + tag).t += t; }
+
+    void count(const char *name, u64 v)
+    {
+        for (auto &c : counts)
+            if (c.first == name) { c.second += v; return; }
+        counts.push_back({name, v});
+    }
+
+    void report(MPI_Comm comm, int rank)
+    {
+        for (int kind = 0; kind < 2; kind++)
+            for (Item &it : kind ? subs : phases) {
+                double mx = 0, mn = 0;
+                u64 fmax = 0;
+                MPI_Reduce(&it.t, &mx, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
+                MPI_Reduce(&it.t, &mn, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
+                MPI_Reduce(&it.faults, &fmax, 1, MPI_UINT64_T, MPI_MAX, 0, comm);
+                if (rank != 0) continue;
+                std::fprintf(stderr, "[hw2-1] %-14s max %9.4f s  min %9.4f s", it.name.c_str(), mx, mn);
+                if (!kind) std::fprintf(stderr, "  faults %llu", (unsigned long long)fmax);
+                std::fprintf(stderr, "\n");
+            }
+        for (auto &c : counts) {
+            u64 sum = 0, mx = 0;
+            MPI_Reduce(&c.second, &sum, 1, MPI_UINT64_T, MPI_SUM, 0, comm);
+            MPI_Reduce(&c.second, &mx, 1, MPI_UINT64_T, MPI_MAX, 0, comm);
+            if (rank == 0)
+                std::fprintf(stderr, "[hw2-1] %-14s sum %llu  max/rank %llu\n", c.first.c_str(),
+                             (unsigned long long)sum, (unsigned long long)mx);
+        }
+    }
+
+private:
+    struct Item {
+        std::string name;
+        double t = 0;
+        u64 faults = 0;
+    };
+    std::vector<Item> phases, subs;
+    std::vector<std::pair<std::string, u64>> counts;
+    double last = MPI_Wtime();
+    u64 flt = faults();
+
+    static u64 faults()
+    {
+        rusage ru{};
+        getrusage(RUSAGE_SELF, &ru);
+        return u64(ru.ru_minflt);
+    }
+
+    static Item &find(std::vector<Item> &v, const std::string &name)
+    {
+        for (Item &it : v)
+            if (it.name == name) return it;
+        v.push_back(Item{name});
+        return v.back();
+    }
+};
+#else
+// The judge's build: measurement compiled out, every call an empty inline.
+class Prof {
+public:
+    static constexpr bool on = false;
+    void mark(const char *) {}
+    void sub(const char *, const char *, double) {}
+    void count(const char *, u64) {}
+    void report(MPI_Comm, int) {}
+};
+#endif
+
+// MPI_Wtime in the profiling build, nothing in the judge's.
+inline double tick() { return Prof::on ? MPI_Wtime() : 0.0; }
 
 // Exact quotient and remainder of a 32-bit value by a runtime constant, without a divide
 // (Lemire, Kaser and Kurz, "Faster remainder by direct computation"). Every arc goes through
@@ -111,6 +221,165 @@ private:
     }
 };
 
+// graph_gen.cpp's mix(), the splitmix64 finalizer.
+inline u64 mix64(u64 x)
+{
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+// graph_gen.cpp's generate_edge, bit for bit, several times faster. The official one rederives the
+// seed's hashes and the scramble keys for every edge (writes through uint8_t* may alias p, so the
+// compiler cannot hoist them) and walks the Kronecker descent one level at a time. This one
+// hoists them, decides eight levels per 64-bit word with byte-wise compares, and with AVX-512
+// runs eight edges at once. fastgen_matches() checks it against the official generator first.
+class FastGen {
+public:
+    explicit FastGen(const GraphParams &p)
+        : scale(p.scale), sh(p.scale / 2 > 0 ? p.scale / 2 : 1), scr(p.scramble != 0), ms(mix64(p.seed)),
+          mw(mix64(p.seed ^ 0x77e19470ULL)), mask((u64(1) << p.scale) - 1)
+    {
+        const u64 s = p.seed ^ 0x5c2a3b1eULL;   // scramble_id's seed
+        k1 = mix64(s ^ 0x1111ULL) | 1;
+        k2 = mix64(s ^ 0x2222ULL) | 1;
+        k3 = mix64(s ^ 0x3333ULL) | 1;
+    }
+
+    void edge(u64 i, u32 &u, u32 &v, u8 &w) const
+    {
+        u64 state = mix64(ms ^ (i * HK));   // hash2(seed, i)
+        u32 a = 0, b = 0;
+        for (int base = 0; base < scale; base += 8) {
+            if (base) state = mix64(state);
+            // Per byte r of the word: bit_a = r >= 195, bit_b = (r >= 146 && r < 195) || r >= 243.
+            const u64 g146 = ge(state, 0x1212121212121212ULL), g195 = ge(state, 0x4343434343434343ULL),
+                      g243 = ge(state, 0x7373737373737373ULL);
+            u32 am = pack8(g195), bm = pack8((g146 & ~g195) | g243);
+            if (scale - base < 8) {
+                am &= (1u << (scale - base)) - 1;
+                bm &= (1u << (scale - base)) - 1;
+            }
+            a |= am << base;
+            b |= bm << base;
+        }
+        if (scr) {
+            a = scramble(a);
+            b = scramble(b);
+        }
+        u = a;
+        v = b;
+        const u64 lo = std::min(a, b), hi = std::max(a, b);
+        w = u8(1 + mix64(mw ^ (((hi << 32) | lo) * HK)) % 255);
+    }
+
+    // Edges [i0, i0 + n) into three arrays, as generate_edges does.
+    void edges(u64 i0, u64 n, u32 *u, u32 *v, u8 *w) const
+    {
+        u64 j = 0;
+#ifdef HW21_AVX512
+        for (; j + 8 <= n; j += 8) edges8(i0 + j, u + j, v + j, w + j);
+#endif
+        for (; j < n; j++) edge(i0 + j, u[j], v[j], w[j]);
+    }
+
+private:
+    static constexpr u64 HK = 0xd6e8feb86659fd93ULL;   // hash2's multiplier
+    int scale, sh;
+    bool scr;
+    u64 ms, mw, mask, k1, k2, k3;
+
+    u32 scramble(u64 x) const
+    {
+        x = (x * k1) & mask;
+        x ^= x >> sh;
+        x = (x * k2) & mask;
+        x ^= x >> sh;
+        return u32((x * k3) & mask);
+    }
+
+    // Top bit of each byte of x set where that byte >= c, for c >= 128; l = c - 128 per byte.
+    static u64 ge(u64 x, u64 l)
+    {
+        constexpr u64 H = 0x8080808080808080ULL;
+        return x & ((x | H) - l) & H;
+    }
+
+    // The eight byte-top bits of m as one byte, byte j's to bit j.
+    static u32 pack8(u64 m) { return u32(((m >> 7) * 0x0102040810204080ULL) >> 56); }
+
+#ifdef HW21_AVX512
+    static __m512i mixv(__m512i x)
+    {
+        x = _mm512_add_epi64(x, _mm512_set1_epi64(0x9e3779b97f4a7c15ULL));
+        x = _mm512_mullo_epi64(_mm512_xor_si512(x, _mm512_srli_epi64(x, 30)), _mm512_set1_epi64(0xbf58476d1ce4e5b9ULL));
+        x = _mm512_mullo_epi64(_mm512_xor_si512(x, _mm512_srli_epi64(x, 27)), _mm512_set1_epi64(0x94d049bb133111ebULL));
+        return _mm512_xor_si512(x, _mm512_srli_epi64(x, 31));
+    }
+
+    void edges8(u64 i0, u32 *u, u32 *v, u8 *w) const
+    {
+        const __m512i idx = _mm512_add_epi64(_mm512_set1_epi64(i0), _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7));
+        __m512i state = mixv(_mm512_xor_si512(_mm512_set1_epi64(ms), _mm512_mullo_epi64(idx, _mm512_set1_epi64(HK))));
+        __m512i a = _mm512_setzero_si512(), b = _mm512_setzero_si512();
+        const __m512i ff = _mm512_set1_epi64(0xff), c146 = _mm512_set1_epi64(146), c195 = _mm512_set1_epi64(195),
+                      c243 = _mm512_set1_epi64(243);
+        for (int level = 0; level < scale; level++) {
+            if (level && (level & 7) == 0) state = mixv(state);
+            const __m512i r = _mm512_and_si512(_mm512_srli_epi64(state, 8 * (level & 7)), ff);
+            const __mmask8 ma = _mm512_cmpge_epu64_mask(r, c195);
+            const __mmask8 mb = (_mm512_cmpge_epu64_mask(r, c146) & ~ma) | _mm512_cmpge_epu64_mask(r, c243);
+            const __m512i bit = _mm512_set1_epi64(u64(1) << level);
+            a = _mm512_mask_or_epi64(a, ma, a, bit);
+            b = _mm512_mask_or_epi64(b, mb, b, bit);
+        }
+        if (scr) {
+            const __m512i m = _mm512_set1_epi64(mask), q1 = _mm512_set1_epi64(k1), q2 = _mm512_set1_epi64(k2),
+                          q3 = _mm512_set1_epi64(k3);
+            for (__m512i *x : {&a, &b}) {
+                __m512i t = _mm512_and_si512(_mm512_mullo_epi64(*x, q1), m);
+                t = _mm512_xor_si512(t, _mm512_srli_epi64(t, sh));
+                t = _mm512_and_si512(_mm512_mullo_epi64(t, q2), m);
+                t = _mm512_xor_si512(t, _mm512_srli_epi64(t, sh));
+                *x = _mm512_and_si512(_mm512_mullo_epi64(t, q3), m);
+            }
+        }
+        const __m512i lo = _mm512_min_epu64(a, b), hi = _mm512_max_epu64(a, b);
+        const __m512i key = _mm512_or_si512(_mm512_slli_epi64(hi, 32), lo);
+        const __m512i h = mixv(_mm512_xor_si512(_mm512_set1_epi64(mw), _mm512_mullo_epi64(key, _mm512_set1_epi64(HK))));
+        // h mod 255 = (sum of h's bytes) mod 255, since 256 = 1 (mod 255).
+        __m512i s = _mm512_sad_epu8(h, _mm512_setzero_si512());                  // <= 2040
+        s = _mm512_add_epi64(_mm512_and_si512(s, ff), _mm512_srli_epi64(s, 8));  // <= 262
+        s = _mm512_mask_sub_epi64(s, _mm512_cmpge_epu64_mask(s, _mm512_set1_epi64(255)), s, _mm512_set1_epi64(255));
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(u), _mm512_cvtepi64_epi32(a));
+        _mm256_storeu_si256(reinterpret_cast<__m256i *>(v), _mm512_cvtepi64_epi32(b));
+        _mm_storel_epi64(reinterpret_cast<__m128i *>(w), _mm512_cvtepi64_epi8(_mm512_add_epi64(s, _mm512_set1_epi64(1))));
+    }
+#endif
+};
+
+// FastGen against the official generator: this rank's first edges (the vector path) and 64 edges
+// spread over the whole range (the scalar path). Any difference and the official one does the work.
+bool fastgen_matches(const GraphParams &p, const FastGen &fg, u64 e0, u64 e1)
+{
+    const u64 M = num_edges(p), n = std::min<u64>(4096, e1 - e0);
+    std::vector<u32> u0(n), v0(n), u1(n), v1(n);
+    std::vector<u8> w0(n), w1(n);
+    generate_edges(p, e0, e0 + n, u0.data(), v0.data(), w0.data());
+    fg.edges(e0, n, u1.data(), v1.data(), w1.data());
+    if (u0 != u1 || v0 != v1 || w0 != w1) return false;
+    for (u64 k = 0; k < 64; k++) {
+        const u64 i = (M - 1) * k / 63;
+        u32 a, b, c, d;
+        u8 x, y;
+        generate_edge(p, i, a, b, x);
+        fg.edge(i, c, d, y);
+        if (a != c || b != d || x != y) return false;
+    }
+    return true;
+}
+
 // The ranks that share memory, and the windows they share. alloc() is collective: rank 0 maps
 // the whole window, everyone gets the same base pointer, and pages land on the NUMA node of
 // whichever rank writes them first.
@@ -119,15 +388,16 @@ public:
     MPI_Comm comm;
     int rank, size;
 
-    explicit Node(MPI_Comm c) : comm(c)
+    Node(MPI_Comm c, Prof &prof) : comm(c), prof(prof)
     {
         MPI_Comm_rank(comm, &rank);
         MPI_Comm_size(comm, &size);
     }
 
     template <class T>
-    T *alloc(u64 count)
+    T *alloc(u64 count, const char *tag)
     {
+        const double t0 = tick();
         const MPI_Aint bytes = rank == 0 ? MPI_Aint(std::max<u64>(count * sizeof(T), 64)) : 0;
         void *mine, *base;
         MPI_Win win;
@@ -136,16 +406,19 @@ public:
         int unit;
         MPI_Win_shared_query(win, 0, &sz, &unit, &base);
         MPI_Win_lock_all(MPI_MODE_NOCHECK, win);
-        wins.push_back({base, win});
+        wins.push_back({base, win, tag});
+        prof.sub("alloc:", tag, tick() - t0);
         return static_cast<T *>(base);
     }
 
     void release(const void *p)   // collective, like alloc
     {
         for (size_t i = 0; i < wins.size(); i++)
-            if (wins[i].first == p) {
-                MPI_Win_unlock_all(wins[i].second);
-                MPI_Win_free(&wins[i].second);
+            if (wins[i].base == p) {
+                const double t0 = tick();
+                MPI_Win_unlock_all(wins[i].win);
+                MPI_Win_free(&wins[i].win);
+                prof.sub("free:", wins[i].tag, tick() - t0);
                 wins.erase(wins.begin() + i);
                 return;
             }
@@ -153,14 +426,14 @@ public:
 
     void release_all()
     {
-        while (!wins.empty()) release(wins.back().first);
+        while (!wins.empty()) release(wins.back().base);
     }
 
     // Orders this rank's window stores before what follows; paired with a barrier or a
     // collective it makes them visible to every other rank of the node.
     void fence()
     {
-        for (auto &e : wins) MPI_Win_sync(e.second);
+        for (auto &e : wins) MPI_Win_sync(e.win);
     }
 
     void sync()
@@ -171,52 +444,13 @@ public:
     }
 
 private:
-    std::vector<std::pair<void *, MPI_Win>> wins;
-};
-
-// Per-phase wall times, reduced over the ranks at the end (max and min) when PP_TIMING is set.
-struct Prof {
-    bool on = std::getenv("PP_TIMING") != nullptr;
-    double last = MPI_Wtime();
-    std::vector<std::pair<const char *, double>> phases;
-    std::vector<std::pair<const char *, u64>> counts;
-
-    void mark(const char *name)
-    {
-        if (!on) return;
-        const double t = MPI_Wtime();
-        for (auto &ph : phases)
-            if (ph.first == name) { ph.second += t - last; last = t; return; }
-        phases.push_back({name, t - last});
-        last = t;
-    }
-
-    void count(const char *name, u64 v)
-    {
-        if (!on) return;
-        for (auto &c : counts)
-            if (c.first == name) { c.second += v; return; }
-        counts.push_back({name, v});
-    }
-
-    void report(MPI_Comm comm, int rank)
-    {
-        if (!on) return;
-        for (auto &ph : phases) {
-            double mx = 0, mn = 0;
-            MPI_Reduce(&ph.second, &mx, 1, MPI_DOUBLE, MPI_MAX, 0, comm);
-            MPI_Reduce(&ph.second, &mn, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
-            if (rank == 0) std::fprintf(stderr, "[hw2-1] %-10s max %9.4f s  min %9.4f s\n", ph.first, mx, mn);
-        }
-        for (auto &c : counts) {
-            u64 sum = 0, mx = 0;
-            MPI_Reduce(&c.second, &sum, 1, MPI_UINT64_T, MPI_SUM, 0, comm);
-            MPI_Reduce(&c.second, &mx, 1, MPI_UINT64_T, MPI_MAX, 0, comm);
-            if (rank == 0)
-                std::fprintf(stderr, "[hw2-1] %-10s sum %llu  max/rank %llu\n", c.first, (unsigned long long)sum,
-                             (unsigned long long)mx);
-        }
-    }
+    struct Window {
+        void *base;
+        MPI_Win win;
+        const char *tag;
+    };
+    Prof &prof;
+    std::vector<Window> wins;
 };
 
 // Adjacency of v: col/w[start, start + deg).
@@ -231,6 +465,56 @@ struct Graph {
     u64 arcs;
 };
 
+#ifdef HW21_PROF
+// PP_STATS=1: the graph's shape at the real size. Owners look at their own vertices: isolated
+// ones, duplicate arcs, leaves (one distinct neighbour), and per log2(degree) bucket the vertices
+// and their arcs, i.e. how many of the arcs' far ends land on the heaviest vertices, which is what
+// a degree-ordered relabel would keep together in the caches.
+void graph_stats(Node &node, const Graph &g, u64 N, const Mix &mix, u64 nloc)
+{
+    const int P = node.size, r = node.rank;
+    constexpr int B = 32;
+    std::vector<u64> mine(4 + 2 * B, 0), all(4 + 2 * B, 0);   // isolated, dup, leaves, maxdeg | count[B] | arcs[B]
+    std::vector<u32> tmp;
+    for (u64 li = 0; li < nloc; li++) {
+        const Adj a = g.adj[mix.inv(u32(r + li * P))];
+        if (!a.deg) {
+            mine[0]++;
+            continue;
+        }
+        tmp.assign(g.col + a.start, g.col + a.start + a.deg);
+        std::sort(tmp.begin(), tmp.end());
+        const u64 uniq = u64(std::unique(tmp.begin(), tmp.end()) - tmp.begin());
+        mine[1] += a.deg - uniq;
+        mine[2] += uniq == 1;
+        mine[3] = std::max<u64>(mine[3], a.deg);
+        const int b = 31 - __builtin_clz(a.deg);
+        mine[4 + b]++;
+        mine[4 + B + b] += a.deg;
+    }
+    MPI_Reduce(mine.data(), all.data(), 3, MPI_UINT64_T, MPI_SUM, 0, node.comm);
+    MPI_Reduce(&mine[3], &all[3], 1, MPI_UINT64_T, MPI_MAX, 0, node.comm);
+    MPI_Reduce(&mine[4], &all[4], 2 * B, MPI_UINT64_T, MPI_SUM, 0, node.comm);
+    if (r != 0 || !g.arcs) return;
+    const u64 live = N - all[0];
+    std::fprintf(stderr,
+                 "[hw2-1] stats: isolated %.1f%% of N, duplicate arcs %.1f%%, leaves %.1f%% of non-isolated, "
+                 "max degree %llu (duplicates counted)\n",
+                 100.0 * all[0] / N, 100.0 * all[1] / g.arcs, live ? 100.0 * all[2] / live : 0.0,
+                 (unsigned long long)all[3]);
+    std::fprintf(stderr, "[hw2-1] stats: arc ends on the heaviest vertices:");
+    u64 cv = 0, ca = 0;
+    for (int b = B - 1; b >= 0; b--) {
+        if (!all[4 + b]) continue;
+        cv += all[4 + b];
+        ca += all[4 + B + b];
+        std::fprintf(stderr, "  deg>=%u: %llu v %.0f%%", 1u << b, (unsigned long long)cv, 100.0 * ca / g.arcs);
+        if (ca * 100 >= g.arcs * 99) break;
+    }
+    std::fprintf(stderr, "\n");
+}
+#endif
+
 // Generates this rank's slice of the edges and builds the shared CSR. Vertex v belongs to owner
 // mix(v) mod P, in local slot mix(v) / P.
 Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
@@ -243,7 +527,11 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     // into this rank's stretch of a shared window: M / P edges privately would be 1 GiB at
     // scale 26 with P = 8, too close to the 1200 MiB cap.
     const u64 e0 = M * r / P, e1 = M * (r + 1) / P;
-    u64 *edges = node.alloc<u64>(M);
+    u64 *edges = node.alloc<u64>(M, "edges");
+    const FastGen fg(p);
+    const char *fe = std::getenv("PP_FASTGEN");
+    const bool fast = !(fe && fe[0] == '0') && fastgen_matches(p, fg, e0, e1);
+    prof.count("fastgen-off", fast ? 0 : 1);
     u64 kept = 0;                      // edges[e0, e0 + kept)
     std::vector<u64> to_owner(P, 0);   // arcs this rank sends to each owner
     {
@@ -252,7 +540,10 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
         std::vector<u8> ww(CH);
         for (u64 i = e0; i < e1; i += CH) {
             const u64 n = std::min(CH, e1 - i);
-            generate_edges(p, i, i + n, uu.data(), vv.data(), ww.data());
+            if (fast)
+                fg.edges(i, n, uu.data(), vv.data(), ww.data());
+            else
+                generate_edges(p, i, i + n, uu.data(), vv.data(), ww.data());
             for (u64 j = 0; j < n; j++) {
                 if (uu[j] == vv[j]) continue;
                 edges[e0 + kept++] = u64(uu[j]) | u64(vv[j]) << VBITS | u64(ww[j]) << 52;
@@ -274,7 +565,7 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
             run_begin[u64(q) * P + o] = total;
             total += sent[u64(q) * P + o];
         }
-    u64 *outbox = node.alloc<u64>(total);
+    u64 *outbox = node.alloc<u64>(total, "outbox");
     prof.mark("wait");
     {
         std::vector<u64> cur(run_begin.begin() + u64(r) * P, run_begin.begin() + u64(r + 1) * P);
@@ -316,9 +607,9 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
 
     Graph g;
     g.arcs = arcs;
-    g.adj = node.alloc<Adj>(N);
-    g.col = node.alloc<u32>(arcs);
-    g.w = node.alloc<u8>(arcs);
+    g.adj = node.alloc<Adj>(N, "adj");
+    g.col = node.alloc<u32>(arcs, "col");
+    g.w = node.alloc<u8>(arcs, "w");
     for (u64 li = 0, at = base; li < nloc; li++) {
         g.adj[mix.inv(u32(r + li * P))] = {u32(at), pos[li]};
         const u64 d = pos[li];
@@ -326,6 +617,14 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
         at += d;
     }
     prof.mark("alloc");
+#ifdef HW21_PROF
+    // Experiment: take the first touch of this owner's CSR pages out of the fill.
+    if (std::getenv("PP_PRETOUCH")) {
+        std::fill(g.col + base, g.col + base + mine, 0u);
+        std::fill(g.w + base, g.w + base + mine, u8(0));
+        prof.mark("pretouch");
+    }
+#endif
 
     // Second pass fills them.
     for_my_arcs([&](u64 a) {
@@ -338,6 +637,12 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     node.sync();
     node.release(outbox);
     prof.mark("wait");
+#ifdef HW21_PROF
+    if (std::getenv("PP_STATS")) {
+        graph_stats(node, g, N, mix, nloc);
+        prof.mark("stats");
+    }
+#endif
     return g;
 }
 
@@ -358,9 +663,9 @@ public:
     {
         // A vertex is settled at most once per source, so N * cap bounds one round's frontier;
         // the coarse prefix keeps one entry per 64 items plus two per rank.
-        dist = node.alloc<u32>(N * cap);
-        front = node.alloc<u32>(N * cap);
-        coarse = node.alloc<u64>(N * cap / 64 + 2 * u64(P) + 1);
+        dist = node.alloc<u32>(N * cap, "dist");
+        front = node.alloc<u32>(N * cap, "front");
+        coarse = node.alloc<u64>(N * cap / 64 + 2 * u64(P) + 1, "coarse");
         info.resize(3 * u64(P));
         off.resize(P);
         coff.resize(P);
@@ -380,9 +685,15 @@ public:
                 ring[0].push_back(u32(s) << VBITS | srcs[s]);
             }
 
+        // The profiling build splits the rounds' time: filter (finding and compacting the next
+        // bucket), sync (the allgather and the barrier, waiting included), publish (writing the
+        // frontier) and relax. A round with little work is mostly sync.
+        double tf = 0, ts = 0, tp = 0, tr = 0;
+        u64 small = 0, biggest = 0;
         u64 next = 0;   // every pending value lies in [next, next + 255]
         u64 rounds = 0, scanned = 0;
         for (;;) {
+            const double t0 = tick();
             // My smallest pending value whose bucket still holds a valid item. Stale items
             // (lowered again since they were filed) are dropped on the way.
             u64 mine[3] = {NONE, 0, 0};
@@ -406,9 +717,13 @@ public:
                     break;
                 }
             }
+            const double t1 = tick();
             node.fence();
             MPI_Allgather(mine, 3, MPI_UINT64_T, info.data(), 3, MPI_UINT64_T, node.comm);
             node.fence();
+            const double t2 = tick();
+            tf += t1 - t0;
+            ts += t2 - t1;
             u64 d = NONE;
             for (int q = 0; q < P; q++) d = std::min(d, info[3 * q]);
             if (d == NONE) break;
@@ -437,15 +752,30 @@ public:
                 coarse[coff[r] + (b.size() + 63) / 64] = a;
                 b.clear();
             }
+            const double t3 = tick();
             node.sync();
+            const double t4 = tick();
 
             const u64 T = arc0[P];
             relax_range(u32(d), T * r / P, T * (r + 1) / P);
+            tp += t3 - t2;
+            ts += t4 - t3;
+            tr += tick() - t4;
             next = d + 1;
             rounds++;
             scanned += T * (r + 1) / P - T * r / P;
+            if (Prof::on) {
+                small += T < 1024 * u64(P);
+                biggest = std::max(biggest, T);
+            }
         }
+        prof.sub("trav:", "filter", tf);
+        prof.sub("trav:", "sync", ts);
+        prof.sub("trav:", "publish", tp);
+        prof.sub("trav:", "relax", tr);
         prof.count("rounds", r == 0 ? rounds : 0);
+        prof.count("rounds-small", r == 0 ? small : 0);   // fewer than 1024 arcs per rank
+        prof.count("round-max-arcs", r == 0 ? biggest : 0);
         prof.count("arcs", scanned);
         prof.count("pushes", pushes);
         pushes = 0;
@@ -550,8 +880,8 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
     if (comm == MPI_COMM_NULL) return;
 
     {
-        Node node(comm);
         Prof prof;
+        Node node(comm, prof);
         const int P = node.size, r = node.rank;
         const FastDiv fd{u32(P)};
         const u64 N = num_vertices(p);
@@ -630,12 +960,13 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
                 std::copy(f.sample_dist.begin(), f.sample_dist.end(), results[i].sample_dist.begin());
             }
 
-        if (prof.on && r == 0)
+        node.release_all();
+        prof.mark("release");
+        if (Prof::on && r == 0)
             std::fprintf(stderr, "[hw2-1] P=%d N=%llu M=%llu arcs=%llu sources=%zu distinct=%zu batch=%d\n", P,
                          (unsigned long long)N, (unsigned long long)num_edges(p), (unsigned long long)g.arcs,
                          sources.size(), uniq.size(), cap);
         prof.report(comm, r);
-        node.release_all();
     }
     MPI_Comm_free(&comm);
 }
