@@ -2,20 +2,23 @@
 set -euo pipefail
 
 # HW 2-1 tests, for SEIREN. Run from anywhere: the script works in hw2/hw2-1. Run it inside one
-# allocation, so each srun is a job step instead of a fresh job in the queue:
+# allocation, so each srun is a job step instead of a fresh job in the queue. The practice QoS
+# `hw` allows at most 8 tasks, so the judge's 24-rank shape is out of reach here: official
+# 24-rank times come from `hw2-1-judge NN` (one case: no cooldown, scoreboard untouched).
 #
-#   salloc -N1 -n24 -c1 --hint=nomultithread -t 60
-#   bash ../tests/run_hw2-1.sh public     # judge shape, every public case against its golden
+#   salloc -N1 -n8 -c1 --hint=nomultithread --mem=48G -t 60
+#   bash ../tests/run_hw2-1.sh public     # every public case against its golden, at PUBLIC_NP ranks
 #   bash ../tests/run_hw2-1.sh custom     # edge cases against the starter, at several rank counts
 #   bash ../tests/run_hw2-1.sh knobs      # the custom cases again under each PP_* knob
 #   bash ../tests/run_hw2-1.sh all        # all three
 #
 # Env overrides:
 #   CASES="01 04 10"   public subset (default: all 17)
+#   PUBLIC_NP=8        ranks for the public cases (24 = the judge's shape, where a QoS allows it)
 #   REPEAT=3           runs per public case; the table shows the best and the median
-#   RANKS="1 2 3 5 24" rank counts for custom
+#   RANKS="1 2 3 5 8"  rank counts for custom
 #   KNOBS="PP_BATCH=1 PP_BATCH=3"   one extra pass of the custom cases per knob
-#   KNOB_RANKS="5 24"  rank counts for the knob passes
+#   KNOB_RANKS="5 8"   rank counts for the knob passes
 #   TIMING=1           pass PP_TIMING=1 and show the per-phase breakdown
 #   CASES_DIR, OUT_ROOT
 #
@@ -43,9 +46,10 @@ fi
 out_root="${OUT_ROOT:-tmp/hw2-1-tests}"
 repeat="${REPEAT:-1}"
 public_cases="${CASES:-01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17}"
-ranks="${RANKS:-1 2 3 5 24}"
+public_np="${PUBLIC_NP:-8}"
+ranks="${RANKS:-1 2 3 5 8}"
 knobs="${KNOBS:-PP_BATCH=1 PP_BATCH=3}"
-knob_ranks="${KNOB_RANKS:-5 24}"
+knob_ranks="${KNOB_RANKS:-5 8}"
 
 if [[ "${NO_ULIMIT:-0}" != "1" ]]; then
     ulimit -d 1228800   # NO_ULIMIT=1 only for dry runs on machines without RLIMIT_DATA
@@ -67,7 +71,7 @@ require_path() {
     fi
 }
 
-judge_shape=(srun -N1 -n24 -c1 --hint=nomultithread)
+public_shape=(srun -N1 -n"$public_np" -c1 --hint=nomultithread)
 passed=0
 failed=0
 failures=()
@@ -129,14 +133,14 @@ run_public() {
     [[ -f "$summary" ]] && mv "$summary" "$dir/summary.prev.tsv"
     printf 'case\trep\tstatus\ttime\tthreads\n' >"$summary"
 
-    echo "== public cases, judge shape: ${judge_shape[*]}, REPEAT=$repeat =="
+    echo "== public cases: ${public_shape[*]}, REPEAT=$repeat =="
     local c rep
     for c in $public_cases; do
         local input="$cases_dir/hw2-1/$c.txt" golden="$cases_dir/hw2-1/$c.golden.bin"
         require_path "$input"
         require_path "$golden"
         for ((rep = 1; rep <= repeat; rep++)); do
-            run_one "public $c #$rep" "$dir/$c.$rep" "$golden" "$input" "$dir/$c.out.bin" -- "${judge_shape[@]}"
+            run_one "public $c #$rep" "$dir/$c.$rep" "$golden" "$input" "$dir/$c.out.bin" -- "${public_shape[@]}"
             printf '%s\t%s\t%s\t%s\t%s\n' "$c" "$rep" "$last_status" "$last_time" "$last_threads" >>"$summary"
         done
     done
@@ -189,11 +193,15 @@ make_goldens() {
     local dir="$1" name args
     mkdir -p "$dir"
     while read -r name args; do
-        echo "$args" >"$dir/$name.txt"
-        if [[ ! -f "$dir/$name.golden.bin" || "$dir/$name.txt" -nt "$dir/$name.golden.bin" ]]; then
-            srun -N1 -n1 "$orig_dir/hw2-1-seq" "$dir/$name.txt" "$dir/$name.golden.bin" </dev/null >/dev/null
+        if [[ ! -f "$dir/$name.txt" || "$(cat "$dir/$name.txt")" != "$args" ]]; then
+            echo "$args" >"$dir/$name.txt"
+        fi
+        if [[ ! -f "$dir/$name.golden.bin" || ! -f "$dir/$name.seq.out" || "$dir/$name.txt" -nt "$dir/$name.golden.bin" ]]; then
+            srun -N1 -n1 "$orig_dir/hw2-1-seq" "$dir/$name.txt" "$dir/$name.golden.bin" </dev/null >"$dir/$name.seq.out"
         fi
     done < <(custom_inputs)
+    # The judge reads the thread count main prints; ours must not exceed what MPI alone starts.
+    echo "starter threads: $(sed -n 's/^Threads: \([0-9-]*\).*/\1/p' "$dir"/*.seq.out | sort -u | paste -sd, -)"
 }
 
 # run_custom <title> <rank counts> <env...>

@@ -178,12 +178,14 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     const int P = node.size, r = node.rank;
     const u64 N = num_vertices(p), M = num_edges(p);
 
-    // Generate edges [M r / P, M (r + 1) / P), self-loops dropped, packed (u | v << 26 | w << 52).
-    std::vector<u64> edges;
+    // Generate edges [M r / P, M (r + 1) / P), self-loops dropped, packed (u | v << 26 | w << 52),
+    // into this rank's stretch of a shared window: M / P edges privately would be 1 GiB at
+    // scale 26 with P = 8, too close to the 1200 MiB cap.
+    const u64 e0 = M * r / P, e1 = M * (r + 1) / P;
+    u64 *edges = node.alloc<u64>(M);
+    u64 kept = 0;                      // edges[e0, e0 + kept)
     std::vector<u64> to_owner(P, 0);   // arcs this rank sends to each owner
     {
-        const u64 e0 = M * r / P, e1 = M * (r + 1) / P;
-        edges.reserve(e1 - e0);
         constexpr u64 CH = 1 << 14;
         std::vector<u32> uu(CH), vv(CH);
         std::vector<u8> ww(CH);
@@ -192,7 +194,7 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
             generate_edges(p, i, i + n, uu.data(), vv.data(), ww.data());
             for (u64 j = 0; j < n; j++) {
                 if (uu[j] == vv[j]) continue;
-                edges.push_back(u64(uu[j]) | u64(vv[j]) << VBITS | u64(ww[j]) << 52);
+                edges[e0 + kept++] = u64(uu[j]) | u64(vv[j]) << VBITS | u64(ww[j]) << 52;
                 to_owner[fd.mod(uu[j])]++;
                 to_owner[fd.mod(vv[j])]++;
             }
@@ -213,14 +215,15 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     u64 *outbox = node.alloc<u64>(total);
     {
         std::vector<u64> cur(run_begin.begin() + u64(r) * P, run_begin.begin() + u64(r + 1) * P);
-        for (const u64 e : edges) {
+        for (u64 i = e0; i < e0 + kept; i++) {
+            const u64 e = edges[i];
             const u32 u = u32(e & VMASK), v = u32((e >> VBITS) & VMASK);
             outbox[cur[fd.mod(u)]++] = e;                                        // u -> v
             outbox[cur[fd.mod(v)]++] = u64(v) | u64(u) << VBITS | (e >> 52) << 52;   // v -> u
         }
-        std::vector<u64>().swap(edges);
     }
     node.sync();
+    node.release(edges);
     prof.mark("scatter");
 
     // Owner r: local vertices v = r + li * P. First pass sizes their lists.
