@@ -20,8 +20,8 @@
 //             already touched costs no fault at all, they are reused by lifetime: rank r's arena
 //             holds its generated edges, then its part of the CSR, whose col (4 B an arc, two arcs
 //             an edge) lands on the pages the edges (8 B) took. Its outbox is a window of its own;
-//             only the small per-vertex tables and the search's arrays share one. Nothing is
-//             freed before the end: a window's pages go back serially, 0.1-0.2 s per GB.
+//             only the small per-vertex tables and the search's arrays share one. The final
+//             graph's windows live until the end; their pages go back serially, 0.1-0.2 s per GB.
 //   traverse  all distinct sources at once, one distance value per round. Weights are integers
 //             >= 1, so every (source, vertex) whose tentative distance equals the round's value d
 //             is final: each is expanded exactly once. A round publishes the frontier to a shared
@@ -43,6 +43,9 @@
 // PP_PROBE=1 times the fill's reads alone (cursors, far ends' slots) before the fill. In any
 // build, PP_BATCH=n caps the sources searched together, PP_FASTGEN=0 uses the official generator
 // and PP_RELABEL=0 keeps the original vertex numbers.
+// PP_WITNESS=prune enables an experimental exact reduction (default: off); probe measures its
+// removable edges but keeps the full graph. PP_WITNESS_TAU=1..255 selects the light-edge cutoff.
+// PP_WITNESS_REPORT=1 prints its counts; HW21_PHASE_ONLY omits per-arc profiling counters.
 #include <mpi.h>
 #ifdef HW21_PROF
 #include <sys/resource.h>
@@ -79,6 +82,12 @@ constexpr int RING = 256;                   // > max weight, so pending values n
 class Prof {
 public:
     static constexpr bool on = true;
+#ifdef HW21_PHASE_ONLY
+    static constexpr bool details = false;
+#else
+    static constexpr bool details = true;
+#endif
+    explicit Prof(const char *label = "hw2-1") : label(label) {}
 
     // Closes the phase that has run since the previous mark.
     void mark(const char *name)
@@ -112,7 +121,7 @@ public:
                 MPI_Reduce(&it.t, &mn, 1, MPI_DOUBLE, MPI_MIN, 0, comm);
                 MPI_Reduce(&it.faults, &fmax, 1, MPI_UINT64_T, MPI_MAX, 0, comm);
                 if (rank != 0) continue;
-                std::fprintf(stderr, "[hw2-1] %-14s max %9.4f s  min %9.4f s", it.name.c_str(), mx, mn);
+                std::fprintf(stderr, "[%s] %-14s max %9.4f s  min %9.4f s", label, it.name.c_str(), mx, mn);
                 if (!kind) std::fprintf(stderr, "  faults %llu", (unsigned long long)fmax);
                 std::fprintf(stderr, "\n");
             }
@@ -121,12 +130,13 @@ public:
             MPI_Reduce(&c.second, &sum, 1, MPI_UINT64_T, MPI_SUM, 0, comm);
             MPI_Reduce(&c.second, &mx, 1, MPI_UINT64_T, MPI_MAX, 0, comm);
             if (rank == 0)
-                std::fprintf(stderr, "[hw2-1] %-14s sum %llu  max/rank %llu\n", c.first.c_str(),
+                std::fprintf(stderr, "[%s] %-14s sum %llu  max/rank %llu\n", label, c.first.c_str(),
                              (unsigned long long)sum, (unsigned long long)mx);
         }
     }
 
 private:
+    const char *label;
     struct Item {
         std::string name;
         double t = 0;
@@ -157,6 +167,8 @@ private:
 class Prof {
 public:
     static constexpr bool on = false;
+    static constexpr bool details = false;
+    explicit Prof(const char * = "hw2-1") {}
     void mark(const char *) {}
     void sub(const char *, const char *, double) {}
     void count(const char *, u64) {}
@@ -562,9 +574,18 @@ void graph_stats(Node &node, const Graph &g, u64 N, const Mix &mix, u64 nloc)
 }
 #endif
 
+enum class EdgeSelection { full, light, witness };
+
+struct WitnessStats {
+    u64 original = 0, removable = 0, light_edges = 0, reached = 0;
+    u32 pivot = INF;
+};
+
 // Generates this rank's slice of the edges and builds the shared CSR over slots. Vertex v belongs
 // to owner mix(v) mod P, in local position mix(v) / P.
-Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
+template <EdgeSelection selection = EdgeSelection::full>
+Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof,
+            u32 tau = 255, const u32 *bounds = nullptr, bool prune = false, WitnessStats *stats = nullptr)
 {
     const int P = node.size, r = node.rank;
     const u64 N = num_vertices(p), M = num_edges(p);
@@ -586,24 +607,58 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     const bool fast = !(fe && fe[0] == '0') && fastgen_matches(p, fg, e0, e1);
     prof.count("fastgen-off", fast ? 0 : 1);
     u64 kept = 0;                      // edges[0, kept)
+    u64 original = 0, removable = 0;
+    double filter_time = 0;
     std::vector<u64> to_owner(P, 0);   // arcs this rank sends to each owner
     {
         constexpr u64 CH = 1 << 14;
         std::vector<u32> uu(CH), vv(CH);
         std::vector<u8> ww(CH);
+        std::vector<u8> accept;
+        if constexpr (selection == EdgeSelection::witness) accept.resize(CH);
         for (u64 i = e0; i < e1; i += CH) {
             const u64 n = std::min(CH, e1 - i);
             if (fast)
                 fg.edges(i, n, uu.data(), vv.data(), ww.data());
             else
                 generate_edges(p, i, i + n, uu.data(), vv.data(), ww.data());
+            if constexpr (selection == EdgeSelection::witness) {
+                const double t = tick();
+                for (u64 j = 0; j < n; j++) {
+                    accept[j] = 0;
+                    if (uu[j] == vv[j]) continue;
+                    original++;
+                    bool redundant = false;
+                    if (ww[j] > tau) {
+                        const u32 a = bounds[uu[j]], b = bounds[vv[j]];
+                        redundant = a != INF && b != INF && u64(a) + b < ww[j];
+                    }
+                    removable += redundant;
+                    accept[j] = !(prune && redundant);
+                }
+                filter_time += tick() - t;
+            }
             for (u64 j = 0; j < n; j++) {
                 if (uu[j] == vv[j]) continue;
+                if constexpr (selection == EdgeSelection::light) {
+                    if (ww[j] > tau) continue;
+                }
+                if constexpr (selection == EdgeSelection::witness) {
+                    if (!accept[j]) continue;
+                }
                 edges[kept++] = u64(uu[j]) | u64(vv[j]) << VBITS | u64(ww[j]) << 52;
                 to_owner[fd.mod(mix.fwd(uu[j]))]++;
                 to_owner[fd.mod(mix.fwd(vv[j]))]++;
             }
         }
+    }
+    if constexpr (selection == EdgeSelection::witness) {
+        const u64 local[2] = {original, removable};
+        u64 total[2] = {};
+        MPI_Allreduce(local, total, 2, MPI_UINT64_T, MPI_SUM, node.comm);
+        stats->original = total[0];
+        stats->removable = total[1];
+        prof.sub("gen:", "filter", filter_time);
     }
     prof.mark("generate");
 
@@ -904,8 +959,10 @@ public:
         prof.count("round-max-arcs", r == 0 ? biggest : 0);
         prof.count("arcs", scanned);
         prof.count("pushes", pushes);
-        prof.count("relax-final", final_hits);
-        prof.count("relax-nogain", nogain_hits);
+        if (Prof::details) {
+            prof.count("relax-final", final_hits);
+            prof.count("relax-nogain", nogain_hits);
+        }
         pushes = final_hits = nogain_hits = 0;
     }
 
@@ -981,7 +1038,7 @@ private:
             if (e + PF < k) __builtin_prefetch(ds + col[e + PF]);
             const u32 y = col[e], nd = d + w[e];
             const u32 cur = __atomic_load_n(ds + y, __ATOMIC_RELAXED);
-            if (Prof::on) {   // how it ends, unless it lowers y (pushes) or loses a race (the rest)
+            if (Prof::details) {   // disabled in a phase-only profiling build
                 final_hits += cur <= d;
                 nogain_hits += cur > d && cur <= nd;
             }
@@ -992,6 +1049,83 @@ private:
         }
     }
 };
+
+struct WitnessConfig {
+    int mode = 0;   // 0: off, 1: probe, 2: prune
+    u32 tau = 16;
+    bool report = false;
+};
+
+WitnessConfig witness_config(Node &node)
+{
+    int options[3] = {0, 16, Prof::on ? 1 : 0};
+    if (node.rank == 0) {
+        auto fail = [&]() {
+            std::fprintf(stderr, "PP_WITNESS must be off/probe/prune; PP_WITNESS_TAU must be 1..255\n");
+            MPI_Abort(node.comm, 2);
+            std::abort();
+        };
+        if (const char *e = std::getenv("PP_WITNESS")) {
+            const std::string mode(e);
+            if (mode == "off" || mode == "0") options[0] = 0;
+            else if (mode == "probe") options[0] = 1;
+            else if (mode == "prune" || mode == "1") options[0] = 2;
+            else fail();
+        }
+        if (const char *e = std::getenv("PP_WITNESS_TAU")) {
+            char *end = nullptr;
+            const long tau = std::strtol(e, &end, 10);
+            if (end == e || *end || tau < 1 || tau > 255) fail();
+            options[1] = int(tau);
+        }
+        if (const char *e = std::getenv("PP_WITNESS_REPORT")) options[2] = std::string(e) == "1";
+    }
+    MPI_Bcast(options, 3, MPI_INT, 0, node.comm);
+    return {options[0], u32(options[1]), options[2] != 0};
+}
+
+// L[v] is an actual path in the retained light graph. Removing only heavier edges with
+// L[u] + L[v] < w preserves all-pairs distances, including disconnected components.
+u32 *prepare_witness(Node &bound_node, const GraphParams &p, const FastDiv &fd,
+                     u32 tau, WitnessStats &stats)
+{
+    const u64 N = num_vertices(p);
+    const int r = bound_node.rank, P = bound_node.size;
+    Prof light_prof("hw2-1-light");
+    Node light_node(bound_node.comm, light_prof);
+    const Graph light = build<EdgeSelection::light>(light_node, p, fd, light_prof, tau);
+    stats.light_edges = light.arcs / 2;
+    u64 best = 0, global_best = 0;
+    for (u64 s = light.n * r / P; s < light.n * (r + 1) / P; s++)
+        if (light.adj[s].deg)
+            best = std::max(best, (u64(light.adj[s].deg) << 32) | u64(~light.vertex(u32(s))));
+    MPI_Allreduce(&best, &global_best, 1, MPI_UINT64_T, MPI_MAX, bound_node.comm);
+    u32 *const bounds = bound_node.alloc<u32>(N, "witness-bounds");
+    std::fill(bounds + N * r / P, bounds + N * (r + 1) / P, INF);
+    bound_node.sync();
+    light_prof.mark("bound-init");
+    u64 reached = 0;
+    if (global_best) {
+        stats.pivot = ~u32(global_best);
+        const u32 source = light.slot(stats.pivot);
+        Search search(light_node, light, 1, light_prof);
+        light_prof.mark("setup");
+        search.run(&source, 1);
+        light_prof.mark("traverse");
+        const u32 *dist = search.distances();
+        for (u64 s = light.n * r / P; s < light.n * (r + 1) / P; s++) {
+            bounds[light.vertex(u32(s))] = dist[s];
+            reached += dist[s] != INF;
+        }
+    }
+    MPI_Allreduce(&reached, &stats.reached, 1, MPI_UINT64_T, MPI_SUM, bound_node.comm);
+    bound_node.sync();
+    light_prof.mark("export");
+    light_node.release_all();
+    light_prof.mark("release");
+    light_prof.report(bound_node.comm, r);
+    return bounds;
+}
 
 }  // namespace
 
@@ -1016,7 +1150,30 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
         const FastDiv fd{u32(P)};
         const u64 N = num_vertices(p);
 
-        const Graph g = build(node, p, fd, prof);
+        const WitnessConfig witness = witness_config(node);
+        WitnessStats witness_stats;
+        Graph g;
+        if (witness.mode) {
+            Prof bound_prof("hw2-1-bound");
+            Node bound_node(comm, bound_prof);
+            const u32 *bounds = prepare_witness(bound_node, p, fd, witness.tau, witness_stats);
+            prof.mark("witness");
+            g = build<EdgeSelection::witness>(node, p, fd, prof, witness.tau, bounds,
+                                               witness.mode == 2, &witness_stats);
+            bound_node.release_all();
+            prof.mark("bound-release");
+            if (witness.report && r == 0)
+                std::fprintf(stderr,
+                    "[hw2-1-witness] mode=%s tau=%u original_edges=%llu light_edges=%llu "
+                    "removable_edges=%llu kept_edges=%llu retained_fraction=%.9f pivot=%u light_reached=%llu\n",
+                    witness.mode == 2 ? "prune" : "probe", witness.tau,
+                    (unsigned long long)witness_stats.original, (unsigned long long)witness_stats.light_edges,
+                    (unsigned long long)witness_stats.removable, (unsigned long long)(g.arcs / 2),
+                    witness_stats.original ? double(g.arcs / 2) / witness_stats.original : 1.0,
+                    witness_stats.pivot, (unsigned long long)witness_stats.reached);
+        } else {
+            g = build(node, p, fd, prof);
+        }
         const std::vector<u32> samples = r == 0 ? sample_vertices(p) : std::vector<u32>();
 
         // Distinct sources, first-occurrence order; repeats copy their twin's result. A source
@@ -1118,6 +1275,16 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
                          P, (unsigned long long)N, (unsigned long long)num_edges(p), (unsigned long long)g.arcs,
                          (unsigned long long)g.n, sources.size(), uniq.size(), todo.size(), cap);
         prof.report(comm, r);
+#ifdef HW21_PROF
+        rusage usage{};
+        getrusage(RUSAGE_SELF, &usage);
+        const u64 local_memory[2] = {u64(usage.ru_maxrss), u64(usage.ru_minflt)};
+        u64 max_memory[2] = {};
+        MPI_Reduce(local_memory, max_memory, 2, MPI_UINT64_T, MPI_MAX, 0, comm);
+        if (r == 0)
+            std::fprintf(stderr, "[hw2-1-memory] peak_rank_rss_kib=%llu max_rank_minflt=%llu arc_counters=%d\n",
+                         (unsigned long long)max_memory[0], (unsigned long long)max_memory[1], Prof::details ? 1 : 0);
+#endif
     }
     MPI_Comm_free(&comm);
 }
