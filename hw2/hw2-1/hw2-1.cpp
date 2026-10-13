@@ -16,11 +16,12 @@
 //             isolated share (about half the vertices at scale 23-24).
 //   memory    a window is one shared-memory object, and first touches of its pages queue on that
 //             object (measured, 8 ranks at once: 7.1 us a page in one window, 2.5 in a window
-//             each, 2.0 private). So what a rank alone writes sits in a window of its own (its
-//             outbox, its CSR part), the edges only their generator reads stay private, and only
-//             the small per-vertex tables and the search's arrays share one window. Little is
-//             freed before the end (only edges too big to keep private): a window's pages go
-//             back serially, about 0.1 s per GB.
+//             each). So what a rank alone writes sits in windows of its own, and since a page
+//             already touched costs no fault at all, they are reused by lifetime: rank r's arena
+//             holds its generated edges, then its part of the CSR, whose col (4 B an arc, two arcs
+//             an edge) lands on the pages the edges (8 B) took. Its outbox is a window of its own;
+//             only the small per-vertex tables and the search's arrays share one. Nothing is
+//             freed before the end: a window's pages go back serially, 0.1-0.2 s per GB.
 //   traverse  all distinct sources at once, one distance value per round. Weights are integers
 //             >= 1, so every (source, vertex) whose tentative distance equals the round's value d
 //             is final: each is expanded exactly once. A round publishes the frontier to a shared
@@ -36,9 +37,12 @@
 // hw2-1-prof); the judge's build compiles none of it. That build prints, per phase, the slowest
 // and fastest rank's time and the most page faults any rank took, time spent waiting at barriers
 // under "wait", timings nested inside phases (window alloc/free, the traversal's parts) and
-// counters. There, PP_STATS=1 adds the graph's shape and PP_PRETOUCH=1 touches the CSR's pages
-// before filling it. In any build, PP_BATCH=n caps the sources searched together, PP_FASTGEN=0
-// uses the official generator and PP_RELABEL=0 keeps the original vertex numbers.
+// counters, among them how relaxations end: on a target already final (relax-final), on one
+// whose tentative distance is no larger (relax-nogain), or lowering it (pushes). There,
+// PP_STATS=1 adds the graph's shape, PP_PRETOUCH=1 touches the CSR's pages before filling it, and
+// PP_PROBE=1 times the fill's reads alone (cursors, far ends' slots) before the fill. In any
+// build, PP_BATCH=n caps the sources searched together, PP_FASTGEN=0 uses the official generator
+// and PP_RELABEL=0 keeps the original vertex numbers.
 #include <mpi.h>
 #ifdef HW21_PROF
 #include <sys/resource.h>
@@ -48,8 +52,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <memory>
 #include <string>
 #include <vector>
 #if defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__AVX512BW__)
@@ -447,35 +449,7 @@ public:
         return parts;
     }
 
-    // Frees every window allocated under tag. Collective.
-    void release_tag(const char *tag)
-    {
-        const double t0 = tick();
-        for (size_t i = 0; i < wins.size();)
-            if (std::strcmp(wins[i].tag, tag) == 0) {
-                MPI_Win_unlock_all(wins[i].win);
-                MPI_Win_free(&wins[i].win);
-                wins.erase(wins.begin() + i);
-            } else {
-                i++;
-            }
-        prof.sub("free:", tag, tick() - t0);
-    }
-
-    void release(const void *p)   // collective, like alloc
-    {
-        for (size_t i = 0; i < wins.size(); i++)
-            if (wins[i].base == p) {
-                const double t0 = tick();
-                MPI_Win_unlock_all(wins[i].win);
-                MPI_Win_free(&wins[i].win);
-                prof.sub("free:", wins[i].tag, tick() - t0);
-                wins.erase(wins.begin() + i);
-                return;
-            }
-    }
-
-    void release_all()
+    void release_all()   // collective, like alloc
     {
         while (!wins.empty()) {
             const double t0 = tick();
@@ -598,15 +572,15 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     const char *re = std::getenv("PP_RELABEL");
     const bool relabel = !(re && re[0] == '0');
 
-    // Memory: what a rank alone writes and others read sits in windows of their own (outbox, CSR),
-    // so first touches never queue on one shared object; what only its generator reads (the
-    // edges) is private while that fits the cap comfortably, as it always does at P = 24.
+    // Rank q's arena: its edges (8 B each), then its part of the CSR (5 B an arc, about two arcs
+    // an edge), col first so that it lands on the pages the edges took. 12 B an edge leaves room
+    // for an owner a fifth heavier than average; untouched pages cost nothing.
+    auto arena_bytes = [&](int q) { return page_up(12 * (M * (q + 1) / P - M * q / P)) + 4096; };
+    const std::vector<char *> arena = node.alloc_each(arena_bytes(r), "arena");
+
     // Generate edges [M r / P, M (r + 1) / P), self-loops dropped, packed (u | v << 26 | w << 52).
-    const u64 e0 = M * r / P, e1 = M * (r + 1) / P, most = (M + P - 1) / P;
-    const bool private_edges = 8 * most <= (u64(400) << 20);
-    std::unique_ptr<u64[]> edges_private(private_edges ? new u64[std::max<u64>(1, e1 - e0)] : nullptr);
-    u64 *const edges = private_edges ? edges_private.get()
-                                     : reinterpret_cast<u64 *>(node.alloc_each(8 * (e1 - e0), "edges")[r]);
+    const u64 e0 = M * r / P, e1 = M * (r + 1) / P;
+    u64 *const edges = reinterpret_cast<u64 *>(arena[r]);
     const FastGen fg(p);
     const char *fe = std::getenv("PP_FASTGEN");
     const bool fast = !(fe && fe[0] == '0') && fastgen_matches(p, fg, e0, e1);
@@ -660,11 +634,7 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
         }
     }
     prof.mark("scatter");
-    node.sync();
-    if (private_edges)
-        edges_private.reset();
-    else
-        node.release_tag("edges");
+    node.sync();   // my edges are dead from here: my arena waits for my part of the CSR
     prof.mark("wait");
 
     // Owner r: positions h = r + li * P, vertex mix^-1(h). First pass sizes their lists.
@@ -693,11 +663,23 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     u64 arcs = 0;
     for (int q = 0; q < P; q++) arcs += owned[q];
 
-    // The CSR: one window per owner (col, then w). The per-vertex tables: one window, small.
+    // The CSR: owner q's col, then w, in q's arena; an owner too heavy for its arena gets a window
+    // of its own (every rank knows every owner's size, so all agree on it). The per-vertex
+    // tables: one window, small.
     Graph g;
     g.arcs = arcs;
     g.relabeled = relabel;
-    const std::vector<char *> csr = node.alloc_each(page_up(4 * mine) + mine, "csr");
+    auto csr_bytes = [&](int q) { return page_up(4 * owned[q]) + owned[q]; };
+    std::vector<char *> csr = arena;
+    bool spill = false;
+    for (int q = 0; q < P; q++) spill |= csr_bytes(q) > arena_bytes(q);
+    const bool me = csr_bytes(r) > arena_bytes(r);
+    if (spill) {
+        const std::vector<char *> extra = node.alloc_each(me ? csr_bytes(r) : 0, "csr");
+        for (int q = 0; q < P; q++)
+            if (csr_bytes(q) > arena_bytes(q)) csr[q] = extra[q];
+    }
+    prof.count("csr-spills", me ? 1 : 0);
     g.col.resize(P);
     g.w.resize(P);
     for (int q = 0; q < P; q++) {
@@ -740,18 +722,29 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
         }
         g.adj[s] = {u32(at), d};
         g.own[s] = uint16_t(r);
-        pos[li] = u32(at);   // now the fill cursor, within my CSR window
+        pos[li] = u32(at);   // now the fill cursor, within my part of the CSR
         at += d;
     }
     prof.mark("slots");
     node.sync();   // every newid is in place before any owner translates its arcs' far ends
     prof.mark("wait");
 #ifdef HW21_PROF
-    // Experiment: take the first touch of this owner's CSR pages out of the fill.
+    // Experiments that split the fill's time. PP_PRETOUCH: the first touch of my CSR pages, done
+    // in order beforehand. PP_PROBE: the fill's loop without its two stores, on cursors of its
+    // own (copied first, under probe-copy): count's work plus the far ends' slots.
     if (std::getenv("PP_PRETOUCH")) {
         std::fill(g.col[r], g.col[r] + mine, 0u);
         std::fill(g.w[r], g.w[r] + mine, u8(0));
         prof.mark("pretouch");
+    }
+    if (std::getenv("PP_PROBE")) {
+        std::vector<u32> cur(pos);
+        prof.mark("probe-copy");
+        u64 sum = 0;
+        for_my_arcs([&](u64 a) { sum += cur[fd.div(u32(a & VMASK))]++ ^ g.slot(u32((a >> VBITS) & VMASK)); });
+        volatile u64 keep = sum;   // the loop must run
+        (void)keep;
+        prof.mark("probe");
     }
 #endif
 
@@ -776,10 +769,9 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     return g;
 }
 
-// Atomic min on a window word; true if this call lowered it.
-inline bool lower(u32 *slot, u32 nd)
+// Atomic min on a window word last read as cur; true if this call lowered it.
+inline bool lower(u32 *slot, u32 cur, u32 nd)
 {
-    u32 cur = __atomic_load_n(slot, __ATOMIC_RELAXED);
     while (nd < cur)
         if (__atomic_compare_exchange_n(slot, &cur, nd, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return true;
     return false;
@@ -912,7 +904,9 @@ public:
         prof.count("round-max-arcs", r == 0 ? biggest : 0);
         prof.count("arcs", scanned);
         prof.count("pushes", pushes);
-        pushes = 0;
+        prof.count("relax-final", final_hits);
+        prof.count("relax-nogain", nogain_hits);
+        pushes = final_hits = nogain_hits = 0;
     }
 
     const u32 *distances() const { return dist; }
@@ -927,7 +921,7 @@ private:
     u64 *coarse;
     std::vector<u32> ring[RING];
     std::vector<u64> info, off, coff, arc0;
-    u64 pushes = 0;
+    u64 pushes = 0, final_hits = 0, nogain_hits = 0;   // relaxations: lowered, target final, no lower
 
     // info is reused after the allgather: [3q + 1] items and [3q + 2] arcs of q this round.
     u64 &cnt_of(int q) { return info[3 * u64(q) + 1]; }
@@ -986,7 +980,12 @@ private:
         for (u64 e = 0; e < k; e++) {
             if (e + PF < k) __builtin_prefetch(ds + col[e + PF]);
             const u32 y = col[e], nd = d + w[e];
-            if (lower(ds + y, nd)) {
+            const u32 cur = __atomic_load_n(ds + y, __ATOMIC_RELAXED);
+            if (Prof::on) {   // how it ends, unless it lowers y (pushes) or loses a race (the rest)
+                final_hits += cur <= d;
+                nogain_hits += cur > d && cur <= nd;
+            }
+            if (lower(ds + y, cur, nd)) {
                 ring[nd % RING].push_back(s << VBITS | y);
                 pushes++;
             }

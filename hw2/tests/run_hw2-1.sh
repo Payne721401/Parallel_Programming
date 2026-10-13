@@ -44,7 +44,8 @@ set -euo pipefail
 #   SCALE_CASE=04      scaling's case; SCALE_NPS="1 2 4 8" its rank counts
 #   VERBOSE=1          custom and knob runs print a line per run (default: a dot per pass)
 #   CASES_DIR, OUT_ROOT
-# Other PP_* knobs (PP_PRETOUCH=1 in the profiling build) pass through from the environment.
+# Other PP_* knobs pass through from the environment; the profiling build's experiments are
+# PP_PRETOUCH=1 (first-touch the CSR before the fill) and PP_PROBE=1 (time the fill's reads alone).
 #
 # Every run's output is checked with hw2-1-check, which compares every field (n_reached,
 # checksum, both digests, every sampled distance), against the course's golden for the public
@@ -124,10 +125,12 @@ timing_now=0   # the runs at hand use the profiling build: show its breakdown
 quiet_now=0    # passes print a dot instead of a line (custom and knobs, unless VERBOSE=1)
 dots_open=0    # a line of dots is waiting for its newline
 
-# The profiling build's report, condensed: phases (slowest rank), page faults (most on a rank),
-# the traversal's parts, window alloc/free of 5 ms or more, counters, and any stats lines.
+# The profiling build's report, condensed: the graph's size, phases (slowest rank), page faults
+# (most on a rank), the traversal's parts, window alloc/free of 5 ms or more, counters, and any
+# stats lines.
 compact_timing() {
     awk '
+        /^\[hw2-1\] P=/ { print "graph: " substr($0, 9) }
         /^\[hw2-1\] [a-z][a-z:-]* +max/ {
             name = $2; t = $4
             if (name ~ /^trav:/)      trav = trav sprintf("  %s %s", substr(name, 6), t)
