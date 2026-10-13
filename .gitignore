@@ -44,6 +44,9 @@ hw2/original_version/hw2-2-seq
 tmp/
 *.log
 
+# Python bytecode caches (hw2/tests/summarize_hw2-1-witness.py)
+__pycache__/
+
 # Course-provided shared test data / symlinks
 cases
 
