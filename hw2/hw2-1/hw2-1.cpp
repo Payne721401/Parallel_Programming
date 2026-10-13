@@ -585,7 +585,7 @@ struct WitnessStats {
 // to owner mix(v) mod P, in local position mix(v) / P.
 template <EdgeSelection selection = EdgeSelection::full>
 Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof,
-            u32 tau = 255, const u32 *bounds = nullptr, bool prune = false, WitnessStats *stats = nullptr)
+            u32 tau = 255, const u8 *bounds = nullptr, bool prune = false, WitnessStats *stats = nullptr)
 {
     const int P = node.size, r = node.rank;
     const u64 N = num_vertices(p), M = num_edges(p);
@@ -631,7 +631,7 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof,
                     bool redundant = false;
                     if (ww[j] > tau) {
                         const u32 a = bounds[uu[j]], b = bounds[vv[j]];
-                        redundant = a != INF && b != INF && u64(a) + b < ww[j];
+                        redundant = a + b < ww[j];
                     }
                     removable += redundant;
                     accept[j] = !(prune && redundant);
@@ -1086,7 +1086,9 @@ WitnessConfig witness_config(Node &node)
 
 // L[v] is an actual path in the retained light graph. Removing only heavier edges with
 // L[u] + L[v] < w preserves all-pairs distances, including disconnected components.
-u32 *prepare_witness(Node &bound_node, const GraphParams &p, const FastDiv &fd,
+// Store min(L[v], 255): a sum containing 255 cannot pass for any edge weight <= 255.
+// Unreachable vertices also map to 255; addition is widened before comparing.
+u8 *prepare_witness(Node &bound_node, const GraphParams &p, const FastDiv &fd,
                      u32 tau, WitnessStats &stats)
 {
     const u64 N = num_vertices(p);
@@ -1100,8 +1102,8 @@ u32 *prepare_witness(Node &bound_node, const GraphParams &p, const FastDiv &fd,
         if (light.adj[s].deg)
             best = std::max(best, (u64(light.adj[s].deg) << 32) | u64(~light.vertex(u32(s))));
     MPI_Allreduce(&best, &global_best, 1, MPI_UINT64_T, MPI_MAX, bound_node.comm);
-    u32 *const bounds = bound_node.alloc<u32>(N, "witness-bounds");
-    std::fill(bounds + N * r / P, bounds + N * (r + 1) / P, INF);
+    u8 *const bounds = bound_node.alloc<u8>(N, "witness-bounds");
+    std::fill(bounds + N * r / P, bounds + N * (r + 1) / P, u8(255));
     bound_node.sync();
     light_prof.mark("bound-init");
     u64 reached = 0;
@@ -1114,7 +1116,7 @@ u32 *prepare_witness(Node &bound_node, const GraphParams &p, const FastDiv &fd,
         light_prof.mark("traverse");
         const u32 *dist = search.distances();
         for (u64 s = light.n * r / P; s < light.n * (r + 1) / P; s++) {
-            bounds[light.vertex(u32(s))] = dist[s];
+            bounds[light.vertex(u32(s))] = u8(std::min(dist[s], u32(255)));
             reached += dist[s] != INF;
         }
     }
@@ -1156,7 +1158,7 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
         if (witness.mode) {
             Prof bound_prof("hw2-1-bound");
             Node bound_node(comm, bound_prof);
-            const u32 *bounds = prepare_witness(bound_node, p, fd, witness.tau, witness_stats);
+            const u8 *bounds = prepare_witness(bound_node, p, fd, witness.tau, witness_stats);
             prof.mark("witness");
             g = build<EdgeSelection::witness>(node, p, fd, prof, witness.tau, bounds,
                                                witness.mode == 2, &witness_stats);
