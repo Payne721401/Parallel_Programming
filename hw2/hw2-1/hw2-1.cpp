@@ -14,10 +14,13 @@
 //             isolated ones none: the arc ends that relaxations read cluster in a few MB of each
 //             distance array instead of spreading over all of it, and the arrays shrink by the
 //             isolated share (about half the vertices at scale 23-24).
-//   memory    one window for the whole run, reused by lifetime: the generated edges' space then
-//             holds the CSR, the outbox's space the search's arrays. Nothing is freed until the
-//             end; freeing a window is the kernel handing back its pages one process at a time,
-//             and mapping fresh pages costs a page fault each.
+//   memory    a window is one shared-memory object, and first touches of its pages queue on that
+//             object (measured, 8 ranks at once: 7.1 us a page in one window, 2.5 in a window
+//             each, 2.0 private). So what a rank alone writes sits in a window of its own (its
+//             outbox, its CSR part), the edges only their generator reads stay private, and only
+//             the small per-vertex tables and the search's arrays share one window. Little is
+//             freed before the end (only edges too big to keep private): a window's pages go
+//             back serially, about 0.1 s per GB.
 //   traverse  all distinct sources at once, one distance value per round. Weights are integers
 //             >= 1, so every (source, vertex) whose tentative distance equals the round's value d
 //             is final: each is expanded exactly once. A round publishes the frontier to a shared
@@ -45,6 +48,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 #if defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__AVX512BW__)
@@ -419,6 +424,44 @@ public:
         return static_cast<T *>(base);
     }
 
+    // One window per rank, rank j's holding j's bytes. Each window is its own shared-memory
+    // object, so ranks first-touching their own parts never queue on one object's page index
+    // (8 ranks at once: 2.5 us a page, against 7.1 for one window). Returns every rank's part.
+    std::vector<char *> alloc_each(u64 bytes, const char *tag)
+    {
+        const double t0 = tick();
+        std::vector<char *> parts(size);
+        for (int j = 0; j < size; j++) {
+            void *mine, *base;
+            MPI_Win win;
+            MPI_Win_allocate_shared(rank == j ? MPI_Aint(std::max<u64>(bytes, 64)) : 0, 1, MPI_INFO_NULL, comm, &mine,
+                                    &win);
+            MPI_Aint sz;
+            int unit;
+            MPI_Win_shared_query(win, j, &sz, &unit, &base);
+            MPI_Win_lock_all(MPI_MODE_NOCHECK, win);
+            wins.push_back({base, win, tag});
+            parts[j] = static_cast<char *>(base);
+        }
+        prof.sub("alloc:", tag, tick() - t0);
+        return parts;
+    }
+
+    // Frees every window allocated under tag. Collective.
+    void release_tag(const char *tag)
+    {
+        const double t0 = tick();
+        for (size_t i = 0; i < wins.size();)
+            if (std::strcmp(wins[i].tag, tag) == 0) {
+                MPI_Win_unlock_all(wins[i].win);
+                MPI_Win_free(&wins[i].win);
+                wins.erase(wins.begin() + i);
+            } else {
+                i++;
+            }
+        prof.sub("free:", tag, tick() - t0);
+    }
+
     void release(const void *p)   // collective, like alloc
     {
         for (size_t i = 0; i < wins.size(); i++)
@@ -434,7 +477,13 @@ public:
 
     void release_all()
     {
-        while (!wins.empty()) release(wins.back().base);
+        while (!wins.empty()) {
+            const double t0 = tick();
+            MPI_Win_unlock_all(wins.back().win);
+            MPI_Win_free(&wins.back().win);
+            prof.sub("free:", wins.back().tag, tick() - t0);
+            wins.pop_back();
+        }
     }
 
     // Orders this rank's window stores before what follows; paired with a barrier or a
@@ -461,27 +510,29 @@ private:
     std::vector<Window> wins;
 };
 
-// Adjacency of a slot: col/w[start, start + deg).
+// Adjacency of a slot: its owner's col/w[start, start + deg).
 struct Adj {
     u32 start, deg;
 };
 
 // The graph over slots. With relabeling (the default) the slots are degree-ordered and the
-// isolated vertices have none; with PP_RELABEL=0 a vertex's slot is its own number.
+// isolated vertices have none; with PP_RELABEL=0 a vertex's slot is its own number. Each owner's
+// adjacency lists sit in that owner's own window: col[own[s]] + adj[s].start.
 struct Graph {
-    u64 n;           // slots: the non-isolated vertices, or N
-    Adj *adj;        // [n]
-    u32 *col;        // [arcs], the far end's slot
-    u8 *w;           // [arcs]
+    u64 n;                  // slots: the non-isolated vertices, or N
+    Adj *adj;               // [n]
+    uint16_t *own;          // [n]: the slot's owner
+    std::vector<u32 *> col; // per owner: the far ends' slots
+    std::vector<u8 *> w;    // per owner: the weights
     u64 arcs;
     bool relabeled;
-    u32 *newid;      // [N]: a vertex's slot, INF for an isolated one (relabeled only)
-    u32 *oldid;      // [n]: a slot's vertex (relabeled only)
-    char *spare;     // the outbox's space, free once the graph is built
-    u64 spare_bytes;
+    u32 *newid;             // [N]: a vertex's slot, INF for an isolated one (relabeled only)
+    u32 *oldid;             // [n]: a slot's vertex (relabeled only)
 
     u32 slot(u32 v) const { return relabeled ? newid[v] : v; }
     u32 vertex(u32 s) const { return relabeled ? oldid[s] : s; }
+    const u32 *cols(u32 s) const { return col[own[s]] + adj[s].start; }
+    const u8 *weights(u32 s) const { return w[own[s]] + adj[s].start; }
 };
 
 inline u64 page_up(u64 x) { return (x + 4095) & ~u64(4095); }
@@ -504,7 +555,7 @@ void graph_stats(Node &node, const Graph &g, u64 N, const Mix &mix, u64 nloc)
             continue;
         }
         const Adj a = g.adj[s];
-        tmp.assign(g.col + a.start, g.col + a.start + a.deg);
+        tmp.assign(g.cols(s), g.cols(s) + a.deg);
         std::sort(tmp.begin(), tmp.end());
         const u64 uniq = u64(std::unique(tmp.begin(), tmp.end()) - tmp.begin());
         mine[1] += a.deg - uniq;
@@ -547,21 +598,20 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     const char *re = std::getenv("PP_RELABEL");
     const bool relabel = !(re && re[0] == '0');
 
-    // One window for the run, carved by lifetime. X: the generated edges (8 B each), then col and
-    // w (5 B per arc, 2 arcs per edge at most). Y: the outbox (8 B per arc), then the search's
-    // arrays. Z: adj, newid, oldid (16 B per vertex at most). Pages cost nothing until touched.
-    const u64 X = page_up(10 * M + 4096), Y = page_up(16 * M), Z = page_up(16 * N);
-    char *arena = node.alloc<char>(X + Y + Z, "arena");
-    u64 *const edges = reinterpret_cast<u64 *>(arena);
-    u64 *const outbox = reinterpret_cast<u64 *>(arena + X);
-
+    // Memory: what a rank alone writes and others read sits in windows of their own (outbox, CSR),
+    // so first touches never queue on one shared object; what only its generator reads (the
+    // edges) is private while that fits the cap comfortably, as it always does at P = 24.
     // Generate edges [M r / P, M (r + 1) / P), self-loops dropped, packed (u | v << 26 | w << 52).
-    const u64 e0 = M * r / P, e1 = M * (r + 1) / P;
+    const u64 e0 = M * r / P, e1 = M * (r + 1) / P, most = (M + P - 1) / P;
+    const bool private_edges = 8 * most <= (u64(400) << 20);
+    std::unique_ptr<u64[]> edges_private(private_edges ? new u64[std::max<u64>(1, e1 - e0)] : nullptr);
+    u64 *const edges = private_edges ? edges_private.get()
+                                     : reinterpret_cast<u64 *>(node.alloc_each(8 * (e1 - e0), "edges")[r]);
     const FastGen fg(p);
     const char *fe = std::getenv("PP_FASTGEN");
     const bool fast = !(fe && fe[0] == '0') && fastgen_matches(p, fg, e0, e1);
     prof.count("fastgen-off", fast ? 0 : 1);
-    u64 kept = 0;                      // edges[e0, e0 + kept)
+    u64 kept = 0;                      // edges[0, kept)
     std::vector<u64> to_owner(P, 0);   // arcs this rank sends to each owner
     {
         constexpr u64 CH = 1 << 14;
@@ -575,7 +625,7 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
                 generate_edges(p, i, i + n, uu.data(), vv.data(), ww.data());
             for (u64 j = 0; j < n; j++) {
                 if (uu[j] == vv[j]) continue;
-                edges[e0 + kept++] = u64(uu[j]) | u64(vv[j]) << VBITS | u64(ww[j]) << 52;
+                edges[kept++] = u64(uu[j]) | u64(vv[j]) << VBITS | u64(ww[j]) << 52;
                 to_owner[fd.mod(mix.fwd(uu[j]))]++;
                 to_owner[fd.mod(mix.fwd(vv[j]))]++;
             }
@@ -583,30 +633,38 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     }
     prof.mark("generate");
 
-    // Outbox: rank q's segment, and inside it one run per owner. sent[q * P + o] = arcs q -> o.
-    // An arc is packed (mix(src) | dst << 26 | w << 52): the owner needs src only as a position.
+    // Outbox: one window per producer q, holding q's runs for owners 0..P-1 in order.
+    // sent[q * P + o] = arcs q -> o. An arc is packed (mix(src) | dst << 26 | w << 52): the
+    // owner needs src only as a position.
     std::vector<u64> sent(u64(P) * P);
     MPI_Allgather(to_owner.data(), P, MPI_UINT64_T, sent.data(), P, MPI_UINT64_T, node.comm);
-    std::vector<u64> run_begin(u64(P) * P);   // [q * P + o]: where q's run for o starts
-    u64 total = 0;
-    for (int q = 0; q < P; q++)
+    std::vector<u64> run_begin(u64(P) * P);   // [q * P + o]: where q's run for o starts in q's window
+    for (int q = 0; q < P; q++) {
+        u64 at = 0;
         for (int o = 0; o < P; o++) {
-            run_begin[u64(q) * P + o] = total;
-            total += sent[u64(q) * P + o];
+            run_begin[u64(q) * P + o] = at;
+            at += sent[u64(q) * P + o];
         }
+    }
+    const std::vector<char *> outbox = node.alloc_each(8 * kept * 2, "outbox");
     prof.mark("wait");
     {
+        u64 *const mine = reinterpret_cast<u64 *>(outbox[r]);
         std::vector<u64> cur(run_begin.begin() + u64(r) * P, run_begin.begin() + u64(r + 1) * P);
-        for (u64 i = e0; i < e0 + kept; i++) {
+        for (u64 i = 0; i < kept; i++) {
             const u64 e = edges[i], w = (e >> 52) << 52;
             const u32 u = u32(e & VMASK), v = u32((e >> VBITS) & VMASK);
             const u32 hu = mix.fwd(u), hv = mix.fwd(v);
-            outbox[cur[fd.mod(hu)]++] = u64(hu) | u64(v) << VBITS | w;   // u -> v
-            outbox[cur[fd.mod(hv)]++] = u64(hv) | u64(u) << VBITS | w;   // v -> u
+            mine[cur[fd.mod(hu)]++] = u64(hu) | u64(v) << VBITS | w;   // u -> v
+            mine[cur[fd.mod(hv)]++] = u64(hv) | u64(u) << VBITS | w;   // v -> u
         }
     }
     prof.mark("scatter");
-    node.sync();   // the edges are dead from here: X becomes the CSR
+    node.sync();
+    if (private_edges)
+        edges_private.reset();
+    else
+        node.release_tag("edges");
     prof.mark("wait");
 
     // Owner r: positions h = r + li * P, vertex mix^-1(h). First pass sizes their lists.
@@ -614,7 +672,7 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     std::vector<u32> pos(nloc, 0);
     auto for_my_arcs = [&](auto &&f) {
         for (int q = 0; q < P; q++) {
-            const u64 *a = outbox + run_begin[u64(q) * P + r];
+            const u64 *a = reinterpret_cast<const u64 *>(outbox[q]) + run_begin[u64(q) * P + r];
             const u64 n = sent[u64(q) * P + r];
             for (u64 i = 0; i < n; i++) f(a[i]);
         }
@@ -632,22 +690,25 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     MPI_Allgather(&mine, 1, MPI_UINT64_T, owned.data(), 1, MPI_UINT64_T, node.comm);
     MPI_Allgather(cls, 32, MPI_UINT64_T, classes.data(), 32, MPI_UINT64_T, node.comm);
     prof.mark("wait");
-    u64 base = 0, arcs = 0;
-    for (int q = 0; q < P; q++) {
-        if (q < r) base += owned[q];
-        arcs += owned[q];
-    }
+    u64 arcs = 0;
+    for (int q = 0; q < P; q++) arcs += owned[q];
 
+    // The CSR: one window per owner (col, then w). The per-vertex tables: one window, small.
     Graph g;
     g.arcs = arcs;
     g.relabeled = relabel;
-    g.col = reinterpret_cast<u32 *>(arena);
-    g.w = reinterpret_cast<u8 *>(arena + page_up(4 * arcs));
-    g.adj = reinterpret_cast<Adj *>(arena + X + Y);
-    g.newid = reinterpret_cast<u32 *>(arena + X + Y + 8 * N);
-    g.oldid = reinterpret_cast<u32 *>(arena + X + Y + 12 * N);
-    g.spare = arena + X;
-    g.spare_bytes = Y;
+    const std::vector<char *> csr = node.alloc_each(page_up(4 * mine) + mine, "csr");
+    g.col.resize(P);
+    g.w.resize(P);
+    for (int q = 0; q < P; q++) {
+        g.col[q] = reinterpret_cast<u32 *>(csr[q]);
+        g.w[q] = reinterpret_cast<u8 *>(csr[q] + page_up(4 * owned[q]));
+    }
+    char *const tables = node.alloc<char>(18 * N, "tables");
+    g.adj = reinterpret_cast<Adj *>(tables);
+    g.newid = reinterpret_cast<u32 *>(tables + 8 * N);
+    g.oldid = reinterpret_cast<u32 *>(tables + 12 * N);
+    g.own = reinterpret_cast<uint16_t *>(tables + 16 * N);
 
     // Slots. Relabeled: classes from the heaviest down, then owners in rank order, then positions;
     // my first slot in class c follows every heavier class and the lower ranks' share of c.
@@ -665,7 +726,7 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
     } else {
         g.n = N;
     }
-    for (u64 li = 0, at = base; li < nloc; li++) {
+    for (u64 li = 0, at = 0; li < nloc; li++) {
         const u32 v = mix.inv(u32(r + li * P)), d = pos[li];
         u32 s = v;
         if (relabel) {
@@ -678,7 +739,8 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
             g.oldid[s] = v;
         }
         g.adj[s] = {u32(at), d};
-        pos[li] = u32(at);   // now the fill cursor
+        g.own[s] = uint16_t(r);
+        pos[li] = u32(at);   // now the fill cursor, within my CSR window
         at += d;
     }
     prof.mark("slots");
@@ -687,21 +749,23 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof)
 #ifdef HW21_PROF
     // Experiment: take the first touch of this owner's CSR pages out of the fill.
     if (std::getenv("PP_PRETOUCH")) {
-        std::fill(g.col + base, g.col + base + mine, 0u);
-        std::fill(g.w + base, g.w + base + mine, u8(0));
+        std::fill(g.col[r], g.col[r] + mine, 0u);
+        std::fill(g.w[r], g.w[r] + mine, u8(0));
         prof.mark("pretouch");
     }
 #endif
 
     // Second pass fills them.
+    u32 *const col = g.col[r];
+    u8 *const wt = g.w[r];
     for_my_arcs([&](u64 a) {
         const u32 at = pos[fd.div(u32(a & VMASK))]++;
-        g.col[at] = g.slot(u32((a >> VBITS) & VMASK));
-        g.w[at] = u8(a >> 52);
+        col[at] = g.slot(u32((a >> VBITS) & VMASK));
+        wt[at] = u8(a >> 52);
     });
     std::vector<u32>().swap(pos);
     prof.mark("fill");
-    node.sync();   // the outbox is dead from here: Y becomes the search's
+    node.sync();
     prof.mark("wait");
 #ifdef HW21_PROF
     if (std::getenv("PP_STATS")) {
@@ -728,18 +792,10 @@ public:
         : node(node), g(g), n(g.n), prof(prof), P(node.size), r(node.rank)
     {
         // A slot is settled at most once per source, so n * cap bounds one round's frontier; the
-        // coarse prefix keeps one entry per 64 items plus two per rank. All three go in the
-        // outbox's old space when they fit (they do unless edgefactor is tiny), else new windows.
-        const u64 nd = page_up(4 * n * cap), nc = n * cap / 64 + 2 * u64(P) + 1;
-        if (2 * nd + 8 * nc <= g.spare_bytes) {
-            dist = reinterpret_cast<u32 *>(g.spare);
-            front = reinterpret_cast<u32 *>(g.spare + nd);
-            coarse = reinterpret_cast<u64 *>(g.spare + 2 * nd);
-        } else {
-            dist = node.alloc<u32>(n * cap, "dist");
-            front = node.alloc<u32>(n * cap, "front");
-            coarse = node.alloc<u64>(nc, "coarse");
-        }
+        // coarse prefix keeps one entry per 64 items plus two per rank.
+        dist = node.alloc<u32>(n * cap, "dist");
+        front = node.alloc<u32>(n * cap, "front");
+        coarse = node.alloc<u64>(n * cap / 64 + 2 * u64(P) + 1, "coarse");
         info.resize(3 * u64(P));
         off.resize(P);
         coff.resize(P);
@@ -916,18 +972,16 @@ private:
             const u32 it = front[off[q] + i];
             const Adj a = g.adj[it & VMASK];
             const u64 take = std::min<u64>(a.deg - o, left);
-            relax(it >> VBITS, d, u64(a.start) + o, take);
+            relax(it >> VBITS, d, g.cols(it & VMASK) + o, g.weights(it & VMASK) + o, take);
             left -= take;
             o = 0;
             i++;
         }
     }
 
-    void relax(u32 s, u32 d, u64 e0, u64 k)
+    void relax(u32 s, u32 d, const u32 *col, const u8 *w, u64 k)
     {
         u32 *ds = dist + u64(s) * n;
-        const u32 *col = g.col + e0;
-        const u8 *w = g.w + e0;
         constexpr u64 PF = 16;
         for (u64 e = 0; e < k; e++) {
             if (e + PF < k) __builtin_prefetch(ds + col[e + PF]);
