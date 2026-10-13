@@ -40,8 +40,9 @@ hw2/hw2-2/hw2-2
 hw2/original_version/hw2-1-seq
 hw2/original_version/hw2-2-seq
 
-# Test runs' outputs (hw2/tests/*.sh write under each problem's tmp/)
+# Test runs' outputs (hw2/tests/*.sh write under each problem's tmp/, batch jobs to *.log)
 tmp/
+*.log
 
 # Course-provided shared test data / symlinks
 cases

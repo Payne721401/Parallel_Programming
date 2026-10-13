@@ -27,7 +27,10 @@
 //             is final: each is expanded exactly once. A round publishes the frontier to a shared
 //             array, splits its arcs evenly over the ranks (a hub's list is cut too), and relaxes
 //             with an atomic min; whoever lowers a distance files the vertex in its own 256-slot
-//             ring of buckets (w <= 255, so pending values span at most 255).
+//             ring of buckets (w <= 255, so pending values span at most 255). About 60% of
+//             relaxations (measured, scale 24-26) reach a target already final, which nothing can
+//             lower: a bitmap of the final (source, slot) pairs, 1/32 the size of the distances
+//             and set as the frontier is published, lets those skip reading the distance at all.
 //   results   each rank sums a contiguous slice of the vertices; MPI_Reduce brings it to rank 0.
 //
 // Phases are separated by MPI_Win_sync + MPI_Barrier, which is what makes one rank's plain stores
@@ -37,12 +40,13 @@
 // hw2-1-prof); the judge's build compiles none of it. That build prints, per phase, the slowest
 // and fastest rank's time and the most page faults any rank took, time spent waiting at barriers
 // under "wait", timings nested inside phases (window alloc/free, the traversal's parts) and
-// counters, among them how relaxations end: on a target already final (relax-final), on one
-// whose tentative distance is no larger (relax-nogain), or lowering it (pushes). There,
-// PP_STATS=1 adds the graph's shape, PP_PRETOUCH=1 touches the CSR's pages before filling it, and
-// PP_PROBE=1 times the fill's reads alone (cursors, far ends' slots) before the fill. In any
-// build, PP_BATCH=n caps the sources searched together, PP_FASTGEN=0 uses the official generator
-// and PP_RELABEL=0 keeps the original vertex numbers.
+// counters, among them how relaxations end: on a target already final (relax-final, of which
+// relax-bitmap the bitmap caught), on one whose tentative distance is no larger (relax-nogain),
+// or lowering it (pushes). There, PP_STATS=1 adds the graph's shape, PP_PRETOUCH=1 touches the
+// CSR's pages before filling it, and PP_PROBE=1 times the fill's reads alone (cursors, far ends'
+// slots) before the fill. In any build, PP_BATCH=n caps the sources searched together,
+// PP_FASTGEN=0 uses the official generator, PP_RELABEL=0 keeps the original vertex numbers and
+// PP_BITMAP=0 reads every target's distance.
 #include <mpi.h>
 #ifdef HW21_PROF
 #include <sys/resource.h>
@@ -788,6 +792,9 @@ public:
         dist = node.alloc<u32>(n * cap, "dist");
         front = node.alloc<u32>(n * cap, "front");
         coarse = node.alloc<u64>(n * cap / 64 + 2 * u64(P) + 1, "coarse");
+        const char *bm = std::getenv("PP_BITMAP");
+        bitmap = !(bm && bm[0] == '0');
+        if (bitmap) final_bits = node.alloc<u64>((n * cap + 63) / 64, "bitmap");
         info.resize(3 * u64(P));
         off.resize(P);
         coff.resize(P);
@@ -799,6 +806,10 @@ public:
     {
         const u64 len = n * u64(k), lo = len * r / P, hi = len * (r + 1) / P;
         std::fill(dist + lo, dist + hi, INF);
+        if (bitmap) {
+            const u64 words = (len + 63) / 64;
+            std::fill(final_bits + words * r / P, final_bits + words * (r + 1) / P, u64(0));
+        }
         node.sync();
         for (int s = 0; s < k; s++)
             if (s % P == r) {
@@ -863,12 +874,18 @@ public:
                 arc0[q + 1] = arc0[q] + arcs_of(q);
             }
             if (mine[0] == d) {
+                // d is the smallest pending value anywhere, and a relaxation gives at least d, so
+                // what is published is final: its bit goes up before the round's relaxations.
                 std::vector<u32> &b = ring[d % RING];
                 u64 a = 0;
                 for (size_t j = 0; j < b.size(); j++) {
                     if (j % 64 == 0) coarse[coff[r] + j / 64] = a;
                     front[off[r] + j] = b[j];
                     a += g.adj[b[j] & VMASK].deg;
+                    if (bitmap) {
+                        const u64 i = u64(b[j] >> VBITS) * n + (b[j] & VMASK);
+                        __atomic_fetch_or(final_bits + i / 64, u64(1) << (i % 64), __ATOMIC_RELAXED);
+                    }
                 }
                 coarse[coff[r] + (b.size() + 63) / 64] = a;
                 // Published, so the private copy can go; a big one goes for good, or 256 buckets
@@ -905,8 +922,9 @@ public:
         prof.count("arcs", scanned);
         prof.count("pushes", pushes);
         prof.count("relax-final", final_hits);
+        prof.count("relax-bitmap", bitmap_hits);
         prof.count("relax-nogain", nogain_hits);
-        pushes = final_hits = nogain_hits = 0;
+        pushes = final_hits = bitmap_hits = nogain_hits = 0;
     }
 
     const u32 *distances() const { return dist; }
@@ -919,9 +937,13 @@ private:
     const int P, r;
     u32 *dist, *front;
     u64 *coarse;
+    u64 *final_bits = nullptr;   // bit s * n + slot: that pair's distance is final
+    bool bitmap = false;
+    u32 zero = 0;                // what a relaxation of a final target reads instead of its distance
     std::vector<u32> ring[RING];
     std::vector<u64> info, off, coff, arc0;
-    u64 pushes = 0, final_hits = 0, nogain_hits = 0;   // relaxations: lowered, target final, no lower
+    // Relaxations: lowered, target final (caught by the bitmap), no lower.
+    u64 pushes = 0, final_hits = 0, bitmap_hits = 0, nogain_hits = 0;
 
     // info is reused after the allgather: [3q + 1] items and [3q + 2] arcs of q this round.
     u64 &cnt_of(int q) { return info[3 * u64(q) + 1]; }
@@ -966,26 +988,48 @@ private:
             const u32 it = front[off[q] + i];
             const Adj a = g.adj[it & VMASK];
             const u64 take = std::min<u64>(a.deg - o, left);
-            relax(it >> VBITS, d, g.cols(it & VMASK) + o, g.weights(it & VMASK) + o, take);
+            if (bitmap)
+                relax<true>(it >> VBITS, d, g.cols(it & VMASK) + o, g.weights(it & VMASK) + o, take);
+            else
+                relax<false>(it >> VBITS, d, g.cols(it & VMASK) + o, g.weights(it & VMASK) + o, take);
             left -= take;
             o = 0;
             i++;
         }
     }
 
+    bool is_final(u64 i) const { return __atomic_load_n(final_bits + i / 64, __ATOMIC_RELAXED) >> (i % 64) & 1; }
+
+    // Relaxes k arcs of source s from distance d. With the bitmap, a final target is passed over
+    // without its distance being read: it reads zero, which lowers nothing. The bitmap's word is
+    // fetched 2 PF arcs ahead and the distance PF ahead, only for a target not final, so the
+    // distances of final targets never leave memory.
+    template <bool BITMAP>
     void relax(u32 s, u32 d, const u32 *col, const u8 *w, u64 k)
     {
         u32 *ds = dist + u64(s) * n;
+        const u64 base = u64(s) * n;
         constexpr u64 PF = 16;
         for (u64 e = 0; e < k; e++) {
-            if (e + PF < k) __builtin_prefetch(ds + col[e + PF]);
+            if (BITMAP) {
+                if (e + 2 * PF < k) __builtin_prefetch(final_bits + (base + col[e + 2 * PF]) / 64);
+                if (e + PF < k) {
+                    const u32 z = col[e + PF];
+                    __builtin_prefetch(is_final(base + z) ? &zero : ds + z);
+                }
+            } else if (e + PF < k) {
+                __builtin_prefetch(ds + col[e + PF]);
+            }
             const u32 y = col[e], nd = d + w[e];
-            const u32 cur = __atomic_load_n(ds + y, __ATOMIC_RELAXED);
+            const bool fin = BITMAP && is_final(base + y);
+            u32 *const at = fin ? &zero : ds + y;
+            const u32 cur = __atomic_load_n(at, __ATOMIC_RELAXED);
             if (Prof::on) {   // how it ends, unless it lowers y (pushes) or loses a race (the rest)
                 final_hits += cur <= d;
+                bitmap_hits += fin;
                 nogain_hits += cur > d && cur <= nd;
             }
-            if (lower(ds + y, cur, nd)) {
+            if (lower(at, cur, nd)) {
                 ring[nd % RING].push_back(s << VBITS | y);
                 pushes++;
             }
@@ -1046,9 +1090,9 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
             }
         }
 
-        // dist + frontier + coarse prefix cost about 8.125 bytes per slot and source.
+        // dist + frontier + coarse prefix + bitmap cost about 8.25 bytes per slot and source.
         const u64 budget = u64(20) << 30;
-        int cap = int(std::max<u64>(1, std::min<u64>(todo.size(), budget / (g.n * 8 + g.n / 8 + 1))));
+        int cap = int(std::max<u64>(1, std::min<u64>(todo.size(), budget / (g.n * 8 + g.n / 4 + 1))));
         if (const char *e = std::getenv("PP_BATCH")) cap = std::max(1, std::min(cap, std::atoi(e)));
         prof.count("batches", r == 0 ? (todo.size() + cap - 1) / cap : 0);
 

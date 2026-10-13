@@ -37,7 +37,8 @@ set -euo pipefail
 #                      the version before its last commit)
 #   AB_KNOB=PP_X=v     ab between this program with PP_X=v (base) and without it (new), no git
 #   RANKS="1 3 8"      rank counts for custom
-#   KNOBS="PP_BATCH=1 PP_BATCH=3 PP_FASTGEN=0 PP_RELABEL=0"   one extra pass of the custom cases per knob
+#   KNOBS="PP_BATCH=1 PP_BATCH=3 PP_FASTGEN=0 PP_RELABEL=0 PP_BITMAP=0"   one extra pass of the
+#                      custom cases per knob
 #   KNOB_RANKS="8"     rank counts for the knob passes
 #   TIMING=1           public runs use the profiling build and show its breakdown
 #   STATS=1            ... plus the graph's shape (PP_STATS=1; slow, so times mean little)
@@ -86,7 +87,7 @@ if [[ "$public_cases" == all ]]; then
 fi
 public_np="${PUBLIC_NP:-8}"
 ranks="${RANKS:-1 3 8}"
-knobs="${KNOBS:-PP_BATCH=1 PP_BATCH=3 PP_FASTGEN=0 PP_RELABEL=0}"
+knobs="${KNOBS:-PP_BATCH=1 PP_BATCH=3 PP_FASTGEN=0 PP_RELABEL=0 PP_BITMAP=0}"
 knob_ranks="${KNOB_RANKS:-8}"
 scale_case="${SCALE_CASE:-04}"
 scale_nps="${SCALE_NPS:-1 2 4 8}"
