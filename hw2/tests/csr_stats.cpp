@@ -167,6 +167,14 @@ int main(int argc, char **argv)
                 used ? double(A.nnz) / used : 0.0);
     std::printf("work a_k*b_k per used B row: top 0.1%% of rows %.1f%%, top 1%% %.1f%% of flops\n",
                 100 * top_share(kwork, 0.001), 100 * top_share(kwork, 0.01));
+    // Used B rows from the most work (a_k * b_k) down, and each row's place in that order.
+    std::vector<u32> hot_order;
+    for (u32 k = 0; k < K; k++)
+        if (a[k]) hot_order.push_back(k);
+    std::sort(hot_order.begin(), hot_order.end(),
+              [&](u32 x, u32 y) { return double(a[x]) * b[x] > double(a[y]) * b[y]; });
+    std::vector<u32> hot_rank(K, ~0u);
+    for (size_t j = 0; j < hot_order.size(); j++) hot_rank[hot_order[j]] = u32(j);
 
     for (const int P : Ps) {
         auto owner = [&](u64 n, u64 x) { return int(((x + 1) * u64(P) - 1) / n); };
@@ -193,6 +201,32 @@ int main(int argc, char **argv)
         std::printf("== P = %d (%d nodes, %d ranks each)\n", P, NODES, P / NODES);
         summary("row-wise flops per rank", roww);
         summary("K-split flops per rank", kw);
+        // K-split with the heaviest B rows replicated: their work can go to any rank, the rest
+        // stays with B's owners. The hot work fills ranks up to the mean, so the max is the mean
+        // unless some rank's own cold work is above it.
+        for (const double f : {0.001, 0.01, 0.05}) {
+            const u64 n = std::max<u64>(1, u64(f * double(hot_order.size())));
+            std::vector<double> cold(P, 0);
+            double hot = 0, bytes = 0, nd[NODES] = {};
+            for (u32 k = 0; k < K; k++) {
+                if (!a[k]) continue;
+                const double w = double(a[k]) * b[k];
+                if (hot_rank[k] < n) {
+                    hot += w;
+                    bytes += 8.0 * b[k];
+                } else {
+                    cold[owner(K, k)] += w;
+                    nd[node(owner(K, k))] += w;
+                }
+            }
+            const double total = hot + nd[0] + nd[1], mean = total / P;
+            const double mx = std::max(mean, *std::max_element(cold.begin(), cold.end()));
+            std::printf("  K-split, top %4.1f%% B rows (%7llu rows, %s) replicated: hot work %.1f%%, max/mean %.2f,"
+                        " cold work node0 %.1f%% node1 %.1f%%\n",
+                        100 * f, (unsigned long long)n, gb(bytes), total > 0 ? 100 * hot / total : 0.0,
+                        mean > 0 ? mx / mean : 0.0, total > 0 ? 100 * nd[0] / total : 0.0,
+                        total > 0 ? 100 * nd[1] / total : 0.0);
+        }
         std::printf("  initial shards per rank: A max %s, B max %s\n", gb(*std::max_element(abytes.begin(), abytes.end())),
                     gb(*std::max_element(bbytes.begin(), bbytes.end())));
 

@@ -234,7 +234,7 @@ void net_mode()
     }
 
     // MPI_Alltoall: every rank sends a block to every rank.
-    for (const u64 blk : {64 * 1024ull, MB, 8 * MB}) {
+    for (const u64 blk : {u64(64 * 1024), MB, 8 * MB}) {
         std::vector<char> sb(blk * size_, 1), rb(blk * size_, 0);
         MPI_Barrier(MPI_COMM_WORLD);
         const double t = MPI_Wtime();
