@@ -1,7 +1,7 @@
 # HW2-1 Exact Witness Experiment
 
-Experimental pruning is **off by default** in `hw2-1.cpp`. This is a measurement
-package, not a claim of a leaderboard speedup. It does not change `main.cpp`, the
+Exact pruning is **on by default**, with tau=16, in `hw2-1.cpp`.
+`PP_WITNESS=off` retains the original path. The measurement package does not change `main.cpp`, the
 generator, the Makefile, HW2-2, or the existing test runner.
 
 ## Run on SEIREN
@@ -76,7 +76,7 @@ CSR. The timing includes both generations, preparation, filtering and releases.
 
 Use normal-build medians to judge speedup. Diagnostic times explain its source,
 but must not be mixed with normal times. These 8-rank results do not establish
-24-rank judge performance. A successful experiment still needs an explicit
-decision to enable pruning by default, followed by official judge validation.
+24-rank judge performance. The default was enabled after the reported 151 checked
+cluster runs passed; a complete official judge run is still needed for the total score.
 Other proposals (tiled CSR fill, new SIMD relaxation, narrower synchronization)
 are not implemented or measured by this package.

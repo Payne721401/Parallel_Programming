@@ -43,8 +43,8 @@
 // PP_PROBE=1 times the fill's reads alone (cursors, far ends' slots) before the fill. In any
 // build, PP_BATCH=n caps the sources searched together, PP_FASTGEN=0 uses the official generator
 // and PP_RELABEL=0 keeps the original vertex numbers.
-// PP_WITNESS=prune enables an experimental exact reduction (default: off); probe measures its
-// removable edges but keeps the full graph. PP_WITNESS_TAU=1..255 selects the light-edge cutoff.
+// Exact witness reduction is enabled by default; PP_WITNESS=off disables it, while probe
+// measures removable edges but keeps the full graph. PP_WITNESS_TAU=1..255 selects the cutoff.
 // PP_WITNESS_REPORT=1 prints its counts; HW21_PHASE_ONLY omits per-arc profiling counters.
 #include <mpi.h>
 #ifdef HW21_PROF
@@ -1051,14 +1051,14 @@ private:
 };
 
 struct WitnessConfig {
-    int mode = 0;   // 0: off, 1: probe, 2: prune
+    int mode = 2;   // 0: off, 1: probe, 2: prune
     u32 tau = 16;
     bool report = false;
 };
 
 WitnessConfig witness_config(Node &node)
 {
-    int options[3] = {0, 16, Prof::on ? 1 : 0};
+    int options[3] = {2, 16, Prof::on ? 1 : 0};
     if (node.rank == 0) {
         auto fail = [&]() {
             std::fprintf(stderr, "PP_WITNESS must be off/probe/prune; PP_WITNESS_TAU must be 1..255\n");
