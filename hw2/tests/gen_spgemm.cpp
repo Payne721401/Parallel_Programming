@@ -6,6 +6,8 @@
 //                                entry stored) and the scalar products total 4.40e9 > 2^32
 //   nnza   <dir>                 M 8192, K 4194304 (the maximum), N 8192: 1024 entries in every
 //                                row of A, nnz(A) = 8388608 (the maximum); B rows hold 0-2
+//   hot    <dir>                 reused dense B rows concentrated away from rank zero, plus
+//                                scattered cold rows, empty B rows and uneven dimensions
 //   random <dir> <seed> <M> <K> <N>   small random shapes: empty rows, rows of every density,
 //                                values 1..8, columns that cluster
 //
@@ -82,7 +84,7 @@ std::vector<Entry> full(std::mt19937_64 &g, u32 cols)
 int main(int argc, char **argv)
 {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s dense|nnza <dir> | random <dir> <seed> <M> <K> <N>\n", argv[0]);
+        std::fprintf(stderr, "usage: %s dense|nnza|hot <dir> | random <dir> <seed> <M> <K> <N>\n", argv[0]);
         return 2;
     }
     const std::string kind = argv[1], dir = argv[2];
@@ -101,6 +103,21 @@ int main(int argc, char **argv)
         B.resize(K);
         for (auto &x : A) x = pick(g, K, 1024);
         for (auto &x : B) x = pick(g, N, u32(g() % 3));
+    } else if (kind == "hot") {
+        M = 257, K = 4099, N = 257;
+        A.resize(M);
+        B.resize(K);
+        for (u32 k = 0; k < K; k++)
+            if (k % 7 == 0) B[k] = pick(g, N, 3);
+        const u32 start = 3 * K / 4;
+        for (u32 k = start; k < start + 64; k++) B[k] = full(g, N);
+        for (u32 i = 0; i < M; i++) {
+            for (u32 k = start; k < start + 64; k++)
+                if (i % 5 || k % 3) A[i].push_back({k, u32(1 + g() % 8)});
+            const u32 cold = (i * 29) % K;
+            if (cold < start || cold >= start + 64) A[i].push_back({cold, u32(1 + g() % 8)});
+            std::sort(A[i].begin(), A[i].end(), [](Entry x, Entry y) { return x.col < y.col; });
+        }
     } else if (kind == "random" && argc == 7) {
         g.seed(std::strtoull(argv[3], nullptr, 10));
         M = u32(std::atoi(argv[4])), K = u32(std::atoi(argv[5])), N = u32(std::atoi(argv[6]));

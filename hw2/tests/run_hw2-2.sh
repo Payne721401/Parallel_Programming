@@ -13,6 +13,8 @@ set -euo pipefail
 #   public    every public case at the practice shape, -N2 -n8 with 4 ranks a node, checked
 #             with hw2-2-check; TIMING=1 runs the profiling build (hw2-2-prof, -DHW22_PROF) and
 #             shows its report: phases (slowest and fastest rank), products per rank, bytes sent
+#   ab        normal builds, alternating AB_REF (default 1604d20) and current code;
+#             CASES defaults to p01 p02 p03, REPEAT=3, PP_HOT=1 enables the candidate path
 #   ranks     the correctness cases at uneven rank counts, on one node (-n1, -n3, -n4) and on
 #             two (-n2, -n5, -n8), plus the custom cases once `custom` has made them
 #   custom    builds tests/gen_spgemm, writes the boundaries no public case reaches (C complete
@@ -33,13 +35,14 @@ set -euo pipefail
 #
 # Env overrides: CASES="c01 p01" (public, ranks, baseline, stats), CASES_DIR, OUT_ROOT,
 # STATS_P="8 24" (rank counts for stats), SHAPE="-N2 -n8 --ntasks-per-node=4" (public),
-# TIMING=1 (public), VERBOSE=1 (ranks and custom print a line per run, not a dot).
+# TIMING=1 (public), AB_REF and REPEAT (ab), CUSTOM_CASES="hot r1" (custom),
+# VERBOSE=1 (ranks and custom print a line per run, not a dot). PP_* variables pass through.
 
 mode="${1:-}"
 case "$mode" in
-    public|ranks|custom|sysinfo|bench-mem|bench-net|stats|baseline) ;;
+    public|ab|ranks|custom|sysinfo|bench-mem|bench-net|stats|baseline) ;;
     *)
-        echo "usage: $0 public|ranks|custom|sysinfo|bench-mem|bench-net|stats|baseline" >&2
+        echo "usage: $0 public|ab|ranks|custom|sysinfo|bench-mem|bench-net|stats|baseline" >&2
         exit 2
         ;;
 esac
@@ -92,6 +95,7 @@ failed=0
 failures=()
 quiet_now=0    # passes print a dot instead of a line
 dots_open=0    # a line of dots is waiting for its newline
+last_status= last_time=
 
 # The profiling build's report, condensed: phases, then counters.
 compact_prof() {
@@ -125,6 +129,8 @@ run_case() {
     rm -f "$out"
     t="$(sed -n 's/^Compute time: \([0-9.]*\) s$/\1/p' "$log.out")"
     rss="$(sed -n 's/^Peak RSS: \([0-9]*\) KiB$/\1/p' "$log.out")"
+    last_status="$status"
+    last_time="${t:--}"
     if [[ "$status" == PASS ]]; then
         passed=$((passed + 1))
         if ((quiet_now)) && [[ "${VERBOSE:-0}" != "1" ]]; then
@@ -179,6 +185,45 @@ run_public() {
     done
 }
 
+run_ab() {
+    check_command hw2-2-check
+    build
+    local ref="${AB_REF:-1604d20}" repeat="${REPEAT:-3}" c rep which
+    [[ "$repeat" =~ ^[1-9][0-9]*$ ]] || { echo "REPEAT must be positive" >&2; exit 2; }
+    git show "$ref:hw2/hw2-2/hw2-2.cpp" >"$bin_dir/base.cpp"
+    mpicxx "${FLAGS[@]}" -I. main.cpp "$bin_dir/base.cpp" -o "$bin_dir/base"
+    read -r -a shape <<<"${SHAPE:--N2 -n8 --ntasks-per-node=4}"
+    local tsv="$out_root/ab.tsv" dir bin
+    printf 'case\twhich\trep\tstatus\ttime\n' >"$tsv"
+    echo "== ab: baseline $ref, candidate working tree; srun ${shape[*]}, REPEAT=$repeat =="
+    for c in ${CASES:-p01 p02 p03}; do
+        dir="$(case_dir "$c")"
+        for ((rep = 1; rep <= repeat; rep++)); do
+            local order="base new"
+            ((rep % 2 == 0)) && order="new base"
+            for which in $order; do
+                bin=./hw2-2
+                [[ "$which" == base ]] && bin="$bin_dir/base"
+                run_case "ab $c $which $rep" "$dir" "$bin" "${shape[@]}"
+                printf '%s\t%s\t%s\t%s\t%s\n' "$c" "$which" "$rep" "$last_status" "$last_time" >>"$tsv"
+            done
+        done
+    done
+    local b n bb nb bm nm
+    echo "== ab summary (seconds; change = new median vs base median) =="
+    printf '%-5s %-11s %-11s %-11s %-11s %s\n' case base_best base_med new_best new_med change
+    for c in ${CASES:-p01 p02 p03}; do
+        b="$(awk -F'\t' -v c="$c" '$1==c && $2=="base" && $4=="PASS" && $5!="-" {print $5}' "$tsv" | sort -g)"
+        n="$(awk -F'\t' -v c="$c" '$1==c && $2=="new" && $4=="PASS" && $5!="-" {print $5}' "$tsv" | sort -g)"
+        bb="$(head -n1 <<<"$b")"; nb="$(head -n1 <<<"$n")"
+        bm="$(awk 'NF {a[++n]=$1} END {if(n) print (a[int((n+1)/2)]+a[int((n+2)/2)])/2; else print "-"}' <<<"$b")"
+        nm="$(awk 'NF {a[++n]=$1} END {if(n) print (a[int((n+1)/2)]+a[int((n+2)/2)])/2; else print "-"}' <<<"$n")"
+        printf '%-5s %-11s %-11s %-11s %-11s %s\n' "$c" "${bb:--}" "$bm" "${nb:--}" "$nm" \
+            "$(awk -v b="$bm" -v n="$nm" 'BEGIN {if(b+0>0 && n+0>0) printf "%+.1f%%",100*(n/b-1); else print "-"}')"
+    done
+    echo "Raw times: $tsv"
+}
+
 # The custom cases that exist so far: OUT_ROOT/custom/<name>/{A,B,C}.csr.
 custom_dirs() {
     local d
@@ -216,6 +261,7 @@ run_custom() {
     mpicxx "${FLAGS[@]}" -o "$bin_dir/gen_spgemm" "$script_dir/gen_spgemm.cpp"
     # name and generator arguments; the random shapes include M, K or N below the rank count
     local specs=(
+        "hot hot"
         "dense dense"
         "nnza nnza"
         "r1 random 1 3 5 7"
@@ -231,6 +277,7 @@ run_custom() {
     echo "== custom cases: generate and compute C with the starter at one rank (kept under $out_root/custom) =="
     for spec in "${specs[@]}"; do
         read -r name args <<<"$spec"
+        if [[ -n "${CUSTOM_CASES:-}" && " $CUSTOM_CASES " != *" $name "* ]]; then continue; fi
         d="$out_root/custom/$name"
         mkdir -p "$d"
         if [[ ! -f "$d/C.csr" || "$script_dir/gen_spgemm.cpp" -nt "$d/C.csr" ]]; then
@@ -247,6 +294,7 @@ run_custom() {
         read -r -a shape <<<"$s"
         echo "== custom cases: srun $s =="
         while read -r d; do
+            if [[ -n "${CUSTOM_CASES:-}" && " $CUSTOM_CASES " != *" $(basename "$d") "* ]]; then continue; fi
             [[ -n "$d" ]] && run_case "$(basename "$d") $s" "$d" ./hw2-2 "${shape[@]}"
         done < <(custom_dirs)
     done
@@ -302,6 +350,7 @@ run_baseline() {
 
 case "$mode" in
     public) run_public; finish ;;
+    ab) run_ab; finish ;;
     ranks) run_ranks; finish ;;
     custom) run_custom; finish ;;
     sysinfo) run_sysinfo ;;

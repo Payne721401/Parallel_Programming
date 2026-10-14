@@ -4,9 +4,11 @@
 // starts out split by k: rank r holds B's rows [K r / P, K (r + 1) / P). So B stays put and A
 // goes to it: every entry a = A[i, k] is sent to the rank holding B's row k, which adds
 // a * B[k, :] into its piece of C's row i. The pieces then go to the rank that owns row i (it
-// owns A's row i) and are summed there. Everything is private memory; across the two nodes
-// only A and the pieces travel (about 18 MB and at most 120 MB on the public performance
-// cases, measured), never B.
+// owns A's row i) and are summed there. This remains the default and the cold-row path.
+// PP_HOT=1 optionally shares selected B rows once per node and assigns each output row's
+// hot work to one worker, weighted by products and the workers' remaining cold work.
+// PP_HOT_MB bounds that cache per node (default 256, range 0..512). PP_HOT_REPORT=1 prints
+// the selected plan even in a normal build; profiling builds report it by default.
 //
 //   scatter   alltoallv of A's entries, packed (i << 32 | k << 4 | a), to B's owners
 //   group     a counting sort of what arrived, by row i
@@ -30,6 +32,9 @@
 #include <climits>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <exception>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -223,6 +228,214 @@ private:
 // What one round may put in flight on any rank, either way: 8-byte items, 128 MiB.
 constexpr u64 BUDGET = u64(16) << 20;
 
+struct HotConfig {
+    bool enabled, report;
+    u64 bytes;
+};
+
+HotConfig hot_config(MPI_Comm comm, int rank)
+{
+    int opt[3] = {0, 256, Prof::on ? 1 : 0};
+    if (rank == 0) {
+        const char *names[] = {"PP_HOT", "PP_HOT_MB", "PP_HOT_REPORT"};
+        for (int i = 0; i < 3; i++) {
+            const char *s = std::getenv(names[i]);
+            if (!s) continue;
+            char *end = nullptr;
+            const long v = std::strtol(s, &end, 10);
+            if (!*s || *end || v < 0 || v > (i == 1 ? 512 : 1))
+                throw std::runtime_error(std::string("invalid ") + names[i]);
+            opt[i] = int(v);
+        }
+    }
+    MPI_Bcast(opt, 3, MPI_INT, 0, comm);
+    return {opt[0] != 0, opt[2] != 0, u64(opt[1]) << 20};
+}
+
+struct HotPlan {
+    static constexpr u64 NONE = UINT64_MAX;
+    std::vector<u32> length;
+    std::vector<u64> offset, starts;
+    std::vector<int> worker;
+    u64 total = 0, before = 0, after = 0, rows = 0, entries = 0, hot_products = 0;
+
+    bool contains(u32 k) const { return !offset.empty() && offset[k] != NONE; }
+};
+
+HotPlan plan_hot(const Matrix &a, const Matrix &b, const HotConfig &cfg, MPI_Comm comm, int P)
+{
+    HotPlan h;
+    if (!cfg.enabled || !cfg.bytes || P == 1) return h;
+    const u32 K = a.cols, M = a.rows;
+    const u64 local_nnz[2] = {a.data.size(), b.data.size()};
+    u64 global_nnz[2];
+    MPI_Allreduce(local_nnz, global_nnz, 2, MPI_UINT64_T, MPI_SUM, comm);
+    if (!global_nnz[0] || !global_nnz[1]) return h;
+    std::vector<u32> uses(K, 0), lengths(K), local(b.local_rows());
+    for (const Entry &x : a.data) uses[x.col]++;
+    MPI_Allreduce(MPI_IN_PLACE, uses.data(), count_of(K), MPI_UINT32_T, MPI_SUM, comm);
+    std::vector<int> counts(P), displs(P);
+    for (int q = 0; q < P; q++) {
+        displs[q] = count_of(block_start(K, q, P));
+        counts[q] = count_of(block_start(K, q + 1, P) - u32(displs[q]));
+    }
+    for (u32 k = 0; k < b.local_rows(); k++) local[k] = u32(b.ptr[k + 1] - b.ptr[k]);
+    MPI_Allgatherv(local.data(), count_of(local.size()), MPI_UINT32_T, lengths.data(),
+                   counts.data(), displs.data(), MPI_UINT32_T, comm);
+    auto work = [&](u32 k) { return u64(uses[k]) * lengths[k]; };
+    std::vector<u64> cold(P, 0);
+    for (int q = 0; q < P; q++)
+        for (u32 k = block_start(K, q, P); k < block_start(K, q + 1, P); k++) cold[q] += work(k);
+    h.total = std::accumulate(cold.begin(), cold.end(), u64(0));
+    h.before = h.after = *std::max_element(cold.begin(), cold.end());
+    const u64 target = (h.total + P - 1) / P;
+    // Small or already balanced products do not justify constructing a shared cache.
+    if (h.total < (u64(1) << 20) || h.before * 4 <= target * 5) return h;
+
+    std::vector<u32> order;
+    for (int q = 0; q < P; q++) {
+        if (cold[q] <= target) continue;
+        for (u32 k = block_start(K, q, P); k < block_start(K, q + 1, P); k++)
+            if (work(k)) order.push_back(k);
+    }
+    // A heap avoids sorting every used B row when only a small hot subset is needed.
+    auto less = [&](u32 x, u32 y) { return work(x) != work(y) ? work(x) < work(y) : x > y; };
+    std::make_heap(order.begin(), order.end(), less);
+    h.offset.assign(K, HotPlan::NONE);
+    while (!order.empty() && *std::max_element(cold.begin(), cold.end()) > target) {
+        std::pop_heap(order.begin(), order.end(), less);
+        const u32 k = order.back();
+        order.pop_back();
+        const int q = row_owner(k, K, P);
+        if (cold[q] <= target || h.entries + lengths[k] > cfg.bytes / sizeof(Entry)) continue;
+        h.offset[k] = 0;
+        h.entries += lengths[k];
+        h.rows++;
+        h.hot_products += work(k);
+        cold[q] -= work(k);
+    }
+    if (!h.rows) {
+        std::vector<u64>().swap(h.offset);
+        return h;
+    }
+
+    std::vector<u64> row_work(M, 0);
+    for (u32 il = 0; il < a.local_rows(); il++)
+        for (u64 t = a.ptr[il]; t < a.ptr[il + 1]; t++)
+            if (h.contains(a.data[t].col)) row_work[a.first + il] += lengths[a.data[t].col];
+    MPI_Allreduce(MPI_IN_PLACE, row_work.data(), count_of(M), MPI_UINT64_T, MPI_SUM, comm);
+    order.resize(M);
+    std::iota(order.begin(), order.end(), u32(0));
+    std::sort(order.begin(), order.end(), [&](u32 x, u32 y) {
+        return row_work[x] != row_work[y] ? row_work[x] > row_work[y] : x < y;
+    });
+    h.worker.resize(M);
+    for (u32 i : order) {
+        int q = row_owner(i, M, P);
+        for (int j = 0; j < P; j++) if (cold[j] < cold[q]) q = j;
+        h.worker[i] = q;
+        cold[q] += row_work[i];
+    }
+    h.after = *std::max_element(cold.begin(), cold.end());
+    if (h.after * 10 >= h.before * 9) {
+        // A coarse output row or too little cache can make this plan unprofitable.
+        h.rows = h.entries = h.hot_products = 0;
+        h.after = h.before;
+        std::vector<u64>().swap(h.offset);
+        std::vector<int>().swap(h.worker);
+        return h;
+    }
+    h.starts.resize(P + 1);
+    u64 pos = 0;
+    for (int q = 0; q < P; q++) {
+        h.starts[q] = pos;
+        for (u32 k = block_start(K, q, P); k < block_start(K, q + 1, P); k++)
+            if (h.contains(k)) {
+                h.offset[k] = pos;
+                pos += lengths[k];
+            }
+    }
+    h.starts[P] = pos;
+    h.length = std::move(lengths);
+    return h;
+}
+
+class HotCache {
+public:
+    Entry *data = nullptr;
+    int nodes = 0;
+
+    void fill(const HotPlan &h, const Matrix &b, MPI_Comm comm, int rank, int P)
+    {
+        if (!h.entries) return;
+        MPI_Comm_split_type(comm, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &node);
+        MPI_Comm_rank(node, &local_rank);
+        int lead = rank;
+        MPI_Bcast(&lead, 1, MPI_INT, 0, node);
+        std::vector<int> all_leads(P), unique;
+        MPI_Allgather(&lead, 1, MPI_INT, all_leads.data(), 1, MPI_INT, comm);
+        for (int q = 0; q < P; q++) if (all_leads[q] == q) unique.push_back(q);
+        nodes = int(unique.size());
+        root.resize(P);
+        for (int q = 0; q < P; q++)
+            root[q] = int(std::lower_bound(unique.begin(), unique.end(), all_leads[q]) - unique.begin());
+        MPI_Comm_split(comm, local_rank == 0 ? 0 : MPI_UNDEFINED, rank, &leaders);
+        void *base = nullptr;
+        MPI_Win_allocate_shared(local_rank == 0 ? MPI_Aint(h.entries * sizeof(Entry)) : 0,
+                                sizeof(Entry), MPI_INFO_NULL, node, &base, &win);
+        MPI_Aint size;
+        int disp;
+        MPI_Win_shared_query(win, 0, &size, &disp, &base);
+        data = static_cast<Entry *>(base);
+        MPI_Win_lock_all(0, win);
+        for (u32 kl = 0; kl < b.local_rows(); kl++) {
+            const u32 k = b.first + kl;
+            if (h.contains(k))
+                std::copy_n(b.data.data() + b.ptr[kl], h.length[k], data + h.offset[k]);
+        }
+        sync();
+    }
+
+    void share(const HotPlan &h)
+    {
+        if (!h.entries) return;
+        // Packed ranges follow global B ownership, not node placement. Only leaders receive
+        // network copies; other local ranks read the same shared cache after publication.
+        if (local_rank == 0)
+            for (size_t q = 0; q + 1 < h.starts.size(); q++) {
+                const u64 n = h.starts[q + 1] - h.starts[q];
+                if (n) MPI_Bcast(data + h.starts[q], count_of(n), MPI_UINT64_T, root[q], leaders);
+            }
+        sync();
+    }
+
+    void release()
+    {
+        if (win == MPI_WIN_NULL) return;
+        MPI_Barrier(node);
+        MPI_Win_unlock_all(win);
+        MPI_Win_free(&win);
+        if (leaders != MPI_COMM_NULL) MPI_Comm_free(&leaders);
+        MPI_Comm_free(&node);
+        data = nullptr;
+    }
+
+    ~HotCache() { if (!std::uncaught_exceptions()) release(); }
+
+private:
+    MPI_Comm node = MPI_COMM_NULL, leaders = MPI_COMM_NULL;
+    MPI_Win win = MPI_WIN_NULL;
+    int local_rank = 0;
+    std::vector<int> root;
+
+    void sync()
+    {
+        MPI_Win_sync(win);
+        MPI_Barrier(node);
+        MPI_Win_sync(win);
+    }
+};
+
 }  // namespace
 
 void multiply(const Matrix &a, const Matrix &b, Matrix &c)
@@ -233,10 +446,32 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
     MPI_Comm_rank(comm, &r);
     Prof prof(comm);
     const u32 M = a.rows, K = a.cols, N = b.cols;
+    const HotConfig cfg = hot_config(comm, r);
+    const HotPlan hot = plan_hot(a, b, cfg, comm, P);
+    prof.mark("hot-plan");
+    HotCache cache;
+    cache.fill(hot, b, comm, r, P);
+    prof.mark("hot-local");
+    cache.share(hot);
+    prof.mark("hot-share");
+    if (cfg.report && r == 0)
+        std::fprintf(stderr, "[hw2-2-hot] enabled=%d selected_rows=%llu cache_bytes_per_node=%llu nodes=%d "
+                             "total_products=%llu hot_products=%llu before_max=%llu planned_max=%llu\n",
+                     cfg.enabled ? 1 : 0, (unsigned long long)hot.rows,
+                     (unsigned long long)(hot.entries * sizeof(Entry)), cache.nodes,
+                     (unsigned long long)hot.total, (unsigned long long)hot.hot_products,
+                     (unsigned long long)hot.before, (unsigned long long)hot.after);
+    auto destination = [&](u32 i, u32 k) { return hot.contains(k) ? hot.worker[i] : row_owner(k, K, P); };
+    auto row_length = [&](u32 k) -> u64 {
+        if (hot.contains(k)) return hot.length[k];
+        const u32 kl = k - b.first;
+        return b.ptr[kl + 1] - b.ptr[kl];
+    };
 
-    // A's entries to the owners of their B rows.
+    // Cold entries stay with B's owners; all hot entries of one output row share a worker.
     std::vector<u64> to(P, 0), from;
-    for (const Entry &x : a.data) to[row_owner(x.col, K, P)]++;
+    for (u32 il = 0; il < a.local_rows(); il++)
+        for (u64 e = a.ptr[il]; e < a.ptr[il + 1]; e++) to[destination(a.first + il, a.data[e].col)]++;
     std::vector<u64> at(P, 0);
     for (int q = 1; q < P; q++) at[q] = at[q - 1] + to[q - 1];
     std::vector<u64> send(a.data.size());
@@ -244,7 +479,7 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
         const u64 i = a.first + il;
         for (u64 e = a.ptr[il]; e < a.ptr[il + 1]; e++) {
             const Entry x = a.data[e];
-            send[at[row_owner(x.col, K, P)]++] = i << 32 | u64(x.col) << 4 | x.val;
+            send[at[destination(u32(i), x.col)]++] = i << 32 | u64(x.col) << 4 | x.val;
         }
     }
     prof.traffic("a", to, 8);
@@ -269,10 +504,7 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
     u64 products = 0;
     for (u32 i = 0; i < M; i++) {
         u64 f = 0;
-        for (u64 t = first[i]; t < first[i + 1]; t++) {
-            const u32 kl = (item[t] >> 4) - b.first;
-            f += b.ptr[kl + 1] - b.ptr[kl];
-        }
+        for (u64 t = first[i]; t < first[i + 1]; t++) f += row_length(item[t] >> 4);
         products += f;
         mine[i] = f ? std::min<u64>(N, f) + 1 : 0;
     }
@@ -306,8 +538,10 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
         for (u32 i = lo; i < hi; i++) {
             if (first[i] == first[i + 1]) continue;
             for (u64 t = first[i]; t < first[i + 1]; t++) {
-                const u32 kl = (item[t] >> 4) - b.first;
-                acc.add(item[t] & 15, b.data.data() + b.ptr[kl], b.ptr[kl + 1] - b.ptr[kl]);
+                const u32 k = item[t] >> 4;
+                const u64 len = row_length(k);
+                if (len) acc.add(item[t] & 15, hot.contains(k) ? cache.data + hot.offset[k]
+                                                             : b.data.data() + b.ptr[k - b.first], len);
             }
             const u64 head = out.size();
             out.push_back({i, 0});
@@ -359,5 +593,7 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
         lo = hi;
     }
     prof.count("rounds", r == 0 ? rounds : 0);
+    cache.release();
+    prof.mark("hot-release");
     prof.report();
 }
