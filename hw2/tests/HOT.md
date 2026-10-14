@@ -1,5 +1,7 @@
 # HW2-2 Hot-Row Experiment
 
+For the subsequent bitmap/scan accumulator A/B, see [ACCUM.md](ACCUM.md).
+
 Only `hw2-2.cpp` changes the submitted program. A and B remain immutable CSR;
 C retains A's original row ownership and canonical CSR ordering.
 

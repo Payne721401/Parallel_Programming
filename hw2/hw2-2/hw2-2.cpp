@@ -9,6 +9,7 @@
 // hot work to one worker, weighted by products and the workers' remaining cold work.
 // PP_HOT_MB bounds that cache per node (default 256, range 0..512). PP_HOT_REPORT=1 prints
 // the selected plan even in a normal build; profiling builds report it by default.
+// PP_ACCUM=bitmap (default), scan, or auto changes only partial-row accumulation.
 //
 //   scatter   alltoallv of A's entries, packed (i << 32 | k << 4 | a), to B's owners
 //   group     a counting sort of what arrived, by row i
@@ -38,6 +39,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -259,6 +261,16 @@ std::vector<T> alltoallv(const std::vector<T> &send, const std::vector<u64> &to,
     return recv;
 }
 
+enum class AccumulatorMode { Bitmap, Scan, Auto };
+constexpr u64 SCAN_WORK_PER_COLUMN = 8;
+
+bool scan_for_row(AccumulatorMode mode, u64 products, u32 columns)
+{
+    // This is an initial cost heuristic, not an assertion that the output is dense.
+    return mode == AccumulatorMode::Scan ||
+           (mode == AccumulatorMode::Auto && products >= SCAN_WORK_PER_COLUMN * columns);
+}
+
 // One row of C being summed: a dense total per column (they fit 32 bits: C[i, j] is at most
 // 64 nnz(A[i, :]) <= 2^23), a bitmap of the columns hit, and the span they lie in, so that
 // reading the row back in column order costs the span's words rather than N.
@@ -269,9 +281,14 @@ public:
     // Adds scale times a row whose columns ascend. The bits reach the bitmap a word at a time:
     // a run of columns shares a word, and or-ing each one into memory would chain every store
     // to the next load (measured 3.6 times slower on a dense row).
+    template <bool Scan = false>
     void add(u32 scale, const Entry *e, u64 len)
     {
         if (!len) return;
+        if constexpr (Scan) {
+            for (u64 t = 0; t < len; t++) sum[e[t].col] += scale * e[t].val;
+            return;
+        }
         lo = std::min(lo, e[0].col);
         hi = std::max(hi, e[len - 1].col);
         u32 w = e[0].col / 64;
@@ -291,8 +308,17 @@ public:
 
     // Appends the row to out in column order, and clears it. Every product is positive, so
     // every column hit has a nonzero total.
+    template <bool Scan = false>
     void take(std::vector<Entry> &out)
     {
+        if constexpr (Scan) {
+            for (u32 j = 0; j < sum.size(); j++) {
+                const u32 value = sum[j];
+                if (value) out.push_back({j, value});
+                sum[j] = 0;
+            }
+            return;
+        }
         if (lo > hi) return;
         for (u32 w = lo / 64; w <= hi / 64; w++) {
             u64 x = hit[w];
@@ -320,11 +346,12 @@ constexpr u64 BUDGET = u64(16) << 20;
 struct HotConfig {
     bool enabled, report;
     u64 bytes;
+    AccumulatorMode accum;
 };
 
 HotConfig hot_config(MPI_Comm comm, int rank)
 {
-    int opt[3] = {0, 256, Prof::on ? 1 : 0};
+    int opt[4] = {0, 256, Prof::on ? 1 : 0, int(AccumulatorMode::Bitmap)};
     if (rank == 0) {
         const char *names[] = {"PP_HOT", "PP_HOT_MB", "PP_HOT_REPORT"};
         for (int i = 0; i < 3; i++) {
@@ -336,9 +363,16 @@ HotConfig hot_config(MPI_Comm comm, int rank)
                 throw std::runtime_error(std::string("invalid ") + names[i]);
             opt[i] = int(v);
         }
+        if (const char *s = std::getenv("PP_ACCUM")) {
+            const std::string value(s);
+            if (value == "bitmap") opt[3] = int(AccumulatorMode::Bitmap);
+            else if (value == "scan") opt[3] = int(AccumulatorMode::Scan);
+            else if (value == "auto") opt[3] = int(AccumulatorMode::Auto);
+            else throw std::runtime_error("invalid PP_ACCUM: expected bitmap, scan, or auto");
+        }
     }
-    MPI_Bcast(opt, 3, MPI_INT, 0, comm);
-    return {opt[0] != 0, opt[2] != 0, u64(opt[1]) << 20};
+    MPI_Bcast(opt, 4, MPI_INT, 0, comm);
+    return {opt[0] != 0, opt[2] != 0, u64(opt[1]) << 20, AccumulatorMode(opt[3])};
 }
 
 struct HotPlan {
@@ -550,6 +584,11 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
                      (unsigned long long)(hot.entries * sizeof(Entry)), cache.nodes,
                      (unsigned long long)hot.total, (unsigned long long)hot.hot_products,
                      (unsigned long long)hot.before, (unsigned long long)hot.after);
+    if (cfg.report && r == 0) {
+        const char *names[] = {"bitmap", "scan", "auto"};
+        std::fprintf(stderr, "[hw2-2-accum] mode=%s scope=partial-rows auto_min_products=%llu merge=bitmap\n",
+                     names[int(cfg.accum)], (unsigned long long)(SCAN_WORK_PER_COLUMN * N));
+    }
     auto destination = [&](u32 i, u32 k) { return hot.contains(k) ? hot.worker[i] : row_owner(k, K, P); };
     auto row_length = [&](u32 k) -> u64 {
         if (hot.contains(k)) return hot.length[k];
@@ -590,16 +629,23 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
 
     // Row i's piece from this rank, and over all ranks (a header each included).
     std::vector<u64> mine(M, 0), bound(M, 0);
+    std::vector<unsigned char> scan_row(M, 0);
     u64 products = 0;
 #ifdef HW22_PROF
     std::vector<u64> row_products(M, 0), row_hot(M, 0);
+    u64 scan_rows = 0, bitmap_rows = 0, scan_products = 0;
 #endif
     for (u32 i = 0; i < M; i++) {
         u64 f = 0;
         for (u64 t = first[i]; t < first[i + 1]; t++) f += row_length(item[t] >> 4);
         products += f;
         mine[i] = f ? std::min<u64>(N, f) + 1 : 0;
+        scan_row[i] = scan_for_row(cfg.accum, f, N);
 #ifdef HW22_PROF
+        if (f) {
+            if (scan_row[i]) { scan_rows++; scan_products += f; }
+            else bitmap_rows++;
+        }
         row_products[i] = f;
         for (u64 t = first[i]; t < first[i + 1]; t++)
             if (hot.contains(item[t] >> 4)) row_hot[i] += row_length(item[t] >> 4);
@@ -607,6 +653,11 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
     }
     MPI_Allreduce(mine.data(), bound.data(), count_of(M), MPI_UINT64_T, MPI_SUM, comm);
     prof.count("products", products);
+#ifdef HW22_PROF
+    prof.count("acc-scan-rows", scan_rows);
+    prof.count("acc-bitmap-rows", bitmap_rows);
+    prof.count("acc-scan-products", scan_products);
+#endif
     prof.mark("bound");
 
     c.rows = M;
@@ -647,19 +698,25 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
 #ifdef HW22_PROF
             const double row_begin = MPI_Wtime();
 #endif
-            for (u64 t = first[i]; t < first[i + 1]; t++) {
-                const u32 k = item[t] >> 4;
-                const u64 len = row_length(k);
-                if (len) acc.add(item[t] & 15, hot.contains(k) ? cache.data + hot.offset[k]
-                                                             : b.data.data() + b.ptr[k - b.first], len);
-            }
+            // Dispatch once per output row, not once per scalar product.
+            auto add_row = [&](auto scan) {
+                for (u64 t = first[i]; t < first[i + 1]; t++) {
+                    const u32 k = item[t] >> 4;
+                    const u64 len = row_length(k);
+                    if (len) acc.add<decltype(scan)::value>(item[t] & 15,
+                        hot.contains(k) ? cache.data + hot.offset[k] : b.data.data() + b.ptr[k - b.first], len);
+                }
+            };
+            if (scan_row[i]) add_row(std::true_type{});
+            else add_row(std::false_type{});
 #ifdef HW22_PROF
             const double emit_begin = MPI_Wtime();
             diag.accumulate += emit_begin - row_begin;
 #endif
             const u64 head = out.size();
             out.push_back({i, 0});
-            acc.take(out);
+            if (scan_row[i]) acc.take<true>(out);
+            else acc.take(out);
 #ifdef HW22_PROF
             diag.emit += MPI_Wtime() - emit_begin;
 #endif
