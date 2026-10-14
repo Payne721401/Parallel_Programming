@@ -102,7 +102,8 @@ compact_prof() {
     awk '
         /^\[hw2-2\] [a-z-]+ +max/ { ph = ph sprintf("  %s %s", $2, $4) }
         /^\[hw2-2\] [a-z-]+ +sum/ { cnt = cnt sprintf("  %s %s (max/mean %s)", $2, $4, $NF) }
-        END { print "phases (s):" ph; print "counts:" cnt }' "$1"
+        /^\[hw2-2-round-summary\]/ { rnd = rnd $0 "\n" }
+        END { print "phases (s):" ph; print "counts:" cnt; printf "%s", rnd }' "$1"
 }
 
 # run_case <label> <case dir> <binary> <srun args...>: runs the binary on the case's A and B,

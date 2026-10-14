@@ -110,3 +110,81 @@ Next changes depend on these results: reduce planning/copy cost if preparation
 dominates, refine assignment if work remains skewed, investigate partial-result
 traffic if exchange grows, and tune the accumulator only after compute is both
 dominant and reasonably balanced. Do not change several of these at once.
+
+## Per-Round Diagnostics
+
+`TIMING=1` also records every rank of every round. No new barrier or collective
+is inserted into the round loop; records are gathered at the end and only rank
+zero prints them. The normal build contains none of this instrumentation.
+
+- `[hw2-2-round-summary]`: round number, global row interval `[lo, hi)`, total
+  products, maximum/mean products and its rank, minimum/maximum compute time
+  and the slowest compute rank. The work-heavy and slowest ranks may differ.
+- `[hw2-2-round]`: one record per rank per round. `node` identifies the lowest
+  world rank on that node. All `_s` fields are local elapsed seconds, never
+  cross-rank timestamp differences. All `send_*` and `recv_*` fields are bytes.
+- `a_entries`, `hot_products`, `cold_products`: assigned A entries (including
+  those referencing empty B rows) and exact scalar-product counts. These are
+  recorded from row bounds, not counted inside the scalar multiplication loop.
+- `partial_rows`, `partial_nnz`: nonempty partial rows and their stored entries,
+  before the final merge. Sent bytes equal `8 * (partial_rows + partial_nnz)`;
+  each partial row has an additional 8-byte header.
+- `compute_s` includes the round's bound scan, output preparation, accumulation
+  and partial-row emission. `prepare_s` covers output clear/reserve and send-count
+  reset; `accumulate_s` covers each row's A traversal, B lookup and accumulator
+  updates; `emit_s` covers its header insertion and sorted extraction/reset.
+  These subfields are nested within compute, not extra elapsed time. Loop and
+  timer overhead are not fully attributed to the subfields.
+- `counts_s`: receive-count initialization and MPI_Alltoall of counts;
+  `layout_s`: allocation and construction of MPI counts/displacements;
+  `alloc_s`: allocation/zero-initialization of the receive buffer;
+  `data_s`: MPI_Alltoallv of partial C; `merge_s`: merging into final C.
+- Traffic is split into `self`, `local` (other ranks on the same node), and
+  `xnode` (another node), for both sending and receiving. Their sums match the
+  older C traffic counters. Rank totals reveal concentrated receivers too.
+
+MPI call durations can include waiting; `data_s` is NOT pure network time.
+Whole-run phase maxima and per-round compute scopes differ (setup/cleanup may
+fall outside a round). Do not add phase maxima or nested subfields together.
+Profiling totals include row timers, extra bound accounting and final reporting;
+only normal builds and judge establish performance. No additional speedup is
+expected from this diagnostics-only change. `PP_HOT` still defaults to zero.
+
+After committing and pushing, run just p01-p03 twice at the practice shape:
+
+```bash
+cd ~/pp_course
+git pull --ff-only
+cd hw2/hw2-2
+jid=$(sbatch --parsable -o hw2-2-round-%j.log ../tests/batch_hw2-2.sh \
+  'export PP_HOT=1 PP_HOT_MB=256 PP_HOT_REPORT=1 TIMING=1
+   export CASES="p01 p02 p03"
+   for rep in 1 2; do
+     echo "== round diagnostics repetition $rep =="
+     OUT_ROOT=tmp/hw2-2-round-$SLURM_JOB_ID/r$rep \
+       bash ../tests/run_hw2-2.sh public || exit 1
+   done')
+echo "Job: $jid; log: hw2-2-round-$jid.log"
+tail -F "hw2-2-round-$jid.log"
+```
+
+After `== done`, expect two `3 passed, 0 failed` summaries and final status `ok`.
+Ctrl+C stops viewing, not the job. View and share all results:
+
+```bash
+cat "hw2-2-round-$jid.log"
+d="tmp/hw2-2-round-$jid"
+for f in "$d"/r*/logs/public_p0*.err; do
+  echo "== $f =="
+  cat "$f"
+done
+```
+
+If `$jid` was lost, recover it before those commands:
+
+```bash
+log=$(ls -t hw2-2-round-*.log | head -n 1)
+jid=${log#hw2-2-round-}
+jid=${jid%.log}
+cat "$log"
+```

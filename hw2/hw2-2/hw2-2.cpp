@@ -25,7 +25,8 @@
 //
 // Measurement exists only with -DHW22_PROF (tests/run_hw2-2.sh builds it as hw2-2-prof): per
 // phase the slowest and fastest rank, the products per rank, and the bytes each exchange sends,
-// in all and across nodes.
+// in all and across nodes. Round diagnostics are gathered only after computation;
+// row timers do not instrument individual scalar products or add round barriers.
 #include "spgemm.hpp"
 
 #include <algorithm>
@@ -46,6 +47,18 @@ using u32 = uint32_t;
 using u64 = uint64_t;
 
 #ifdef HW22_PROF
+struct ExchangeProfile {
+    double counts = 0, layout = 0, alloc = 0, data = 0;
+};
+
+struct RoundProfile {
+    u64 lo = 0, hi = 0, a_entries = 0, hot = 0, cold = 0;
+    u64 partial_rows = 0, partial_nnz = 0;
+    u64 send[3]{}, recv[3]{};  // self, same-node peer, other node
+    double compute = 0, prepare = 0, accumulate = 0, emit = 0, merge = 0;
+    ExchangeProfile exchange;
+};
+
 class Prof {
 public:
     static constexpr bool on = true;
@@ -87,6 +100,16 @@ public:
         count((std::string(name) + "-xnode").c_str(), away);
     }
 
+    void round(RoundProfile row, const std::vector<u64> &to, const std::vector<u64> &from)
+    {
+        for (int q = 0; q < size; q++) {
+            const int kind = q == rank ? 0 : (node_of[q] == node_of[rank] ? 1 : 2);
+            row.send[kind] += to[q] * sizeof(Entry);
+            row.recv[kind] += from[q] * sizeof(Entry);
+        }
+        rounds.push_back(row);
+    }
+
     void report()
     {
         for (auto &p : phases) {
@@ -104,6 +127,7 @@ public:
                              (unsigned long long)sum, (unsigned long long)mx,
                              sum ? double(mx) * size / double(sum) : 0.0);
         }
+        report_rounds();
     }
 
 private:
@@ -112,7 +136,53 @@ private:
     std::vector<int> node_of;
     std::vector<std::pair<std::string, double>> phases;
     std::vector<std::pair<std::string, u64>> counts;
+    std::vector<RoundProfile> rounds;
     double last = 0;
+
+    void report_rounds()
+    {
+        // Every rank uses the same global row bounds, hence the same round count.
+        // Fixed-size records travel as bytes between ranks of this same executable.
+        if (rounds.size() > size_t(INT_MAX) / sizeof(RoundProfile))
+            throw std::runtime_error("round diagnostics exceed MPI count");
+        const int bytes = int(rounds.size() * sizeof(RoundProfile));
+        std::vector<RoundProfile> all(rank == 0 ? rounds.size() * size : 0);
+        MPI_Gather(rounds.data(), bytes, MPI_BYTE, all.data(), bytes, MPI_BYTE, 0, comm);
+        if (rank != 0) return;
+        const auto u = [](u64 x) { return static_cast<unsigned long long>(x); };
+        for (size_t j = 0; j < rounds.size(); j++) {
+            auto at = [&](int q) -> const RoundProfile & { return all[size_t(q) * rounds.size() + j]; };
+            u64 total = 0;
+            int work_rank = 0, compute_rank = 0;
+            double compute_min = at(0).compute;
+            for (int q = 0; q < size; q++) {
+                const auto &v = at(q);
+                total += v.hot + v.cold;
+                if (v.hot + v.cold > at(work_rank).hot + at(work_rank).cold) work_rank = q;
+                if (v.compute > at(compute_rank).compute) compute_rank = q;
+                compute_min = std::min(compute_min, v.compute);
+            }
+            const auto &w = at(work_rank);
+            std::fprintf(stderr, "[hw2-2-round-summary] round=%zu lo=%llu hi=%llu products=%llu "
+                         "products_max_mean=%.3f work_rank=%d compute_min_s=%.6f compute_max_s=%.6f compute_rank=%d\n",
+                         j + 1, u(w.lo), u(w.hi), u(total),
+                         total ? double(w.hot + w.cold) * size / double(total) : 0.0,
+                         work_rank, compute_min, at(compute_rank).compute, compute_rank);
+            for (int q = 0; q < size; q++) {
+                const auto &v = at(q);
+                std::fprintf(stderr, "[hw2-2-round] round=%zu rank=%d node=%d lo=%llu hi=%llu "
+                             "a_entries=%llu hot_products=%llu cold_products=%llu partial_rows=%llu partial_nnz=%llu "
+                             "compute_s=%.6f prepare_s=%.6f accumulate_s=%.6f emit_s=%.6f "
+                             "counts_s=%.6f layout_s=%.6f alloc_s=%.6f data_s=%.6f merge_s=%.6f "
+                             "send_self=%llu send_local=%llu send_xnode=%llu "
+                             "recv_self=%llu recv_local=%llu recv_xnode=%llu\n",
+                             j + 1, q, node_of[q], u(v.lo), u(v.hi), u(v.a_entries), u(v.hot), u(v.cold),
+                             u(v.partial_rows), u(v.partial_nnz), v.compute, v.prepare, v.accumulate, v.emit,
+                             v.exchange.counts, v.exchange.layout, v.exchange.alloc, v.exchange.data, v.merge,
+                             u(v.send[0]), u(v.send[1]), u(v.send[2]), u(v.recv[0]), u(v.recv[1]), u(v.recv[2]));
+            }
+        }
+    }
 
     template <class T>
     static T &find(std::vector<std::pair<std::string, T>> &v, const std::string &name)
@@ -146,12 +216,22 @@ int count_of(u64 n)
 // what arrived, in source order; from[q] is how many came from q.
 template <class T>
 std::vector<T> alltoallv(const std::vector<T> &send, const std::vector<u64> &to, std::vector<u64> &from,
-                         MPI_Comm comm)
+                         MPI_Comm comm
+#ifdef HW22_PROF
+                         , ExchangeProfile *diag = nullptr
+#endif
+                         )
 {
     static_assert(sizeof(T) == 8, "items travel as MPI_UINT64_T");
     const int P = int(to.size());
+#ifdef HW22_PROF
+    double tick = diag ? MPI_Wtime() : 0;
+#endif
     from.assign(P, 0);
     MPI_Alltoall(to.data(), 1, MPI_UINT64_T, from.data(), 1, MPI_UINT64_T, comm);
+#ifdef HW22_PROF
+    if (diag) { const double now = MPI_Wtime(); diag->counts = now - tick; tick = now; }
+#endif
     std::vector<int> sc(P), sd(P), rc(P), rd(P);
     u64 so = 0, ro = 0;
     for (int q = 0; q < P; q++) {
@@ -164,9 +244,18 @@ std::vector<T> alltoallv(const std::vector<T> &send, const std::vector<u64> &to,
     }
     count_of(so);
     count_of(ro);
+#ifdef HW22_PROF
+    if (diag) { const double now = MPI_Wtime(); diag->layout = now - tick; tick = now; }
+#endif
     std::vector<T> recv(ro);
+#ifdef HW22_PROF
+    if (diag) { const double now = MPI_Wtime(); diag->alloc = now - tick; tick = now; }
+#endif
     MPI_Alltoallv(send.data(), sc.data(), sd.data(), MPI_UINT64_T, recv.data(), rc.data(), rd.data(),
                   MPI_UINT64_T, comm);
+#ifdef HW22_PROF
+    if (diag) diag->data = MPI_Wtime() - tick;
+#endif
     return recv;
 }
 
@@ -502,11 +591,19 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
     // Row i's piece from this rank, and over all ranks (a header each included).
     std::vector<u64> mine(M, 0), bound(M, 0);
     u64 products = 0;
+#ifdef HW22_PROF
+    std::vector<u64> row_products(M, 0), row_hot(M, 0);
+#endif
     for (u32 i = 0; i < M; i++) {
         u64 f = 0;
         for (u64 t = first[i]; t < first[i + 1]; t++) f += row_length(item[t] >> 4);
         products += f;
         mine[i] = f ? std::min<u64>(N, f) + 1 : 0;
+#ifdef HW22_PROF
+        row_products[i] = f;
+        for (u64 t = first[i]; t < first[i + 1]; t++)
+            if (hot.contains(item[t] >> 4)) row_hot[i] += row_length(item[t] >> 4);
+#endif
     }
     MPI_Allreduce(mine.data(), bound.data(), count_of(M), MPI_UINT64_T, MPI_SUM, comm);
     prof.count("products", products);
@@ -523,6 +620,10 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
     std::vector<u64> to_c(P), from_c, at_c(P), end_c(P);
     u64 rounds = 0;
     for (u32 lo = 0; lo < M;) {
+#ifdef HW22_PROF
+        RoundProfile diag;
+        const double compute_begin = MPI_Wtime();
+#endif
         // This round's rows: as many as fit the budget, and at least one.
         u32 hi = lo;
         u64 load = 0, mine_load = 0;
@@ -532,32 +633,62 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
             hi++;
         }
 
+#ifdef HW22_PROF
+        const double prepare_begin = MPI_Wtime();
+#endif
         out.clear();
         out.reserve(mine_load);
         std::fill(to_c.begin(), to_c.end(), 0);
+#ifdef HW22_PROF
+        diag.prepare = MPI_Wtime() - prepare_begin;
+#endif
         for (u32 i = lo; i < hi; i++) {
             if (first[i] == first[i + 1]) continue;
+#ifdef HW22_PROF
+            const double row_begin = MPI_Wtime();
+#endif
             for (u64 t = first[i]; t < first[i + 1]; t++) {
                 const u32 k = item[t] >> 4;
                 const u64 len = row_length(k);
                 if (len) acc.add(item[t] & 15, hot.contains(k) ? cache.data + hot.offset[k]
                                                              : b.data.data() + b.ptr[k - b.first], len);
             }
+#ifdef HW22_PROF
+            const double emit_begin = MPI_Wtime();
+            diag.accumulate += emit_begin - row_begin;
+#endif
             const u64 head = out.size();
             out.push_back({i, 0});
             acc.take(out);
+#ifdef HW22_PROF
+            diag.emit += MPI_Wtime() - emit_begin;
+#endif
             if (out.size() == head + 1) {   // nothing: the B rows it met were empty
                 out.pop_back();
                 continue;
             }
             out[head].val = u32(out.size() - head - 1);
             to_c[row_owner(i, M, P)] += out.size() - head;
+#ifdef HW22_PROF
+            diag.partial_rows++;
+#endif
         }
+#ifdef HW22_PROF
+        diag.compute = MPI_Wtime() - compute_begin;
+        diag.partial_nnz = out.size() - diag.partial_rows;
+#endif
         prof.mark("compute");
         prof.traffic("c", to_c, 8);
-        const std::vector<Entry> in = alltoallv(out, to_c, from_c, comm);
+        const std::vector<Entry> in = alltoallv(out, to_c, from_c, comm
+#ifdef HW22_PROF
+                                              , &diag.exchange
+#endif
+                                              );
         prof.mark("exchange");
 
+#ifdef HW22_PROF
+        const double merge_begin = MPI_Wtime();
+#endif
         // My rows of the round, in order; each source's pieces come in row order.
         u64 o = 0;
         for (int q = 0; q < P; q++) {
@@ -588,7 +719,20 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
                 acc.take(c.data);
             c.ptr[i - my0 + 1] = c.data.size();
         }
+#ifdef HW22_PROF
+        diag.merge = MPI_Wtime() - merge_begin;
+#endif
         prof.mark("merge");
+#ifdef HW22_PROF
+        diag.lo = lo;
+        diag.hi = hi;
+        diag.a_entries = first[hi] - first[lo];
+        for (u32 i = lo; i < hi; i++) {
+            diag.hot += row_hot[i];
+            diag.cold += row_products[i] - row_hot[i];
+        }
+        prof.round(diag, to_c, from_c);
+#endif
         rounds++;
         lo = hi;
     }
