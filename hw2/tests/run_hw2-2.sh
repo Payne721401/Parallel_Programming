@@ -110,14 +110,18 @@ compact_prof() {
 run_case() {
     local label="$1" dir="$2" bin="$3"
     shift 3
-    local log="$out_root/logs/${label// /_}" out="$out_root/out.csr" status t rss
+    local log="$out_root/logs/${label// /_}" run_dir out status t rss
     mkdir -p "$out_root/logs"
-    rm -f "$out"
+    # Never reuse a deleted output name across steps on different filesystem clients.
+    run_dir="$(mktemp -d "$out_root/output.XXXXXX")"
+    out="$run_dir/C.csr"
+    rm -f "$log.check"
     # </dev/null: srun forwards stdin to task 0, which would swallow a loop's input.
     if (ulimit -d 1228800; srun "$@" -c1 --hint=nomultithread "$bin" "$dir/A.csr" "$dir/B.csr" "$out" \
             </dev/null >"$log.out" 2>"$log.err"); then
         if [[ ! -f "$out" ]]; then
             status=NO
+            printf 'srun succeeded, but output is not visible on %s: %s\n' "$(hostname)" "$out" >>"$log.err"
         elif hw2-2-check "$dir/C.csr" "$out" >"$log.check" 2>&1; then
             status=PASS
         else
@@ -126,7 +130,12 @@ run_case() {
     else
         status=RE
     fi
-    rm -f "$out"
+    if [[ "$status" == PASS ]]; then
+        rm -f "$out"
+        rmdir "$run_dir"
+    else
+        printf 'Output path retained for diagnosis: %s\n' "$out" >>"$log.err"
+    fi
     t="$(sed -n 's/^Compute time: \([0-9.]*\) s$/\1/p' "$log.out")"
     rss="$(sed -n 's/^Peak RSS: \([0-9]*\) KiB$/\1/p' "$log.out")"
     last_status="$status"

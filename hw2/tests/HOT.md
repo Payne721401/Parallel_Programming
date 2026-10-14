@@ -32,7 +32,9 @@ Commit and push the changes first. On SEIREN:
 
 ```bash
 cd ~/pp_course
-git pull
+git pull --ff-only && git merge-base --is-ancestor 3ed8a35 HEAD || exit 1
+git log -1 --oneline
+git status --short
 cd hw2/hw2-2
 jid=$(sbatch --parsable -o hw2-2-hot-%j.log ../tests/batch_hw2-2.sh \
   'export PP_HOT=1 PP_HOT_MB=256 PP_HOT_REPORT=1
@@ -53,6 +55,13 @@ The new `hot` custom case exercises reuse concentrated away from rank zero;
 custom also checks empty/uneven shapes and the existing dense and nnz boundaries.
 Stages stop at the first failed script. A/B uses normal builds, alternates their
 order, checks every output, and compares the candidate with commit `1604d20`.
+
+Each invocation uses a fresh output directory, so consecutive steps do not
+delete and recreate the same file across filesystem clients. Passing outputs
+are removed; failed output paths are kept and printed in the run's `.err` log.
+`NO` means srun exited successfully but the batch shell could not see the output;
+it is not a checker mismatch (`WA`). If custom tests fail, A/B and profile files
+will not exist because the remaining stages were not run.
 
 View and share the complete log, raw A/B times and candidate phase reports:
 
