@@ -4,6 +4,42 @@ Exact pruning is **on by default**, with tau=16, in `hw2-1.cpp`.
 `PP_WITNESS=off` retains the original path. The measurement package does not change `main.cpp`, the
 generator, the Makefile, HW2-2, or the existing test runner.
 
+## Step 2: Pruning Light Edges
+
+`PP_WITNESS_LIGHT=1` also tests edges with weight <= tau for redundancy. It is
+disabled by default. The light graph and its exact distances are computed as
+before. On any edge of a shortest-path tree rooted at the pivot,
+`L[child] = L[parent] + w`, so `L[parent] + L[child] >= w`. Such edges cannot be
+deleted by the strict test. A whole witness tree therefore survives even when
+other light edges are removed. Unreachable vertices still use the saturated 255
+sentinel and cannot trigger pruning. `PP_WITNESS=probe` only counts candidates.
+
+After committing, pushing, and pulling in `~/pp_course`, run this targeted A/B
+from `~/pp_course/hw2/hw2-1`. The baseline is Step 1 at `020d319`; it ignores the
+new environment variable. Both variants print counts into their `.err` logs.
+
+```bash
+sbatch -o hw2-1-light-%j.log ../tests/batch_hw2-1.sh \
+  'AB_REF=020d319 CASES="07 10 12 13" REPEAT=3 \
+   PP_WITNESS=prune PP_WITNESS_TAU=16 PP_WITNESS_LIGHT=1 PP_WITNESS_REPORT=1 \
+   OUT_ROOT=tmp/hw2-1-light-$SLURM_JOB_ID bash ../tests/run_hw2-1.sh ab'
+```
+
+Require `24 passed, 0 failed` before interpreting times. For the same input and
+tau, the decrease in `kept_edges` from base to new is precisely the number of
+newly removed light edges. The candidate report includes `light_pruning=1`.
+For job JOBID, inspect `tmp/hw2-1-light-JOBID/ab/*.1.err` for first-run counts.
+
+A full judge run of the experimental path can be requested explicitly:
+
+```bash
+PP_WITNESS=prune PP_WITNESS_TAU=16 PP_WITNESS_LIGHT=1 PP_WITNESS_REPORT=0 \
+  hw2-1-judge 2>&1 | tee ~/judge-light.log
+```
+
+The environment switch must reach the judged process for that run to exercise
+Step 2. The direct `srun` A/B above also records which mode actually ran.
+
 ## Run on SEIREN
 
 Synchronize `hw2-1/hw2-1.cpp` and these four files in `hw2/tests`:

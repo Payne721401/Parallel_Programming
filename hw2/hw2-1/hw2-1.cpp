@@ -46,6 +46,7 @@
 // Exact witness reduction is enabled by default; PP_WITNESS=off disables it, while probe
 // measures removable edges but keeps the full graph. PP_WITNESS_TAU=1..255 selects the cutoff.
 // PP_WITNESS_REPORT=1 prints its counts; HW21_PHASE_ONLY omits per-arc profiling counters.
+// PP_WITNESS_LIGHT=1 also tests light edges for redundancy (experimental; default: 0).
 #include <mpi.h>
 #ifdef HW21_PROF
 #include <sys/resource.h>
@@ -585,7 +586,8 @@ struct WitnessStats {
 // to owner mix(v) mod P, in local position mix(v) / P.
 template <EdgeSelection selection = EdgeSelection::full>
 Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof,
-            u32 tau = 255, const u8 *bounds = nullptr, bool prune = false, WitnessStats *stats = nullptr)
+            u32 tau = 255, const u8 *bounds = nullptr, bool prune = false,
+            WitnessStats *stats = nullptr, bool prune_light = false)
 {
     const int P = node.size, r = node.rank;
     const u64 N = num_vertices(p), M = num_edges(p);
@@ -629,7 +631,7 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof,
                     if (uu[j] == vv[j]) continue;
                     original++;
                     bool redundant = false;
-                    if (ww[j] > tau) {
+                    if (prune_light || ww[j] > tau) {
                         const u32 a = bounds[uu[j]], b = bounds[vv[j]];
                         redundant = a + b < ww[j];
                     }
@@ -1054,14 +1056,16 @@ struct WitnessConfig {
     int mode = 2;   // 0: off, 1: probe, 2: prune
     u32 tau = 16;
     bool report = false;
+    bool prune_light = false;
 };
 
 WitnessConfig witness_config(Node &node)
 {
-    int options[3] = {2, 16, Prof::on ? 1 : 0};
+    int options[4] = {2, 16, Prof::on ? 1 : 0, 0};
     if (node.rank == 0) {
         auto fail = [&]() {
-            std::fprintf(stderr, "PP_WITNESS must be off/probe/prune; PP_WITNESS_TAU must be 1..255\n");
+            std::fprintf(stderr, "PP_WITNESS must be off/probe/prune; PP_WITNESS_TAU must be 1..255; "
+                                 "PP_WITNESS_LIGHT must be 0/1\n");
             MPI_Abort(node.comm, 2);
             std::abort();
         };
@@ -1079,13 +1083,20 @@ WitnessConfig witness_config(Node &node)
             options[1] = int(tau);
         }
         if (const char *e = std::getenv("PP_WITNESS_REPORT")) options[2] = std::string(e) == "1";
+        if (const char *e = std::getenv("PP_WITNESS_LIGHT")) {
+            const std::string value(e);
+            if (value == "0") options[3] = 0;
+            else if (value == "1") options[3] = 1;
+            else fail();
+        }
     }
-    MPI_Bcast(options, 3, MPI_INT, 0, node.comm);
-    return {options[0], u32(options[1]), options[2] != 0};
+    MPI_Bcast(options, 4, MPI_INT, 0, node.comm);
+    return {options[0], u32(options[1]), options[2] != 0, options[3] != 0};
 }
 
-// L[v] is an actual path in the retained light graph. Removing only heavier edges with
-// L[u] + L[v] < w preserves all-pairs distances, including disconnected components.
+// L is the exact shortest-path distance in the light graph. On a shortest-path tree edge,
+// L[v] = L[u] + w, so L[u] + L[v] >= w: the strict pruning test keeps that entire tree.
+// Thus its witness paths survive even when pruning light edges, preserving all-pairs distances.
 // Store min(L[v], 255): a sum containing 255 cannot pass for any edge weight <= 255.
 // Unreachable vertices also map to 255; addition is widened before comparing.
 u8 *prepare_witness(Node &bound_node, const GraphParams &p, const FastDiv &fd,
@@ -1161,18 +1172,19 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
             const u8 *bounds = prepare_witness(bound_node, p, fd, witness.tau, witness_stats);
             prof.mark("witness");
             g = build<EdgeSelection::witness>(node, p, fd, prof, witness.tau, bounds,
-                                               witness.mode == 2, &witness_stats);
+                                               witness.mode == 2, &witness_stats, witness.prune_light);
             bound_node.release_all();
             prof.mark("bound-release");
             if (witness.report && r == 0)
                 std::fprintf(stderr,
                     "[hw2-1-witness] mode=%s tau=%u original_edges=%llu light_edges=%llu "
-                    "removable_edges=%llu kept_edges=%llu retained_fraction=%.9f pivot=%u light_reached=%llu\n",
+                    "removable_edges=%llu kept_edges=%llu retained_fraction=%.9f pivot=%u light_reached=%llu "
+                    "light_pruning=%d\n",
                     witness.mode == 2 ? "prune" : "probe", witness.tau,
                     (unsigned long long)witness_stats.original, (unsigned long long)witness_stats.light_edges,
                     (unsigned long long)witness_stats.removable, (unsigned long long)(g.arcs / 2),
                     witness_stats.original ? double(g.arcs / 2) / witness_stats.original : 1.0,
-                    witness_stats.pivot, (unsigned long long)witness_stats.reached);
+                    witness_stats.pivot, (unsigned long long)witness_stats.reached, witness.prune_light ? 1 : 0);
         } else {
             g = build(node, p, fd, prof);
         }
