@@ -48,8 +48,8 @@
 // PP_WITNESS_REPORT=1 prints its counts; HW21_PHASE_ONLY omits per-arc profiling counters.
 // PP_WITNESS_LIGHT=1 also tests light edges for redundancy (experimental; default: 0).
 // PP_WITNESS_SAMPLE=1/2/4 generates that fraction's prefix for the witness only (default: 1).
-// PP_GEN8=1 (experimental, default 0): the AVX-512 generator decides eight Kronecker levels per
-// byte compare instead of one level per step; edges are bit-identical and still checked first.
+// The AVX-512 generator decides eight Kronecker levels per byte compare (default); PP_GEN8=0
+// restores one level per step. Edges are bit-identical and still checked first.
 // HW21_BUCKET_PROF and HW21_ATOMIC_PROF add diagnostic counters, never judge-build work.
 #include <mpi.h>
 #ifdef HW21_PROF
@@ -647,7 +647,7 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof,
     prof.count("generated-edges", e1 - e0);
     u64 *const edges = reinterpret_cast<u64 *>(arena[r]);
     const char *g8 = std::getenv("PP_GEN8");
-    const FastGen fg(p, g8 && std::string(g8) == "1");
+    const FastGen fg(p, !(g8 && std::string(g8) == "0"));
     const char *fe = std::getenv("PP_FASTGEN");
     const bool fast = !(fe && fe[0] == '0') && fastgen_matches(p, fg, e0, e1);
     prof.count("fastgen-off", fast ? 0 : 1);
