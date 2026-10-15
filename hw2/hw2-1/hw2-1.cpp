@@ -47,6 +47,8 @@
 // measures removable edges but keeps the full graph. PP_WITNESS_TAU=1..255 selects the cutoff.
 // PP_WITNESS_REPORT=1 prints its counts; HW21_PHASE_ONLY omits per-arc profiling counters.
 // PP_WITNESS_LIGHT=1 also tests light edges for redundancy (experimental; default: 0).
+// PP_WITNESS_SAMPLE=1/2/4 generates that fraction's prefix for the witness only (default: 1).
+// HW21_BUCKET_PROF and HW21_ATOMIC_PROF add diagnostic counters, never judge-build work.
 #include <mpi.h>
 #ifdef HW21_PROF
 #include <sys/resource.h>
@@ -76,6 +78,15 @@ constexpr u64 NONE = ~u64(0);
 constexpr int VBITS = 26;                   // N <= 2^26, so a vertex id fits 26 bits
 constexpr u64 VMASK = (u64(1) << VBITS) - 1;
 constexpr int RING = 256;                   // > max weight, so pending values never alias
+
+#if (defined(HW21_BUCKET_PROF) || defined(HW21_ATOMIC_PROF)) && !defined(HW21_PROF)
+#error Search diagnostics require HW21_PROF
+#endif
+#ifdef HW21_BUCKET_PROF
+constexpr bool bucket_prof = true;
+#else
+constexpr bool bucket_prof = false;
+#endif
 
 #ifdef HW21_PROF
 // Per-phase wall time and minor page faults (each first touch of a fresh page, shared windows
@@ -587,10 +598,12 @@ struct WitnessStats {
 template <EdgeSelection selection = EdgeSelection::full>
 Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof,
             u32 tau = 255, const u8 *bounds = nullptr, bool prune = false,
-            WitnessStats *stats = nullptr, bool prune_light = false)
+            WitnessStats *stats = nullptr, bool prune_light = false, u32 sample = 1)
 {
     const int P = node.size, r = node.rank;
-    const u64 N = num_vertices(p), M = num_edges(p);
+    const u64 N = num_vertices(p);
+    // A rank-independent subset of real edge indices; the final graph always uses all M.
+    const u64 M = selection == EdgeSelection::light ? (num_edges(p) + sample - 1) / sample : num_edges(p);
     const Mix mix(p.scale, p.scramble == 0);
     const char *re = std::getenv("PP_RELABEL");
     const bool relabel = !(re && re[0] == '0');
@@ -603,6 +616,7 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof,
 
     // Generate edges [M r / P, M (r + 1) / P), self-loops dropped, packed (u | v << 26 | w << 52).
     const u64 e0 = M * r / P, e1 = M * (r + 1) / P;
+    prof.count("generated-edges", e1 - e0);
     u64 *const edges = reinterpret_cast<u64 *>(arena[r]);
     const FastGen fg(p);
     const char *fe = std::getenv("PP_FASTGEN");
@@ -826,11 +840,34 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof,
     return g;
 }
 
-// Atomic min on a window word last read as cur; true if this call lowered it.
-inline bool lower(u32 *slot, u32 cur, u32 nd)
+struct AtomicStats {
+#ifdef HW21_ATOMIC_PROF
+    static constexpr bool on = true;
+#else
+    static constexpr bool on = false;
+#endif
+    u64 attempts = 0, failed = 0, changed = 0, abandoned = 0, skipped = 0;
+};
+
+// Failed weak CAS with a changed expected value proves a concurrent decrease; a
+// failure with the same value can be spurious. Neither measures cache-line traffic.
+inline bool lower(u32 *slot, u32 cur, u32 nd, AtomicStats &stats)
 {
-    while (nd < cur)
+    if constexpr (AtomicStats::on) stats.skipped += nd >= cur;
+    bool attempted = false;
+    while (nd < cur) {
+        const u32 expected = cur;
+        if constexpr (AtomicStats::on) {
+            stats.attempts++;
+            attempted = true;
+        }
         if (__atomic_compare_exchange_n(slot, &cur, nd, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return true;
+        if constexpr (AtomicStats::on) {
+            stats.failed++;
+            stats.changed += cur != expected;
+        }
+    }
+    if constexpr (AtomicStats::on) stats.abandoned += attempted;
     return false;
 }
 
@@ -860,7 +897,8 @@ public:
         for (int s = 0; s < k; s++)
             if (s % P == r) {
                 dist[u64(s) * n + srcs[s]] = 0;
-                ring[0].push_back(u32(s) << VBITS | srcs[s]);
+                enqueue(0, u32(s) << VBITS | srcs[s]);
+                if constexpr (bucket_prof) seeds++;
             }
 
         // The profiling build splits the rounds' time: filter (finding and compacting the next
@@ -878,6 +916,7 @@ public:
             for (u64 x = next; x < next + RING; x++) {
                 std::vector<u32> &b = ring[x % RING];
                 if (b.empty()) continue;
+                const size_t old_size = b.size();
                 size_t m = 0;
                 u64 a = 0;
                 for (const u32 it : b) {
@@ -886,6 +925,10 @@ public:
                         b[m++] = it;
                         a += g.adj[v].deg;
                     }
+                }
+                if constexpr (bucket_prof) {
+                    inspected += old_size;
+                    stale += old_size - m;
                 }
                 b.resize(m);
                 if (m) {
@@ -921,6 +964,7 @@ public:
             }
             if (mine[0] == d) {
                 std::vector<u32> &b = ring[d % RING];
+                if constexpr (bucket_prof) published += b.size();
                 u64 a = 0;
                 for (size_t j = 0; j < b.size(); j++) {
                     if (j % 64 == 0) coarse[coff[r] + j / 64] = a;
@@ -930,9 +974,10 @@ public:
                 coarse[coff[r] + (b.size() + 63) / 64] = a;
                 // Published, so the private copy can go; a big one goes for good, or 256 buckets
                 // each keeping its peak capacity outgrow the private cap (scale 24 at P = 1 did).
-                if (b.capacity() > (u64(1) << 16))
+                if (b.capacity() > (u64(1) << 16)) {
+                    if constexpr (bucket_prof) released_bytes += b.capacity() * sizeof(u32);
                     std::vector<u32>().swap(b);
-                else
+                } else
                     b.clear();
             }
             const double t3 = tick();
@@ -961,6 +1006,26 @@ public:
         prof.count("round-max-arcs", r == 0 ? biggest : 0);
         prof.count("arcs", scanned);
         prof.count("pushes", pushes);
+        if constexpr (bucket_prof) {
+            prof.count("bucket-seeds", seeds);
+            prof.count("bucket-inspected", inspected);
+            prof.count("bucket-stale", stale);
+            prof.count("bucket-published", published);
+            prof.count("bucket-growths", growths);
+            prof.count("bucket-moved-bytes", moved_bytes);
+            prof.count("bucket-released-bytes", released_bytes);
+            prof.sub("bucket:", "grow", grow_time);
+            seeds = inspected = stale = published = growths = moved_bytes = released_bytes = 0;
+            grow_time = 0;
+        }
+        if constexpr (AtomicStats::on) {
+            prof.count("cas-attempts", atomic.attempts);
+            prof.count("cas-failed", atomic.failed);
+            prof.count("cas-changed", atomic.changed);
+            prof.count("cas-abandoned", atomic.abandoned);
+            prof.count("cas-skipped", atomic.skipped);
+            atomic = {};
+        }
         if (Prof::details) {
             prof.count("relax-final", final_hits);
             prof.count("relax-nogain", nogain_hits);
@@ -981,6 +1046,26 @@ private:
     std::vector<u32> ring[RING];
     std::vector<u64> info, off, coff, arc0;
     u64 pushes = 0, final_hits = 0, nogain_hits = 0;   // relaxations: lowered, target final, no lower
+    AtomicStats atomic;
+    u64 seeds = 0, inspected = 0, stale = 0, published = 0, growths = 0;
+    u64 moved_bytes = 0, released_bytes = 0;
+    double grow_time = 0;
+
+    void enqueue(u32 d, u32 item)
+    {
+        auto &b = ring[d % RING];
+        if constexpr (bucket_prof) {
+            if (b.size() == b.capacity()) {
+                growths++;
+                moved_bytes += b.size() * sizeof(u32);
+                const double t = tick();
+                b.push_back(item);
+                grow_time += tick() - t;
+                return;
+            }
+        }
+        b.push_back(item);
+    }
 
     // info is reused after the allgather: [3q + 1] items and [3q + 2] arcs of q this round.
     u64 &cnt_of(int q) { return info[3 * u64(q) + 1]; }
@@ -1044,8 +1129,8 @@ private:
                 final_hits += cur <= d;
                 nogain_hits += cur > d && cur <= nd;
             }
-            if (lower(ds + y, cur, nd)) {
-                ring[nd % RING].push_back(s << VBITS | y);
+            if (lower(ds + y, cur, nd, atomic)) {
+                enqueue(nd, s << VBITS | y);
                 pushes++;
             }
         }
@@ -1057,15 +1142,16 @@ struct WitnessConfig {
     u32 tau = 16;
     bool report = false;
     bool prune_light = false;
+    u32 sample = 1;
 };
 
 WitnessConfig witness_config(Node &node)
 {
-    int options[4] = {2, 16, Prof::on ? 1 : 0, 0};
+    int options[5] = {2, 16, Prof::on ? 1 : 0, 0, 1};
     if (node.rank == 0) {
         auto fail = [&]() {
             std::fprintf(stderr, "PP_WITNESS must be off/probe/prune; PP_WITNESS_TAU must be 1..255; "
-                                 "PP_WITNESS_LIGHT must be 0/1\n");
+                                 "PP_WITNESS_LIGHT must be 0/1; PP_WITNESS_SAMPLE must be 1/2/4\n");
             MPI_Abort(node.comm, 2);
             std::abort();
         };
@@ -1089,9 +1175,16 @@ WitnessConfig witness_config(Node &node)
             else if (value == "1") options[3] = 1;
             else fail();
         }
+        if (const char *e = std::getenv("PP_WITNESS_SAMPLE")) {
+            const std::string value(e);
+            if (value == "1") options[4] = 1;
+            else if (value == "2") options[4] = 2;
+            else if (value == "4") options[4] = 4;
+            else fail();
+        }
     }
-    MPI_Bcast(options, 4, MPI_INT, 0, node.comm);
-    return {options[0], u32(options[1]), options[2] != 0, options[3] != 0};
+    MPI_Bcast(options, 5, MPI_INT, 0, node.comm);
+    return {options[0], u32(options[1]), options[2] != 0, options[3] != 0, u32(options[4])};
 }
 
 // L is the exact shortest-path distance in the light graph. On a shortest-path tree edge,
@@ -1100,13 +1193,14 @@ WitnessConfig witness_config(Node &node)
 // Store min(L[v], 255): a sum containing 255 cannot pass for any edge weight <= 255.
 // Unreachable vertices also map to 255; addition is widened before comparing.
 u8 *prepare_witness(Node &bound_node, const GraphParams &p, const FastDiv &fd,
-                     u32 tau, WitnessStats &stats)
+                     u32 tau, WitnessStats &stats, u32 sample)
 {
     const u64 N = num_vertices(p);
     const int r = bound_node.rank, P = bound_node.size;
     Prof light_prof("hw2-1-light");
     Node light_node(bound_node.comm, light_prof);
-    const Graph light = build<EdgeSelection::light>(light_node, p, fd, light_prof, tau);
+    const Graph light = build<EdgeSelection::light>(light_node, p, fd, light_prof, tau,
+                                                   nullptr, false, nullptr, false, sample);
     stats.light_edges = light.arcs / 2;
     u64 best = 0, global_best = 0;
     for (u64 s = light.n * r / P; s < light.n * (r + 1) / P; s++)
@@ -1169,7 +1263,7 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
         if (witness.mode) {
             Prof bound_prof("hw2-1-bound");
             Node bound_node(comm, bound_prof);
-            const u8 *bounds = prepare_witness(bound_node, p, fd, witness.tau, witness_stats);
+            const u8 *bounds = prepare_witness(bound_node, p, fd, witness.tau, witness_stats, witness.sample);
             prof.mark("witness");
             g = build<EdgeSelection::witness>(node, p, fd, prof, witness.tau, bounds,
                                                witness.mode == 2, &witness_stats, witness.prune_light);
@@ -1179,12 +1273,13 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
                 std::fprintf(stderr,
                     "[hw2-1-witness] mode=%s tau=%u original_edges=%llu light_edges=%llu "
                     "removable_edges=%llu kept_edges=%llu retained_fraction=%.9f pivot=%u light_reached=%llu "
-                    "light_pruning=%d\n",
+                    "light_pruning=%d sample_divisor=%u witness_generated=%llu\n",
                     witness.mode == 2 ? "prune" : "probe", witness.tau,
                     (unsigned long long)witness_stats.original, (unsigned long long)witness_stats.light_edges,
                     (unsigned long long)witness_stats.removable, (unsigned long long)(g.arcs / 2),
                     witness_stats.original ? double(g.arcs / 2) / witness_stats.original : 1.0,
-                    witness_stats.pivot, (unsigned long long)witness_stats.reached, witness.prune_light ? 1 : 0);
+                    witness_stats.pivot, (unsigned long long)witness_stats.reached, witness.prune_light ? 1 : 0,
+                    witness.sample, (unsigned long long)((num_edges(p) + witness.sample - 1) / witness.sample));
         } else {
             g = build(node, p, fd, prof);
         }
@@ -1296,8 +1391,10 @@ void run(const GraphParams &p, const std::vector<uint32_t> &sources, std::vector
         u64 max_memory[2] = {};
         MPI_Reduce(local_memory, max_memory, 2, MPI_UINT64_T, MPI_MAX, 0, comm);
         if (r == 0)
-            std::fprintf(stderr, "[hw2-1-memory] peak_rank_rss_kib=%llu max_rank_minflt=%llu arc_counters=%d\n",
-                         (unsigned long long)max_memory[0], (unsigned long long)max_memory[1], Prof::details ? 1 : 0);
+            std::fprintf(stderr, "[hw2-1-memory] peak_rank_rss_kib=%llu max_rank_minflt=%llu arc_counters=%d "
+                                 "bucket_counters=%d atomic_counters=%d\n",
+                         (unsigned long long)max_memory[0], (unsigned long long)max_memory[1], Prof::details ? 1 : 0,
+                         bucket_prof ? 1 : 0, AtomicStats::on ? 1 : 0);
 #endif
     }
     MPI_Comm_free(&comm);

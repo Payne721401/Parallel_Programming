@@ -1,5 +1,8 @@
 # HW2-1 Exact Witness Experiment
 
+For the independent bucket/CAS diagnostics and sampled-witness experiment, see
+[SEARCH.md](SEARCH.md). Both use isolated binaries and leave defaults unchanged.
+
 Exact pruning is **on by default**, with tau=16, in `hw2-1.cpp`.
 `PP_WITNESS=off` retains the original path. The measurement package does not change `main.cpp`, the
 generator, the Makefile, HW2-2, or the existing test runner.
