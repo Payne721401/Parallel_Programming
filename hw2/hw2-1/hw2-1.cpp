@@ -48,6 +48,8 @@
 // PP_WITNESS_REPORT=1 prints its counts; HW21_PHASE_ONLY omits per-arc profiling counters.
 // PP_WITNESS_LIGHT=1 also tests light edges for redundancy (experimental; default: 0).
 // PP_WITNESS_SAMPLE=1/2/4 generates that fraction's prefix for the witness only (default: 1).
+// PP_GEN8=1 (experimental, default 0): the AVX-512 generator decides eight Kronecker levels per
+// byte compare instead of one level per step; edges are bit-identical and still checked first.
 // HW21_BUCKET_PROF and HW21_ATOMIC_PROF add diagnostic counters, never judge-build work.
 #include <mpi.h>
 #ifdef HW21_PROF
@@ -276,9 +278,9 @@ inline u64 mix64(u64 x)
 // runs eight edges at once. fastgen_matches() checks it against the official generator first.
 class FastGen {
 public:
-    explicit FastGen(const GraphParams &p)
-        : scale(p.scale), sh(p.scale / 2 > 0 ? p.scale / 2 : 1), scr(p.scramble != 0), ms(mix64(p.seed)),
-          mw(mix64(p.seed ^ 0x77e19470ULL)), mask((u64(1) << p.scale) - 1)
+    explicit FastGen(const GraphParams &p, bool bytes8 = false)
+        : scale(p.scale), sh(p.scale / 2 > 0 ? p.scale / 2 : 1), scr(p.scramble != 0), bytes8(bytes8),
+          ms(mix64(p.seed)), mw(mix64(p.seed ^ 0x77e19470ULL)), mask((u64(1) << p.scale) - 1)
     {
         const u64 s = p.seed ^ 0x5c2a3b1eULL;   // scramble_id's seed
         k1 = mix64(s ^ 0x1111ULL) | 1;
@@ -318,7 +320,10 @@ public:
     {
         u64 j = 0;
 #ifdef HW21_AVX512
-        for (; j + 8 <= n; j += 8) edges8(i0 + j, u + j, v + j, w + j);
+        if (bytes8)
+            for (; j + 8 <= n; j += 8) edges8<true>(i0 + j, u + j, v + j, w + j);
+        else
+            for (; j + 8 <= n; j += 8) edges8<false>(i0 + j, u + j, v + j, w + j);
 #endif
         for (; j < n; j++) edge(i0 + j, u[j], v[j], w[j]);
     }
@@ -326,7 +331,7 @@ public:
 private:
     static constexpr u64 HK = 0xd6e8feb86659fd93ULL;   // hash2's multiplier
     int scale, sh;
-    bool scr;
+    bool scr, bytes8;
     u64 ms, mw, mask, k1, k2, k3;
 
     u32 scramble(u64 x) const
@@ -357,21 +362,44 @@ private:
         return _mm512_xor_si512(x, _mm512_srli_epi64(x, 31));
     }
 
+    template <bool Bytes>
     void edges8(u64 i0, u32 *u, u32 *v, u8 *w) const
     {
         const __m512i idx = _mm512_add_epi64(_mm512_set1_epi64(i0), _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7));
         __m512i state = mixv(_mm512_xor_si512(_mm512_set1_epi64(ms), _mm512_mullo_epi64(idx, _mm512_set1_epi64(HK))));
         __m512i a = _mm512_setzero_si512(), b = _mm512_setzero_si512();
-        const __m512i ff = _mm512_set1_epi64(0xff), c146 = _mm512_set1_epi64(146), c195 = _mm512_set1_epi64(195),
-                      c243 = _mm512_set1_epi64(243);
-        for (int level = 0; level < scale; level++) {
-            if (level && (level & 7) == 0) state = mixv(state);
-            const __m512i r = _mm512_and_si512(_mm512_srli_epi64(state, 8 * (level & 7)), ff);
-            const __mmask8 ma = _mm512_cmpge_epu64_mask(r, c195);
-            const __mmask8 mb = (_mm512_cmpge_epu64_mask(r, c146) & ~ma) | _mm512_cmpge_epu64_mask(r, c243);
-            const __m512i bit = _mm512_set1_epi64(u64(1) << level);
-            a = _mm512_mask_or_epi64(a, ma, a, bit);
-            b = _mm512_mask_or_epi64(b, mb, b, bit);
+        const __m512i ff = _mm512_set1_epi64(0xff);
+        if constexpr (Bytes) {
+            // edge()'s eight levels per word, for all eight edges at once: one unsigned compare of
+            // the 64 state bytes per threshold. Mask bit 8 j + k is lane j's byte k, i.e. level
+            // base + k of edge j, so byte j of each mask is edge j's eight bits, in level order.
+            const __m512i c146 = _mm512_set1_epi8(char(146)), c195 = _mm512_set1_epi8(char(195)),
+                          c243 = _mm512_set1_epi8(char(243));
+            for (int base = 0; base < scale; base += 8) {
+                if (base) state = mixv(state);
+                const u64 g146 = _mm512_cmpge_epu8_mask(state, c146), g195 = _mm512_cmpge_epu8_mask(state, c195),
+                          g243 = _mm512_cmpge_epu8_mask(state, c243);
+                u64 am = g195, bm = (g146 & ~g195) | g243;
+                if (scale - base < 8) {   // the last word's unused levels
+                    const u64 keep = 0x0101010101010101ULL * ((1u << (scale - base)) - 1);
+                    am &= keep;
+                    bm &= keep;
+                }
+                const __m128i at = _mm_cvtsi32_si128(base);
+                a = _mm512_or_si512(a, _mm512_sll_epi64(_mm512_cvtepu8_epi64(_mm_cvtsi64_si128((long long)am)), at));
+                b = _mm512_or_si512(b, _mm512_sll_epi64(_mm512_cvtepu8_epi64(_mm_cvtsi64_si128((long long)bm)), at));
+            }
+        } else {
+            const __m512i c146 = _mm512_set1_epi64(146), c195 = _mm512_set1_epi64(195), c243 = _mm512_set1_epi64(243);
+            for (int level = 0; level < scale; level++) {
+                if (level && (level & 7) == 0) state = mixv(state);
+                const __m512i r = _mm512_and_si512(_mm512_srli_epi64(state, 8 * (level & 7)), ff);
+                const __mmask8 ma = _mm512_cmpge_epu64_mask(r, c195);
+                const __mmask8 mb = (_mm512_cmpge_epu64_mask(r, c146) & ~ma) | _mm512_cmpge_epu64_mask(r, c243);
+                const __m512i bit = _mm512_set1_epi64(u64(1) << level);
+                a = _mm512_mask_or_epi64(a, ma, a, bit);
+                b = _mm512_mask_or_epi64(b, mb, b, bit);
+            }
         }
         if (scr) {
             const __m512i m = _mm512_set1_epi64(mask), q1 = _mm512_set1_epi64(k1), q2 = _mm512_set1_epi64(k2),
@@ -618,7 +646,8 @@ Graph build(Node &node, const GraphParams &p, const FastDiv &fd, Prof &prof,
     const u64 e0 = M * r / P, e1 = M * (r + 1) / P;
     prof.count("generated-edges", e1 - e0);
     u64 *const edges = reinterpret_cast<u64 *>(arena[r]);
-    const FastGen fg(p);
+    const char *g8 = std::getenv("PP_GEN8");
+    const FastGen fg(p, g8 && std::string(g8) == "1");
     const char *fe = std::getenv("PP_FASTGEN");
     const bool fast = !(fe && fe[0] == '0') && fastgen_matches(p, fg, e0, e1);
     prof.count("fastgen-off", fast ? 0 : 1);
