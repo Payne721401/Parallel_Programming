@@ -10,6 +10,8 @@
 // PP_HOT_MB bounds that cache per node (default 256, range 0..512). PP_HOT_REPORT=1 prints
 // the selected plan even in a normal build; profiling builds report it by default.
 // PP_ACCUM=bitmap (default), scan, or auto changes only partial-row accumulation.
+// PP_HOT_DENSE=1 adds a node-shared uint8 shadow of hot rows with density >= 1/4.
+// Only scan-selected partial rows use it; CSR sharing and scheduling stay unchanged.
 //
 //   scatter   alltoallv of A's entries, packed (i << 32 | k << 4 | a), to B's owners
 //   group     a counting sort of what arrived, by row i
@@ -271,6 +273,11 @@ bool scan_for_row(AccumulatorMode mode, u64 products, u32 columns)
            (mode == AccumulatorMode::Auto && products >= SCAN_WORK_PER_COLUMN * columns);
 }
 
+bool dense_hot_row(u64 length, u32 columns)
+{
+    return length && 4 * length >= columns;
+}
+
 // One row of C being summed: a dense total per column (they fit 32 bits: C[i, j] is at most
 // 64 nnz(A[i, :]) <= 2^23), a bitmap of the columns hit, and the span they lie in, so that
 // reading the row back in column order costs the span's words rather than N.
@@ -304,6 +311,14 @@ public:
             bits |= u64(1) << (j % 64);
         }
         hit[w] |= bits;
+    }
+
+    // Scan extraction is required: this kernel deliberately does not update the bitmap.
+    void add_dense_scan(u32 scale, const uint8_t *values)
+    {
+        u32 *__restrict__ dst = sum.data();
+        const uint8_t *__restrict__ src = values;
+        for (size_t j = 0; j < sum.size(); j++) dst[j] += scale * u32(src[j]);
     }
 
     // Appends the row to out in column order, and clears it. Every product is positive, so
@@ -347,11 +362,12 @@ struct HotConfig {
     bool enabled, report;
     u64 bytes;
     AccumulatorMode accum;
+    bool dense;
 };
 
 HotConfig hot_config(MPI_Comm comm, int rank)
 {
-    int opt[4] = {0, 256, Prof::on ? 1 : 0, int(AccumulatorMode::Bitmap)};
+    int opt[5] = {0, 256, Prof::on ? 1 : 0, int(AccumulatorMode::Bitmap), 0};
     if (rank == 0) {
         const char *names[] = {"PP_HOT", "PP_HOT_MB", "PP_HOT_REPORT"};
         for (int i = 0; i < 3; i++) {
@@ -370,9 +386,14 @@ HotConfig hot_config(MPI_Comm comm, int rank)
             else if (value == "auto") opt[3] = int(AccumulatorMode::Auto);
             else throw std::runtime_error("invalid PP_ACCUM: expected bitmap, scan, or auto");
         }
+        if (const char *s = std::getenv("PP_HOT_DENSE")) {
+            if (std::string(s) == "0") opt[4] = 0;
+            else if (std::string(s) == "1") opt[4] = 1;
+            else throw std::runtime_error("invalid PP_HOT_DENSE: expected 0 or 1");
+        }
     }
-    MPI_Bcast(opt, 4, MPI_INT, 0, comm);
-    return {opt[0] != 0, opt[2] != 0, u64(opt[1]) << 20, AccumulatorMode(opt[3])};
+    MPI_Bcast(opt, 5, MPI_INT, 0, comm);
+    return {opt[0] != 0, opt[2] != 0, u64(opt[1]) << 20, AccumulatorMode(opt[3]), opt[4] != 0};
 }
 
 struct HotPlan {
@@ -487,6 +508,14 @@ class HotCache {
 public:
     Entry *data = nullptr;
     int nodes = 0;
+    uint8_t *dense_data = nullptr;
+    std::vector<u32> dense_offset;
+    u64 dense_rows = 0, dense_bytes = 0;
+
+    bool has_dense(u32 k) const
+    {
+        return !dense_offset.empty() && dense_offset[k] != UINT32_MAX;
+    }
 
     void fill(const HotPlan &h, const Matrix &b, MPI_Comm comm, int rank, int P)
     {
@@ -532,10 +561,56 @@ public:
         sync();
     }
 
+    void build_dense(const HotPlan &h, u32 N, const HotConfig &cfg)
+    {
+        if (!cfg.dense || cfg.accum == AccumulatorMode::Bitmap || !h.entries) return;
+        std::vector<u32> selected;
+        dense_offset.assign(h.offset.size(), UINT32_MAX);
+        for (u32 k = 0; k < h.offset.size(); k++) {
+            if (!h.contains(k) || !dense_hot_row(h.length[k], N)) continue;
+            dense_offset[k] = u32(dense_bytes);
+            dense_bytes += N;
+            selected.push_back(k);
+        }
+        dense_rows = selected.size();
+        if (!dense_rows) {
+            std::vector<u32>().swap(dense_offset);
+            return;
+        }
+        // N <= 4*nnz per selected row: shadow <= half of the capped CSR cache,
+        // hence <= 256 MiB and all offsets fit uint32_t (with a distinct sentinel).
+        void *base = nullptr;
+        MPI_Win_allocate_shared(local_rank == 0 ? MPI_Aint(dense_bytes) : 0,
+                                1, MPI_INFO_NULL, node, &base, &dense_win);
+        MPI_Aint size;
+        int disp, local_size;
+        MPI_Win_shared_query(dense_win, 0, &size, &disp, &base);
+        dense_data = static_cast<uint8_t *>(base);
+        MPI_Win_lock_all(0, dense_win);
+        MPI_Comm_size(node, &local_size);
+        // Each node converts its already-shared CSR copy once, in disjoint row ranges.
+        for (u64 j = dense_rows * local_rank / local_size;
+             j < dense_rows * (local_rank + 1) / local_size; j++) {
+            const u32 k = selected[j];
+            uint8_t *dst = dense_data + dense_offset[k];
+            std::fill_n(dst, N, uint8_t(0));
+            const Entry *src = data + h.offset[k];
+            for (u32 t = 0; t < h.length[k]; t++) dst[src[t].col] = uint8_t(src[t].val);
+        }
+        MPI_Win_sync(dense_win);
+        MPI_Barrier(node);
+        MPI_Win_sync(dense_win);
+    }
+
     void release()
     {
         if (win == MPI_WIN_NULL) return;
         MPI_Barrier(node);
+        if (dense_win != MPI_WIN_NULL) {
+            MPI_Win_unlock_all(dense_win);
+            MPI_Win_free(&dense_win);
+            dense_data = nullptr;
+        }
         MPI_Win_unlock_all(win);
         MPI_Win_free(&win);
         if (leaders != MPI_COMM_NULL) MPI_Comm_free(&leaders);
@@ -547,7 +622,7 @@ public:
 
 private:
     MPI_Comm node = MPI_COMM_NULL, leaders = MPI_COMM_NULL;
-    MPI_Win win = MPI_WIN_NULL;
+    MPI_Win win = MPI_WIN_NULL, dense_win = MPI_WIN_NULL;
     int local_rank = 0;
     std::vector<int> root;
 
@@ -577,6 +652,14 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
     prof.mark("hot-local");
     cache.share(hot);
     prof.mark("hot-share");
+    cache.build_dense(hot, N, cfg);
+    prof.mark("hot-dense");
+    if (cfg.report && r == 0)
+        std::fprintf(stderr, "[hw2-2-dense] enabled=%d rows=%llu shadow_bytes_per_node=%llu "
+                     "offset_bytes_per_rank=%llu min_density=0.25 scope=scan-selected-hot-rows\n",
+                     cfg.dense ? 1 : 0, (unsigned long long)cache.dense_rows,
+                     (unsigned long long)cache.dense_bytes,
+                     (unsigned long long)(cache.dense_offset.size() * sizeof(u32)));
     if (cfg.report && r == 0)
         std::fprintf(stderr, "[hw2-2-hot] enabled=%d selected_rows=%llu cache_bytes_per_node=%llu nodes=%d "
                              "total_products=%llu hot_products=%llu before_max=%llu planned_max=%llu\n",
@@ -634,6 +717,7 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
 #ifdef HW22_PROF
     std::vector<u64> row_products(M, 0), row_hot(M, 0);
     u64 scan_rows = 0, bitmap_rows = 0, scan_products = 0;
+    u64 dense_calls = 0, dense_products = 0;
 #endif
     for (u32 i = 0; i < M; i++) {
         u64 f = 0;
@@ -647,8 +731,14 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
             else bitmap_rows++;
         }
         row_products[i] = f;
-        for (u64 t = first[i]; t < first[i + 1]; t++)
-            if (hot.contains(item[t] >> 4)) row_hot[i] += row_length(item[t] >> 4);
+        for (u64 t = first[i]; t < first[i + 1]; t++) {
+            const u32 k = item[t] >> 4;
+            if (hot.contains(k)) row_hot[i] += row_length(k);
+            if (scan_row[i] && cache.has_dense(k)) {
+                dense_calls++;
+                dense_products += row_length(k);
+            }
+        }
 #endif
     }
     MPI_Allreduce(mine.data(), bound.data(), count_of(M), MPI_UINT64_T, MPI_SUM, comm);
@@ -657,6 +747,9 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
     prof.count("acc-scan-rows", scan_rows);
     prof.count("acc-bitmap-rows", bitmap_rows);
     prof.count("acc-scan-products", scan_products);
+    prof.count("dense-calls", dense_calls);
+    prof.count("dense-products", dense_products);
+    prof.count("dense-slots", dense_calls * N);
 #endif
     prof.mark("bound");
 
@@ -702,6 +795,12 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
             auto add_row = [&](auto scan) {
                 for (u64 t = first[i]; t < first[i + 1]; t++) {
                     const u32 k = item[t] >> 4;
+                    if constexpr (decltype(scan)::value) {
+                        if (cache.has_dense(k)) {
+                            acc.add_dense_scan(item[t] & 15, cache.dense_data + cache.dense_offset[k]);
+                            continue;
+                        }
+                    }
                     const u64 len = row_length(k);
                     if (len) acc.add<decltype(scan)::value>(item[t] & 15,
                         hot.contains(k) ? cache.data + hot.offset[k] : b.data.data() + b.ptr[k - b.first], len);

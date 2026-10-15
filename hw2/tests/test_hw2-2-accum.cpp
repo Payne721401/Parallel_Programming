@@ -20,7 +20,10 @@ static void check_row(Accumulator &acc, bool scan, const std::vector<u32> &expec
 
 int main()
 {
-    for (u32 n : {1u, 65u, 8192u}) {
+    for (u32 n : {1u, 65u, 6143u, 8192u}) {
+        if (dense_hot_row(0, n) || !dense_hot_row((n + 3) / 4, n) ||
+            dense_hot_row((n - 1) / 4, n))
+            throw std::runtime_error("dense hot density threshold mismatch");
         const u64 threshold = SCAN_WORK_PER_COLUMN * n;
         if (scan_for_row(AccumulatorMode::Bitmap, threshold, n) ||
             !scan_for_row(AccumulatorMode::Scan, 0, n) ||
@@ -59,6 +62,29 @@ int main()
                 check_row(acc, !scan, std::vector<u32>(n, 0));
             }
         }
+        Accumulator mixed(n);
+        for (u32 row = 0; row < 12; row++) {
+            std::vector<u32> expected(n, 0);
+            for (u32 pass = 0; pass < 4; pass++) {
+                std::vector<uint8_t> dense(n, 0);
+                std::vector<Entry> sparse;
+                for (u32 j = 0; row % 4 && j < n; j++) {
+                    if ((j + pass) % 3) continue;
+                    dense[j] = uint8_t(1 + (j + pass) % 8);
+                    sparse.push_back({j, dense[j]});
+                    expected[j] += 8 * u32(dense[j]);
+                }
+                if (pass % 2) mixed.add_dense_scan(8, dense.data());
+                else mixed.add<true>(8, sparse.data(), sparse.size());
+            }
+            check_row(mixed, true, expected);
+            const Entry last{n - 1, 8};
+            mixed.add(8, &last, 1);
+            expected.assign(n, 0);
+            expected.back() = 64;
+            check_row(mixed, false, expected);
+            check_row(mixed, true, std::vector<u32>(n, 0));
+        }
     }
-    std::puts("PASS accumulator bitmap/scan/reset, empty/dense/sparse rows, auto threshold and large sums");
+    std::puts("PASS accumulator bitmap/scan/dense-hot mixing and reset, density/auto thresholds and large sums");
 }
