@@ -12,6 +12,8 @@
 // PP_ACCUM=auto (default), bitmap, or scan changes only partial-row accumulation.
 // PP_HOT_DENSE=1 adds a node-shared uint8 shadow of hot rows with density >= 1/4.
 // Only scan-selected partial rows use it; CSR sharing and scheduling stay unchanged.
+// PP_EMIT_SIMD=1 (experimental, default 0) reads partial and merged rows back with AVX-512
+// compresses instead of a branch and a push_back per column; the output is identical.
 //
 //   scatter   alltoallv of A's entries, packed (i << 32 | k << 4 | a), to B's owners
 //   group     a counting sort of what arrived, by row i
@@ -44,6 +46,10 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#define HW22_AVX512 1
+#endif
 
 namespace {
 
@@ -349,11 +355,106 @@ public:
         hi = 0;
     }
 
+    // take() with AVX-512 (PP_EMIT_SIMD=1): the same entries, appended in column order, and the
+    // same reset. Sixteen columns at a time become (col, val) pairs, eight per compress. A
+    // bitmap word with few bits keeps the scalar loop. out holds 8 entries of slack while the
+    // full-width stores run, then shrinks to its exact size.
+    template <bool Scan = false>
+    void take_simd(std::vector<Entry> &out)
+    {
+#ifdef HW22_AVX512
+        u32 *const s = sum.data();
+        const u32 n = u32(sum.size());
+        const __m512i zero = _mm512_setzero_si512();
+        u64 count = 0;
+        if constexpr (Scan) {
+            for (u32 j = 0; j < n; j += 16) {
+                const __m512i v = _mm512_maskz_loadu_epi32(live16(j, n), s + j);
+                count += u32(__builtin_popcount(_mm512_test_epi32_mask(v, v)));
+            }
+        } else {
+            if (lo > hi) return;
+            for (u32 w = lo / 64; w <= hi / 64; w++) count += u32(__builtin_popcountll(hit[w]));
+        }
+        const size_t old = out.size();
+        out.resize(old + count + 8);
+        Entry *dst = out.data() + old;
+        if constexpr (Scan) {
+            for (u32 j = 0; j < n; j += 16) {
+                const __m512i v = _mm512_maskz_loadu_epi32(live16(j, n), s + j);
+                const __mmask16 m = _mm512_test_epi32_mask(v, v);
+                if (!m) continue;
+                _mm512_mask_storeu_epi32(s + j, m, zero);
+                dst = emit16(dst, v, m, j);
+            }
+        } else {
+            for (u32 w = lo / 64; w <= hi / 64; w++) {
+                u64 x = hit[w];
+                if (!x) continue;
+                hit[w] = 0;
+                if (__builtin_popcountll(x) >= 8) {
+                    // Only columns whose bit is set are loaded or stored: all of them are < N.
+                    for (u32 q = 0; q < 4; q++) {
+                        const __mmask16 m = __mmask16(x >> (16 * q));
+                        if (!m) continue;
+                        const u32 j = w * 64 + 16 * q;
+                        const __m512i v = _mm512_maskz_loadu_epi32(m, s + j);
+                        _mm512_mask_storeu_epi32(s + j, m, zero);
+                        dst = emit16(dst, v, m, j);
+                    }
+                } else {
+                    for (; x; x &= x - 1) {
+                        const u32 j = w * 64 + u32(__builtin_ctzll(x));
+                        *dst++ = {j, s[j]};
+                        s[j] = 0;
+                    }
+                }
+            }
+            lo = UINT32_MAX;
+            hi = 0;
+        }
+        out.resize(old + count);
+#else
+        take<Scan>(out);
+#endif
+    }
+
 private:
     std::vector<u32> sum;
     std::vector<u64> hit;
     u32 lo = UINT32_MAX, hi = 0;
+
+#ifdef HW22_AVX512
+    // Lanes of columns [j, j + 16) that exist.
+    static __mmask16 live16(u32 j, u32 n)
+    {
+        return j + 16 <= n ? __mmask16(0xffff) : __mmask16((1u << (n - j)) - 1);
+    }
+
+    // Writes the totals v of columns j..j+15 selected by m as Entry pairs at dst, in column
+    // order, and returns the end. Each store is a full 64 bytes: the caller provides slack.
+    static Entry *emit16(Entry *dst, __m512i v, __mmask16 m, u32 j)
+    {
+        const __m512i col = _mm512_add_epi64(_mm512_set1_epi64(j), _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7));
+        const __m512i first8 = _mm512_or_si512(
+            col, _mm512_slli_epi64(_mm512_cvtepu32_epi64(_mm512_castsi512_si256(v)), 32));
+        const __m512i last8 = _mm512_or_si512(
+            _mm512_add_epi64(col, _mm512_set1_epi64(8)),
+            _mm512_slli_epi64(_mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64(v, 1)), 32));
+        const __mmask8 a = __mmask8(m), b = __mmask8(m >> 8);
+        _mm512_storeu_si512(dst, _mm512_maskz_compress_epi64(a, first8));
+        dst += __builtin_popcount(a);
+        _mm512_storeu_si512(dst, _mm512_maskz_compress_epi64(b, last8));
+        return dst + __builtin_popcount(b);
+    }
+#endif
 };
+
+#ifdef HW22_AVX512
+constexpr bool EMIT_AVX512 = true;
+#else
+constexpr bool EMIT_AVX512 = false;
+#endif
 
 // What one round may put in flight on any rank, either way: 8-byte items, 128 MiB.
 constexpr u64 BUDGET = u64(16) << 20;
@@ -363,11 +464,12 @@ struct HotConfig {
     u64 bytes;
     AccumulatorMode accum;
     bool dense;
+    bool emit_simd;
 };
 
 HotConfig hot_config(MPI_Comm comm, int rank)
 {
-    int opt[5] = {1, 256, Prof::on ? 1 : 0, int(AccumulatorMode::Auto), 0};
+    int opt[6] = {1, 256, Prof::on ? 1 : 0, int(AccumulatorMode::Auto), 0, 0};
     if (rank == 0) {
         const char *names[] = {"PP_HOT", "PP_HOT_MB", "PP_HOT_REPORT"};
         for (int i = 0; i < 3; i++) {
@@ -391,9 +493,14 @@ HotConfig hot_config(MPI_Comm comm, int rank)
             else if (std::string(s) == "1") opt[4] = 1;
             else throw std::runtime_error("invalid PP_HOT_DENSE: expected 0 or 1");
         }
+        if (const char *s = std::getenv("PP_EMIT_SIMD")) {
+            if (std::string(s) == "0") opt[5] = 0;
+            else if (std::string(s) == "1") opt[5] = 1;
+            else throw std::runtime_error("invalid PP_EMIT_SIMD: expected 0 or 1");
+        }
     }
-    MPI_Bcast(opt, 5, MPI_INT, 0, comm);
-    return {opt[0] != 0, opt[2] != 0, u64(opt[1]) << 20, AccumulatorMode(opt[3]), opt[4] != 0};
+    MPI_Bcast(opt, 6, MPI_INT, 0, comm);
+    return {opt[0] != 0, opt[2] != 0, u64(opt[1]) << 20, AccumulatorMode(opt[3]), opt[4] != 0, opt[5] != 0};
 }
 
 struct HotPlan {
@@ -672,6 +779,9 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
         std::fprintf(stderr, "[hw2-2-accum] mode=%s scope=partial-rows auto_min_products=%llu merge=bitmap\n",
                      names[int(cfg.accum)], (unsigned long long)(SCAN_WORK_PER_COLUMN * N));
     }
+    if (cfg.report && r == 0)
+        std::fprintf(stderr, "[hw2-2-emit] simd=%d avx512=%d scope=partial-rows+merge\n",
+                     cfg.emit_simd ? 1 : 0, EMIT_AVX512 ? 1 : 0);
     auto destination = [&](u32 i, u32 k) { return hot.contains(k) ? hot.worker[i] : row_owner(k, K, P); };
     auto row_length = [&](u32 k) -> u64 {
         if (hot.contains(k)) return hot.length[k];
@@ -781,7 +891,7 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
         const double prepare_begin = MPI_Wtime();
 #endif
         out.clear();
-        out.reserve(mine_load);
+        out.reserve(mine_load + (cfg.emit_simd ? 8 : 0));   // take_simd's slack fits too
         std::fill(to_c.begin(), to_c.end(), 0);
 #ifdef HW22_PROF
         diag.prepare = MPI_Wtime() - prepare_begin;
@@ -814,8 +924,14 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
 #endif
             const u64 head = out.size();
             out.push_back({i, 0});
-            if (scan_row[i]) acc.take<true>(out);
-            else acc.take(out);
+            if (cfg.emit_simd) {
+                if (scan_row[i]) acc.take_simd<true>(out);
+                else acc.take_simd(out);
+            } else if (scan_row[i]) {
+                acc.take<true>(out);
+            } else {
+                acc.take(out);
+            }
 #ifdef HW22_PROF
             diag.emit += MPI_Wtime() - emit_begin;
 #endif
@@ -852,6 +968,9 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
             o += from_c[q];
             end_c[q] = o;
         }
+        // Merged rows are no longer than the pieces received; one reservation per round
+        // replaces repeated growth, and covers take_simd's slack.
+        if (cfg.emit_simd) c.data.reserve(c.data.size() + o + 8);
         for (u32 i = std::max(lo, my0); i < std::min(hi, my1); i++) {
             const Entry *one = nullptr;
             u32 one_len = 0;
@@ -871,6 +990,8 @@ void multiply(const Matrix &a, const Matrix &b, Matrix &c)
             }
             if (pieces == 1)
                 c.data.insert(c.data.end(), one, one + one_len);
+            else if (pieces > 1 && cfg.emit_simd)
+                acc.take_simd(c.data);
             else if (pieces > 1)
                 acc.take(c.data);
             c.ptr[i - my0 + 1] = c.data.size();

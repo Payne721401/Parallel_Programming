@@ -1,12 +1,21 @@
 // Exercise the submitted accumulator directly without changing its public interface.
 #include "../hw2-2/hw2-2.cpp"
 
+// Every check runs twice: with the scalar take() and with take_simd() (PP_EMIT_SIMD=1).
+static bool simd_take = false;
+
 static void check_row(Accumulator &acc, bool scan, const std::vector<u32> &expected)
 {
     const Entry prefix{UINT32_MAX, 123};
     std::vector<Entry> out{prefix};
-    if (scan) acc.take<true>(out);
-    else acc.take(out);
+    if (simd_take) {
+        if (scan) acc.take_simd<true>(out);
+        else acc.take_simd(out);
+    } else if (scan) {
+        acc.take<true>(out);
+    } else {
+        acc.take(out);
+    }
     size_t at = 1;
     for (u32 j = 0; j < expected.size(); j++) {
         if (!expected[j]) continue;
@@ -18,9 +27,26 @@ static void check_row(Accumulator &acc, bool scan, const std::vector<u32> &expec
         throw std::runtime_error("accumulator append/reset mismatch");
 }
 
-int main()
+static void run_checks()
 {
     for (u32 n : {1u, 65u, 6143u, 8192u}) {
+        // One bitmap row mixing words take_simd() handles with compresses (64 and exactly 8
+        // bits) and with the scalar loop (7 bits and 1 bit).
+        {
+            Accumulator acc(n);
+            std::vector<u32> expected(n, 0);
+            std::vector<Entry> entries;
+            for (u32 j = 0; j < n; j++) {
+                const u32 w = j / 64, b = j % 64;
+                const bool on = w % 4 == 0 ? true : w % 4 == 1 ? b < 7 : w % 4 == 2 ? b % 8 == 3 : b == 63;
+                if (!on) continue;
+                entries.push_back({j, 1 + j % 8});
+                expected[j] = 3 * (1 + j % 8);
+            }
+            acc.add(3, entries.data(), entries.size());
+            check_row(acc, false, expected);
+            check_row(acc, false, std::vector<u32>(n, 0));
+        }
         if (dense_hot_row(0, n) || !dense_hot_row((n + 3) / 4, n) ||
             dense_hot_row((n - 1) / 4, n))
             throw std::runtime_error("dense hot density threshold mismatch");
@@ -86,5 +112,13 @@ int main()
             check_row(mixed, true, std::vector<u32>(n, 0));
         }
     }
-    std::puts("PASS accumulator bitmap/scan/dense-hot mixing and reset, density/auto thresholds and large sums");
+}
+
+int main()
+{
+    run_checks();
+    simd_take = true;
+    run_checks();
+    std::printf("PASS accumulator bitmap/scan/dense-hot mixing and reset, density/auto thresholds and large sums; "
+                "scalar and SIMD take (avx512=%d)\n", EMIT_AVX512 ? 1 : 0);
 }

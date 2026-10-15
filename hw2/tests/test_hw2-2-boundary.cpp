@@ -24,8 +24,9 @@ int main(int argc, char **argv)
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     try {
         const HotConfig cfg = hot_config(MPI_COMM_WORLD, rank);
-        if (!cfg.enabled || cfg.accum != AccumulatorMode::Auto || cfg.dense || cfg.bytes != (u64(256) << 20))
-            throw std::runtime_error("submission defaults are not hot=1, auto, dense=0, cache=256MiB");
+        if (!cfg.enabled || cfg.accum != AccumulatorMode::Auto || cfg.dense || cfg.emit_simd ||
+            cfg.bytes != (u64(256) << 20))
+            throw std::runtime_error("submission defaults are not hot=1, auto, dense=0, emit_simd=0, cache=256MiB");
         for (int test = 0; test < 6; test++) {
             const u32 M = test == 5 ? 1 : 3, K = 5, N = test == 5 ? 1 : 8192;
             Rows A(M), B(K);
