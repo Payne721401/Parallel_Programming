@@ -6,17 +6,17 @@ the accumulation and extraction of partial C rows.
 
 ## Modes
 
-- `PP_ACCUM=bitmap` (default): existing word-batched bitmap accumulator.
+- `PP_ACCUM=bitmap`: existing word-batched bitmap accumulator.
 - `PP_ACCUM=scan`: direct uint32 multiply-add without bitmap maintenance; scan
   all N columns in order, append nonzeros, and clear the accumulator after each
   partial row. This remains exact even for sparse or empty output.
-- `PP_ACCUM=auto`: scan when that rank's partial row has at least `8*N` scalar
+- `PP_ACCUM=auto` (submission default): scan when that rank's partial row has at least `8*N` scalar
   products, otherwise bitmap. This initial heuristic is NOT a measured optimum
   and does not assume that the output is dense. It uses runtime work and shape,
   never case names. Selection is made once per output row; the scalar loop has
   no mode branch. Both paths reset all their touched state before switching.
 
-The final merge always uses bitmap. `PP_HOT` still defaults to zero; the wrapper
+The final merge always uses bitmap. `PP_HOT` now defaults to one; the wrapper
 enables it equally for baseline and candidates. `PP_HOT_REPORT=1` also prints
 `[hw2-2-accum]` with the selected mode. Profiling adds `acc-scan-rows`,
 `acc-bitmap-rows` and `acc-scan-products`; row counters exclude zero-product rows.

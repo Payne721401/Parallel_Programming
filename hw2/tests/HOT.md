@@ -7,8 +7,8 @@ C retains A's original row ownership and canonical CSR ordering.
 
 ## Candidate
 
-- `PP_HOT=0` (default): original K-split path.
-- `PP_HOT=1`: count references to each B row, multiply by its length, and select
+- `PP_HOT=0`: original K-split path, retained as an explicit fallback.
+- `PP_HOT=1` (submission default): count references to each B row, multiply by its length, and select
   high-work rows from overloaded owners. Cache entries are bounded by
   `PP_HOT_MB` (default 256 MiB per node, range 0..512; zero disables the cache).
 - One MPI shared window per node holds the selected B rows, ordered by global k.
@@ -150,7 +150,7 @@ Whole-run phase maxima and per-round compute scopes differ (setup/cleanup may
 fall outside a round). Do not add phase maxima or nested subfields together.
 Profiling totals include row timers, extra bound accounting and final reporting;
 only normal builds and judge establish performance. No additional speedup is
-expected from this diagnostics-only change. `PP_HOT` still defaults to zero.
+expected from this diagnostics-only change. The later submission default is `PP_HOT=1`.
 
 After committing and pushing, run just p01-p03 twice at the practice shape:
 

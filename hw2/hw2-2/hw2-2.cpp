@@ -5,11 +5,11 @@
 // goes to it: every entry a = A[i, k] is sent to the rank holding B's row k, which adds
 // a * B[k, :] into its piece of C's row i. The pieces then go to the rank that owns row i (it
 // owns A's row i) and are summed there. This remains the default and the cold-row path.
-// PP_HOT=1 optionally shares selected B rows once per node and assigns each output row's
+// PP_HOT=1 (default) shares selected B rows once per node and assigns each output row's
 // hot work to one worker, weighted by products and the workers' remaining cold work.
 // PP_HOT_MB bounds that cache per node (default 256, range 0..512). PP_HOT_REPORT=1 prints
 // the selected plan even in a normal build; profiling builds report it by default.
-// PP_ACCUM=bitmap (default), scan, or auto changes only partial-row accumulation.
+// PP_ACCUM=auto (default), bitmap, or scan changes only partial-row accumulation.
 // PP_HOT_DENSE=1 adds a node-shared uint8 shadow of hot rows with density >= 1/4.
 // Only scan-selected partial rows use it; CSR sharing and scheduling stay unchanged.
 //
@@ -367,7 +367,7 @@ struct HotConfig {
 
 HotConfig hot_config(MPI_Comm comm, int rank)
 {
-    int opt[5] = {0, 256, Prof::on ? 1 : 0, int(AccumulatorMode::Bitmap), 0};
+    int opt[5] = {1, 256, Prof::on ? 1 : 0, int(AccumulatorMode::Auto), 0};
     if (rank == 0) {
         const char *names[] = {"PP_HOT", "PP_HOT_MB", "PP_HOT_REPORT"};
         for (int i = 0; i < 3; i++) {
