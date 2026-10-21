@@ -1,0 +1,6 @@
+20 12                          # W H
+R1,C3,M0,S8..8,B2..2,NM        # Brian's Brain-like: born on exactly 2, survives only fully surrounded, C3
+torus                          # boundary
+12                             # T
+1
+3 3 14 6 25 2026               # a 14x6 soup at 25%

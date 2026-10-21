@@ -1,0 +1,7 @@
+24 14
+R3,C4,M0,S6..14,B7..10,NN      # radius 3, von Neumann, 4 states
+torus
+20
+2
+0 0 24 14 40 11                # the whole grid at 40%
+8 4 8 6 90 12                  # an 8 x 6 patch at 90%, overlapping it
