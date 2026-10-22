@@ -16,6 +16,30 @@ import sys
 import time
 
 
+PROFILE_TIMES = ["alloc_host_ms", "h2d_ms", "kernels_ms", "d2h_ms", "free_host_ms", "run_host_ms"]
+PROFILE_COLUMNS = ["profile_status", "profile_kernel", *PROFILE_TIMES]
+
+
+def parse_profile(log_text):
+    lines = [line for line in log_text.splitlines() if line.startswith("[PP_PROFILE] ")]
+    if not lines:
+        return ["absent", "", *([""] * len(PROFILE_TIMES))]
+    try:
+        if len(lines) != 1:
+            raise ValueError("expected one profile per process")
+        fields = dict(token.split("=", 1) for token in lines[0].split()[1:])
+        if fields["kernel"] not in ("naive", "tiled", "none"):
+            raise ValueError("invalid profile kernel")
+        times = [float(fields[name]) for name in PROFILE_TIMES]
+        if any(not math.isfinite(value) or value < 0 for value in times):
+            raise ValueError("invalid profile duration")
+        return ["ok", fields["kernel"], *times]
+    except (KeyError, ValueError):
+        # Preserve correctness/Compute time results, but do not present malformed
+        # diagnostic values as valid measurements. The original log is retained.
+        return ["invalid", "", *([""] * len(PROFILE_TIMES))]
+
+
 def run_cases(args):
     paths = [Path(p) for p in args.inputs] if args.inputs else sorted(Path("examples").rglob("*.txt"))
     if not paths:
@@ -41,7 +65,7 @@ def run_cases(args):
     failed = 0
     with (outdir / "results.tsv").open("w", newline="", encoding="utf-8") as table:
         writer = csv.writer(table, delimiter="\t")
-        writer.writerow(["case", "verdict", "compute_s", "wall_s", "limit_s"])
+        writer.writerow(["case", "verdict", "compute_s", "wall_s", "limit_s", *PROFILE_COLUMNS])
         for number, (path, golden) in enumerate(cases):
             stem = f"{number:02d}-{path.stem}"
             output = outdir / f"{stem}.out"
@@ -63,7 +87,9 @@ def run_cases(args):
                 except subprocess.TimeoutExpired:
                     verdict = "WALL_TIMEOUT"
             wall = time.monotonic() - start
-            match = re.search(r"Compute time:\s*([0-9.eE+-]+)\s*s", log.read_text(encoding="utf-8", errors="replace"))
+            log_text = log.read_text(encoding="utf-8", errors="replace")
+            profile = parse_profile(log_text)
+            match = re.search(r"Compute time:\s*([0-9.eE+-]+)\s*s", log_text)
             if match:
                 try:
                     compute = float(match.group(1))
@@ -89,9 +115,12 @@ def run_cases(args):
                     if verdict == "PENDING":
                         verdict = "WA" if not same else "TLE" if limit is not None and compute > limit else "AC"
             failed += verdict != "AC"
-            writer.writerow([str(path), verdict, "" if compute is None else compute, f"{wall:.6f}", limit or ""])
+            writer.writerow([str(path), verdict, "" if compute is None else compute, f"{wall:.6f}", limit or "", *profile])
             table.flush()
             print(f"{path}: {verdict} compute={compute} wall={wall:.3f}s limit={limit}", flush=True)
+            if profile[0] != "absent":
+                print("  " + " ".join(f"{key}={value}" for key, value in zip(PROFILE_COLUMNS, profile)
+                                       if value != ""), flush=True)
     print(f"PASS {len(cases)-failed}/{len(cases)}; logs: {outdir}")
     return 1 if failed else 0
 
