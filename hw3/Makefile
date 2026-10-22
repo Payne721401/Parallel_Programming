@@ -16,7 +16,13 @@ endif
 hw3-1: main.cu hw3-1.cu ca.hpp
 	$(NVCC) $(NVCCFLAGS) main.cu hw3-1.cu -o $@
 
+hw3-1-seq: main.cu original_version/hw3-1.cu ca.hpp
+	$(NVCC) $(NVCCFLAGS) -I. main.cu original_version/hw3-1.cu -o $@
+
+tests/test_hw3-1: tests/test_hw3-1.cu hw3-1.cu original_version/hw3-1.cu ca.hpp
+	$(NVCC) $(NVCCFLAGS) -I. tests/test_hw3-1.cu hw3-1.cu -o $@
+
 clean:
-	rm -f hw3-1
+	rm -f hw3-1 hw3-1-seq tests/test_hw3-1
 
 .PHONY: clean
