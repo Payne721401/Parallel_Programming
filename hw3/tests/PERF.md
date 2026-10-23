@@ -2,12 +2,19 @@
 
 ## Status
 
-The counting algorithm defaults to R>=5 tiled prefix sums, otherwise direct
-neighbour counting. `PP_KERNEL=auto|naive|tiled` controls counting independently
+Dense counting defaults to R>=5 tiled prefix sums, otherwise direct counting.
+Sparse R1 now has a packed-byte/shared-memory candidate enabled by default;
+this newest change still needs Nano5 compilation and GPU validation.
+`PP_R1=direct` restores the measured old sparse R1 path; `PP_R1=packed` requests
+the candidate for R1 sparse entry. Other radii and dense entry are unaffected.
+`PP_KERNEL=auto|naive|tiled` controls counting independently
 of `PP_ACTIVE=auto|0|1`, which controls scheduling. Both defaults are `auto`.
-The new sparse candidate is implemented but still needs Nano5 compilation,
-correctness checks, and public timing. No sparse performance result exists yet.
-No graph, mapped-host, or bit-packed path is enabled. The initial copy,
+User logs confirm the sparse candidate's main executable compiled on Nano5.
+Single-case judge results are 08 TLE 1.333 s, 09 AC 0.571 s, and 10 TLE 0.989 s.
+The small CUDA reference gates remain unrun: the test executable failed to
+compile its mixed pair initializer list; a local explicit-array fix is pending
+Nano5 verification. The later profiling run below confirms 08/10 correctness too.
+No graph, mapped-host, or one-bit-per-cell path is enabled. The initial copy,
 allocations, launches, final copy, and frees are inside `run()` and count toward
 the official Compute time. T=0 returns without allocating anything.
 Optional `PP_PROFILE=1` diagnostics report phase times to stderr; unset or 0
@@ -22,9 +29,100 @@ default-dispatch fix, not the current sparse changes. No same-allocation
 A/B result has been supplied; do not treat historical ratios as precise speedups.
 The original reference and the fixed main.cu/ca.hpp are unchanged.
 
-## Sparse candidate (2026-10-23; GPU validation pending)
+## R1 profile evidence and packed candidate (2026-10-23)
+
+Job 402205, logs tmp/baseline-20261023-222106-306461, user supplied:
+
+| Case | Compute s | H2D ms | Kernel interval ms | D2H ms | Initial work | Mean work | Max work | Dense steps |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 08 | 1.268750 | 19.515808 | 1225.694702 | 21.062592 | 4549 | 9230.788462 | 12893 | 0 |
+| 10 | 0.994618 | 19.541344 | 951.790039 | 20.806784 | 23487 | 38371.295107 | 54638 | 0 |
+
+Both report sparse_selected=1, profile_kernel=sparse_naive, and 524288 total
+tiles. The runner's TLE verdict is assigned only after the official checker
+accepts the output; PASS 0/2 and exit code 1 mean both missed the time limits,
+not failed output validation. The two profiles completed successfully.
+
+Mean scheduled fractions are 1.761% and 7.319%; the kernel intervals account
+for 96.606% and 95.694% of Compute. Those intervals still include discovery,
+queue management and launch gaps: they do not isolate arithmetic vs atomics.
+Scheduled cell updates over all generations are 68,812,943,360 and
+51,394,205,696, including inactive cells within scheduled tiles.
+
+The next candidate replaces only R1 sparse tile arithmetic with four byte lanes
+per uint32_t plus shared-memory staging. Each 64x32 tile loads 18x34 words (one
+word halo horizontally, one row vertically). State and alive tables together
+use 4896 bytes. Each of 256 threads updates two words/eight cells. Counts never
+exceed nine per byte, so sums have no inter-byte carry; comparisons use high-bit
+sentinels to prevent inter-byte borrow. General C2..C16 transitions are handled.
+Aligned rows use 32-bit memory operations; other widths use scalar packing and
+valid-byte masking. Grid storage stays one byte per cell; this is instruction
+packing, not a fourfold reduction in grid storage or a measured speedup.
+
+Scheduling, tile dimensions, worklist atomics, fallback thresholds and full-grid
+copies are unchanged. PP_R1=auto selects packed only for sparse R1 with automatic
+PP_KERNEL. Explicit PP_KERNEL=naive preserves direct unless PP_R1=packed is set;
+PP_KERNEL=tiled takes precedence. Profile reports sparse_r1 for the new path.
+
+Local validation: test_r1_packed.cpp compiled with GCC C++17/O2 and warnings as
+errors; 20,079,304 scalar comparisons of the exact production header passed.
+These exhaust byte equality, count ranges, C2..C16 transitions and compare
+random packed Moore/diamond neighbourhoods with scalar counts. GPU memory
+accesses, barriers, and performance remain unverified. The new runner has Bash
+syntax/Slurm guard checks and its profile label is accepted by the parser.
+
+Next run, after committing/pushing the new header and all related changes:
+
+```bash
+cd ~/Parallel_Programming && git pull && cd hw3
+unset PP_KERNEL PP_ACTIVE PP_R1 PP_PROFILE
+make hw3-1 tests/test_hw3-1 &&
+srun -A ACD115218 -p dev -N1 -n1 -c4 \
+  --gpus-per-node=1 -t 2 bash tests/run_r1.sh profile
+```
+
+This runs 64 R1 boundary/rule comparisons and 30 sparse regressions before
+profiling only 08/10 with default dispatch. No public 09 rerun or full judge.
+Use the printed session.log; expected candidate label is sparse_r1. Optional
+`ab` runs direct/packed/packed/direct without profiling in the same allocation;
+do not add this routinely before the first candidate result is known.
+Submission now also needs r1_packed.hpp beside tile_geometry.hpp and hw3-1.cu.
+Suggested commit: `hw3-1: pack R1 sparse updates into shared-memory byte lanes`.
+
+## Sparse candidate (2026-10-23; partial GPU validation)
 
 Implementation walkthrough: [SPARSE.md](SPARSE.md).
+
+User-supplied single-case judge results (separate jobs, no phase profiling):
+
+| Case | Verdict | Compute seconds | Limit seconds | GPU seconds held |
+| --- | --- | ---: | ---: | ---: |
+| 08 | TLE | 1.333 | 0.7 | 4 |
+| 09 | AC | 0.571 | 0.7 | 3 |
+| 10 | TLE | 0.989 | 0.7 | 4 |
+
+The judge excerpts do not print a revision or chosen kernel. Local HEAD is
+ccd2825, with the test initializer fix uncommitted. These are observed timings,
+not a controlled speedup measurement. Case 09 is verified correct within its
+limit; 08/10 require checker confirmation and bottleneck diagnosis. Both have
+R=1, whose default counting algorithm is direct rather than prefix sums; actual
+sparse selection, work density, and dense fallback are not yet observed.
+
+Next diagnostic: only 08 and 10 in one bounded allocation, using the already
+built main binary (no dependency on the test executable or its pending fix):
+
+```bash
+srun -A ACD115218 -p dev -N1 -n1 -c4 --gpus-per-node=1 -t 1 \
+  env -u PP_KERNEL -u PP_ACTIVE PP_PROFILE=1 \
+  python3 tests/run_cases.py --checker hw3-1-check --wall-timeout 15 \
+  cases/08.txt cases/10.txt
+```
+
+Run from hw3/. The runner writes a unique tmp/baseline-TIMESTAMP directory,
+prints phase/worklist fields, and checks outputs even when compute exceeds the
+limit. TLE makes the runner exit 1 after both inputs; a Slurm exit-code message
+then need not mean a CUDA failure. Inspect each case verdict and retained log.
+Do not rerun 09, the full judge, or the full profile script just for this diagnosis.
 
 - Auto inspects initial state only for >=2^28 cells and >=128 generations.
   A GPU scan marks nonzero tiles; a second kernel constructs the radius-dilated
@@ -45,7 +143,8 @@ Implementation walkthrough: [SPARSE.md](SPARSE.md).
   sparsity after that switch. Forced entry retains this safeguard.
 - Initial dst is zeroed once; no full-grid memset occurs per generation.
   A provably empty initial grid skips all evolution launches. Final D2H remains
-  a full-grid copy. Include `tile_geometry.hpp` beside `hw3-1.cu` in submission.
+  a full-grid copy. Include `tile_geometry.hpp` and `r1_packed.hpp` beside
+  `hw3-1.cu` in submission.
 
 Profile additions (`PP_PROFILE=1`):
 

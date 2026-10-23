@@ -1,7 +1,8 @@
 # Sparse 實作導讀
 
 本版為 08～10 這類大圖、多代、局部活動問題加入工作清單。演算法根據
-規則與實際非零狀態選擇路徑，不依 case 編號或種子。CUDA 尚待 Nano5 驗證。
+規則與實際非零狀態選擇路徑，不依 case 編號或種子。原 sparse/direct 版
+已通過 08～10 的答案檢查，其中 09 過時限；新 packed R1 版尚待 GPU 驗證。
 
 ## 1. 分開「計數」與「排程」
 
@@ -10,9 +11,10 @@
 取得 tile 座標，再呼叫同一個計數函式。`Track=false` 時編譯器不產生
 非零追蹤的兩次 block reduction。
 
-小半徑 sparse 使用 `update_direct<Track>`，一個 block 的 256 threads
+原本小半徑 sparse 使用 `update_direct<Track>`，一個 block 的 256 threads
 共同覆蓋 64×32 格，每 thread 最多更新 8 格。每格寫入位置互不重疊，
 細胞資料不需要 atomic。大半徑仍使用原有 shared-memory prefix sums。
+最新 R1 替換路徑見第 9 節；direct 路徑保留供比較。
 
 ## 2. 先建立正確的 tile 影響範圍
 
@@ -106,5 +108,30 @@ barriers／atomics。`test_hw3-1 --sparse` 才會執行真正 CUDA 路徑，逐�
 `sparse_dense_steps` 可判斷後來是否轉為 dense。正式 Compute time 才是
 判斷是否過時限的指標，不能只看工作比例。
 
-目前仍完整 H2D／D2H，未加入 CUDA Graphs 或選擇性回傳。先用一次量測
-確定剩餘瓶頸，再決定下一個改動。繳交時需附上 `tile_geometry.hpp`。
+目前仍完整 H2D／D2H，未加入 CUDA Graphs 或選擇性回傳。
+
+## 9. R1：shared memory 與四個 byte 的並行計數
+
+Job 402205 確認 08／10 的 sparse 有啟用、平均工作比例僅 1.76%／7.32%，
+沒有切回 dense，但 kernel 區間仍佔 95～97%。這個區間包含排程，尚不能
+斷言全是鄰居計數成本。新候選先降低區塊內計算成本，保留排程供比較。
+
+`update_r1_packed` 將四個相鄰格子放入一個 uint32_t，各佔一個 byte。
+先合作載入 tile 加 halo，再把 `state==1` 轉成每 byte 一個 0/1 指示值。
+透過位移對齊左右鄰居、整數加法累加上下列，一次求出四格的鄰居數。
+每 byte 的總和最多為 9，不會進位到旁邊的格子。這是 SWAR 的用法：
+在一個 register 裡安排多個獨立的小整數運算；grid 本身仍是一格一 byte。
+
+`r1_packed.hpp::in_range` 對每個 byte 加上高位哨兵，再相減比較上下界，
+避免跨 byte 借位。`next` 保留 C2..C16 的出生、存活與衰退規則。這些純
+運算函式由 CPU 與 CUDA 共用，已做 20,079,304 次 scalar 對照。
+
+一個 tile 的 state/alive shared tables 合計 4896 bytes。輸出仍是每 thread
+八格，但改成兩個 word。寬度為四的倍數時用對齊的 32-bit load/store；
+其他寬度逐 byte 打包，尾端不合法的 bytes 不得寫出或納入非零旗標。
+
+`PP_R1=direct` 可重現舊計數；預設在 sparse R1 路徑使用 packed，profile
+標籤為 `sparse_r1`。R5 前綴和與 sparse 管理邏輯不變。新的 `run_r1.sh`
+先跑 94 次小圖 reference 比對，再只量 08／10。執行命令見 PERF.md。
+
+繳交時需附上 `tile_geometry.hpp` 與 `r1_packed.hpp`。

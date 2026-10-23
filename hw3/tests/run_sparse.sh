@@ -23,11 +23,11 @@ git status --short
 nvidia-smi --query-gpu=name,driver_version --format=csv
 
 echo 'Gate 1: dense refactor, 22 CPU-reference comparisons'
-env -u PP_KERNEL PP_ACTIVE=0 PP_PROFILE=0 timeout 15s ./tests/test_hw3-1 --quick
+env -u PP_KERNEL -u PP_R1 PP_ACTIVE=0 PP_PROFILE=0 timeout 15s ./tests/test_hw3-1 --quick
 echo 'Gate 2: forced sparse entry, 22 rule/radius/boundary comparisons'
-env -u PP_KERNEL PP_ACTIVE=1 PP_PROFILE=0 timeout 15s ./tests/test_hw3-1 --quick
+env -u PP_KERNEL -u PP_R1 PP_ACTIVE=1 PP_PROFILE=0 timeout 15s ./tests/test_hw3-1 --quick
 echo 'Gate 3: sparse motion, decay, stale-buffer cleanup, and growth fallback, 30 comparisons'
-env -u PP_KERNEL PP_ACTIVE=1 PP_PROFILE=0 timeout 25s ./tests/test_hw3-1 --sparse
+env -u PP_KERNEL -u PP_R1 PP_ACTIVE=1 PP_PROFILE=0 timeout 25s ./tests/test_hw3-1 --sparse
 if [[ $mode == gate ]]; then
     echo "Correctness gates passed; logs: $logdir"
     exit 0
@@ -38,7 +38,7 @@ if [[ $mode == profile ]]; then profile=1; fi
 echo "Public cases: PP_KERNEL/PP_ACTIVE unset (judge defaults), PP_PROFILE=$profile"
 for case_id in 08 09 10; do
     status=0
-    env -u PP_KERNEL -u PP_ACTIVE PP_PROFILE=$profile python3 tests/run_cases.py \
+    env -u PP_KERNEL -u PP_ACTIVE -u PP_R1 PP_PROFILE=$profile python3 tests/run_cases.py \
         --checker hw3-1-check --wall-timeout 15 --outdir "$logdir/$case_id" \
         "cases/$case_id.txt" || status=$?
     # Correct-but-slow outputs are useful diagnostics. Never proceed after

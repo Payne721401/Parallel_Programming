@@ -1,6 +1,7 @@
 // PP_KERNEL=auto|naive|tiled selects the neighbour-counting algorithm.
 // PP_ACTIVE=auto|0|1 selects adaptive, dense, or forced sparse entry.
 // Sparse entry always retains the one-way dense fallback on growth.
+// PP_R1=auto|direct|packed controls R1 sparse counting; auto uses packed.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -11,6 +12,7 @@
 
 #include "ca.hpp"
 #include "tile_geometry.hpp"
+#include "r1_packed.hpp"
 
 namespace {
 
@@ -286,6 +288,89 @@ __device__ unsigned update_direct(const uint8_t *__restrict__ src,
     return 0;
 }
 
+constexpr int R1_WORDS = TILE_W / 4;
+constexpr int R1_PITCH = R1_WORDS + 2;
+constexpr int R1_WORD_COUNT = (TILE_H + 2) * R1_PITCH;
+constexpr size_t R1_SHARED_BYTES = 2 * R1_WORD_COUNT * sizeof(uint32_t);
+static_assert(TILE_W % 4 == 0, "packed R1 tiles must contain whole words");
+
+// Called only with x a multiple of four. Aligned rows use one 32-bit load.
+// Non-multiple-of-four widths use scalar packing, including torus seam words.
+__device__ uint32_t load_r1_word(const uint8_t *src, const Problem &p, int x, int y) {
+    const bool torus = p.boundary == Boundary::Torus;
+    if (torus) y = wrap_halo(y, p.height);
+    else if (y < 0 || y >= p.height) return 0;
+    if ((p.width & 3) == 0) {
+        if (torus) x = wrap_halo(x, p.width);
+        if (x >= 0 && x + 3 < p.width)
+            return *reinterpret_cast<const uint32_t *>(src + size_t(y) * p.width + x);
+        return 0; // dead boundary, entire aligned word is outside the grid
+    }
+    uint32_t word = 0;
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+        int gx = x + b;
+        if (torus) gx = wrap_halo(gx, p.width);
+        if (gx >= 0 && gx < p.width)
+            word |= uint32_t(src[size_t(y) * p.width + gx]) << (8 * b);
+    }
+    return word;
+}
+
+template <bool Moore, bool Track>
+__device__ unsigned update_r1_packed(const uint8_t *__restrict__ src,
+                                     uint8_t *__restrict__ dst, const Problem &p,
+                                     int x0, int y0, uint32_t *words) {
+    const int tid = int(threadIdx.y) * 32 + int(threadIdx.x);
+    uint32_t *alive = words + R1_WORD_COUNT;
+    for (int i = tid; i < R1_WORD_COUNT; i += 256) {
+        const int x = x0 + (i % R1_PITCH - 1) * 4;
+        const int y = y0 + i / R1_PITCH - 1;
+        const uint32_t s = load_r1_word(src, p, x, y);
+        words[i] = s;
+        alive[i] = r1_packed::equal(s, 1);
+    }
+    __syncthreads();
+    unsigned flags = 0;
+    for (int i = tid; i < R1_WORDS * TILE_H; i += 256) {
+        const int x = x0 + (i % R1_WORDS) * 4, y = y0 + i / R1_WORDS;
+        if (x >= p.width || y >= p.height) continue;
+        const int q = (i / R1_WORDS + 1) * R1_PITCH + i % R1_WORDS + 1;
+        uint32_t counts;
+        if constexpr (Moore) {
+            counts = r1_packed::count<true>(
+                alive[q-R1_PITCH-1], alive[q-R1_PITCH], alive[q-R1_PITCH+1],
+                alive[q-1], alive[q], alive[q+1],
+                alive[q+R1_PITCH-1], alive[q+R1_PITCH], alive[q+R1_PITCH+1], p.rule.count_centre);
+        } else {
+            counts = r1_packed::count<false>(0, alive[q-R1_PITCH], 0,
+                alive[q-1], alive[q], alive[q+1], 0, alive[q+R1_PITCH], 0, p.rule.count_centre);
+        }
+        const uint32_t input = words[q];
+        const uint32_t output = r1_packed::next(input, counts, p.rule);
+        const size_t index = size_t(y) * p.width + x;
+        // Invalid tail bytes may hold wrapped halo values. They must neither
+        // be stored nor contribute to the tile's nonzero flags.
+        const int valid = p.width - x < 4 ? p.width - x : 4;
+        const uint32_t mask = valid == 4 ? 0xffffffffu : (1u << (8 * valid)) - 1u;
+        if ((p.width & 3) == 0) {
+            *reinterpret_cast<uint32_t *>(dst + index) = output;
+        } else {
+#pragma unroll
+            for (int b = 0; b < 4; ++b)
+                if (b < valid) dst[index + b] = uint8_t(output >> (8 * b));
+        }
+        if constexpr (Track)
+            flags |= unsigned((input & mask) != 0) | (unsigned((output & mask) != 0) << 1);
+    }
+    if constexpr (Track) {
+        const unsigned input_nonzero = __syncthreads_or((flags & 1) != 0);
+        const unsigned output_nonzero = __syncthreads_or((flags & 2) != 0);
+        return input_nonzero | (output_nonzero << 1);
+    }
+    return 0;
+}
+
 struct TileQueue {
     int *ids;
     int *count;
@@ -357,12 +442,13 @@ __global__ void prepare_sparse(TileQueue current, TileQueue next, int *dense,
     }
 }
 
-template <bool Tiled, bool Moore>
+template <bool Tiled, bool Moore, bool Packed = false>
 __global__ void step_sparse(const uint8_t *__restrict__ src,
                             uint8_t *__restrict__ dst, Problem p,
                             TileQueue current, TileQueue next, int *stamp, int epoch,
                             const int *dense, int tiles_x, int tile_count) {
-    extern __shared__ uint16_t sums[];
+    extern __shared__ uint32_t scratch[];
+    uint16_t *sums = reinterpret_cast<uint16_t *>(scratch);
     const bool full = *dense != 0;
     const int count = full ? tile_count : *current.count;
     for (int i = int(blockIdx.x); i < count; i += int(gridDim.x)) {
@@ -371,10 +457,12 @@ __global__ void step_sparse(const uint8_t *__restrict__ src,
         unsigned flags = 0;
         if (full) {
             // One-way dense fallback: no flag reductions or queue atomics.
-            if constexpr (Tiled) update_tiled<Moore, false>(src, dst, p, x0, y0, sums);
+            if constexpr (Packed) update_r1_packed<Moore, false>(src, dst, p, x0, y0, scratch);
+            else if constexpr (Tiled) update_tiled<Moore, false>(src, dst, p, x0, y0, sums);
             else update_direct<false>(src, dst, p, x0, y0);
         } else {
-            if constexpr (Tiled) flags = update_tiled<Moore, true>(src, dst, p, x0, y0, sums);
+            if constexpr (Packed) flags = update_r1_packed<Moore, true>(src, dst, p, x0, y0, scratch);
+            else if constexpr (Tiled) flags = update_tiled<Moore, true>(src, dst, p, x0, y0, sums);
             else flags = update_direct<true>(src, dst, p, x0, y0);
             if (threadIdx.x == 0 && threadIdx.y == 0) {
                 // W_(t+1) = dilation(A_(t+1)) union A_t. The second term
@@ -461,6 +549,15 @@ void run(uint8_t *grid, const Problem &p) {
         std::exit(EXIT_FAILURE);
     }
     const bool tiled = automatic ? p.rule.radius >= 5 : forced_tiled;
+    const char *r1_mode = std::getenv("PP_R1");
+    const bool r1_auto = !r1_mode || std::strcmp(r1_mode, "auto") == 0;
+    const bool r1_force = r1_mode && std::strcmp(r1_mode, "packed") == 0;
+    if (!r1_auto && !r1_force && std::strcmp(r1_mode, "direct") != 0) {
+        std::fprintf(stderr, "hw3-1: PP_R1 must be auto, direct or packed\n");
+        std::exit(EXIT_FAILURE);
+    }
+    // Respect an explicit PP_KERNEL=naive baseline unless packed is requested.
+    const bool packed = p.rule.radius == 1 && !tiled && (r1_force || (r1_auto && automatic));
     const size_t bytes = size_t(p.width) * p.height;
     const char *active = std::getenv("PP_ACTIVE");
     const bool adaptive = !active || std::strcmp(active, "auto") == 0;
@@ -501,7 +598,15 @@ void run(uint8_t *grid, const Problem &p) {
             prepare_sparse<<<1, 1>>>(current, next, sparse_work.counts + 2,
                                       sparse_work.tile_count, sparse_work.stats);
             check(cudaGetLastError(), "launch prepare_sparse");
-            if (!tiled)
+            if (packed && p.rule.shape == Shape::Moore)
+                step_sparse<false, true, true><<<sparse_work.workers, threads, R1_SHARED_BYTES>>>(
+                    src, dst, p, current, next, sparse_work.stamp, t + 1,
+                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count);
+            else if (packed)
+                step_sparse<false, false, true><<<sparse_work.workers, threads, R1_SHARED_BYTES>>>(
+                    src, dst, p, current, next, sparse_work.stamp, t + 1,
+                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count);
+            else if (!tiled)
                 step_sparse<false, false><<<sparse_work.workers, threads>>>(
                     src, dst, p, current, next, sparse_work.stamp, t + 1,
                     sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count);
@@ -538,7 +643,8 @@ void run(uint8_t *grid, const Problem &p) {
     check(cudaFree(src), "free source");
     sparse_work.release();
     if (profile.enabled) profile.free_host_ms = PhaseProfile::elapsed_ms(free_start);
-    profile.report(sparse ? (tiled ? "sparse_tiled" : "sparse_naive") : (tiled ? "tiled" : "naive"), p);
+    profile.report(sparse ? (packed ? "sparse_r1" : tiled ? "sparse_tiled" : "sparse_naive")
+                         : (tiled ? "tiled" : "naive"), p);
     if (profile.enabled && inspect_sparse)
         std::fprintf(stderr,
             "[PP_SPARSE] selected=%d tiles_total=%d initial_work=%d work_sum=%llu "

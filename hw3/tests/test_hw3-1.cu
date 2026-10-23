@@ -6,7 +6,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
-#include <utility>
 #include <vector>
 #include "ca.hpp"
 
@@ -64,8 +63,9 @@ static void sparse_checks(std::mt19937 &rng) {
         compare(p, initial); // death must clear the reused source buffer
         p.rule = life;
         std::fill(initial.begin(), initial.end(), 0);
-        for (auto origin : {std::pair<int,int>{62,30}, {319,159}}) {
-            const int x = origin.first, y = origin.second;
+        const int origins[][2] = {{62, 30}, {319, 159}};
+        for (const auto &origin : origins) {
+            const int x = origin[0], y = origin[1];
             put(x+1,y,1); put(x+2,y+1,1);
             put(x,y+2,1); put(x+1,y+2,1); put(x+2,y+2,1);
         }
@@ -110,25 +110,63 @@ static void sparse_checks(std::mt19937 &rng) {
     std::printf("PASS %d/%d (sparse full-grid comparison; not timing)\n", tested, tested);
 }
 
+static void r1_checks(std::mt19937 &rng) {
+    const int state_counts[] = {2, 3, 3, 16, 4, 2, 16, 4};
+    for (int width : {3, 4, 65, 68, 128, 129, 641, 644})
+    for (int mode = 0; mode < 8; ++mode) {
+        const bool moore = (mode & 1) == 0;
+        const bool torus = (mode & 2) != 0;
+        const bool centre = (mode & 4) != 0;
+        const int maxn = (moore ? 8 : 4) + int(centre);
+        Rule r{1, state_counts[mode], centre, int(centre), maxn, 2, 2,
+               moore ? Shape::Moore : Shape::VonNeumann};
+        if (moore && r.states == 2 && !centre) {
+            r.survive_lo = 2; r.survive_hi = 3; r.birth_lo = 3; r.birth_hi = 3;
+        } else if (moore && r.states == 3 && !centre) {
+            r.survive_lo = 8; r.survive_hi = 8; // same R1/C3 rule family as public 10
+        }
+        // Largest grids leave enough empty tiles that the separated patches
+        // exercise tracking, rather than immediately taking dense fallback.
+        Problem p{width, width < 65 ? 7 : width >= 641 ? 321 : 161, r,
+                  torus ? Boundary::Torus : Boundary::Dead, 3 + mode % 3};
+        std::vector<uint8_t> initial(size_t(p.width)*p.height, 0);
+        // Local patches cross word/tile boundaries; thin tails and both seams
+        // exercise scalar packing, vector loads/stores, and valid-byte masking.
+        for (int y = 0; y < p.height; ++y)
+            for (int x = 0; x < p.width; ++x)
+                if ((x < 6 || x >= width-6 || (x >= 60 && x <= 69))
+                        && (y < 6 || y >= p.height-6 || (y >= 29 && y <= 35)))
+                    initial[size_t(y)*p.width+x] = uint8_t(rng()%r.states);
+        compare(p, initial);
+    }
+    std::printf("PASS %d/%d (R1 packed boundaries and rules; not timing)\n", tested, tested);
+}
+
 int main(int argc, char **argv) {
     int random_cases = 64;
     unsigned seed = 20261022;
     const bool quick = argc == 2 && std::strcmp(argv[1], "--quick") == 0;
     const bool sparse = argc == 2 && std::strcmp(argv[1], "--sparse") == 0;
+    const bool r1 = argc == 2 && std::strcmp(argv[1], "--r1") == 0;
     if (argc > 3) {
-        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1\n", argv[0]);
         return 2;
     }
-    if (argc >= 2 && !quick && !sparse) random_cases = std::atoi(argv[1]);
+    if (argc >= 2 && !quick && !sparse && !r1) random_cases = std::atoi(argv[1]);
     if (argc >= 3) seed = unsigned(std::strtoul(argv[2], nullptr, 10));
     if (random_cases < 0 || random_cases > 1000) return 2;
     const char *kernel = std::getenv("PP_KERNEL");
     const char *active = std::getenv("PP_ACTIVE");
-    std::printf("kernel=%s active=%s seed=%u mode=%s random_cases=%d\n",
-                kernel ? kernel : "auto", active ? active : "auto", seed,
-                sparse ? "sparse" : quick ? "quick" : "full", (quick || sparse) ? 0 : random_cases);
+    const char *r1_mode = std::getenv("PP_R1");
+    std::printf("kernel=%s active=%s r1=%s seed=%u mode=%s random_cases=%d\n",
+                kernel ? kernel : "auto", active ? active : "auto", r1_mode ? r1_mode : "auto", seed,
+                r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full", (quick || sparse || r1) ? 0 : random_cases);
     check(cudaFree(nullptr));
     std::mt19937 rng(seed);
+    if (r1) {
+        r1_checks(rng);
+        return 0;
+    }
     if (sparse) {
         sparse_checks(rng);
         return 0;
