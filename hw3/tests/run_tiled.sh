@@ -23,14 +23,17 @@ echo "CUDA_MODULE_LOADING=${CUDA_MODULE_LOADING:-unset}"
 profile=0
 if [[ $mode == profile ]]; then profile=1; fi
 echo "PP_PROFILE=$profile (public cases only; quick correctness checks use 0)"
+if [[ $mode != ab ]]; then
+    echo 'PP_KERNEL=unset: testing the judge default (auto: R>=5 tiled, otherwise naive)'
+fi
 git status --short
 nvidia-smi --query-gpu=name,driver_version --format=csv
-echo 'Correctness gate: tiled vs the original CPU reference, 22 small cases'
-PP_KERNEL=tiled PP_PROFILE=0 timeout 20s ./tests/test_hw3-1 --quick
+echo 'Correctness gate: default dispatch vs the original CPU reference, 22 small cases'
+env -u PP_KERNEL PP_PROFILE=0 timeout 20s ./tests/test_hw3-1 --quick
 
 if [[ $mode != ab ]]; then
     # A first candidate check, not a causal A/B speedup measurement.
-    PP_KERNEL=tiled PP_PROFILE=$profile python3 tests/run_cases.py --checker hw3-1-check \
+    env -u PP_KERNEL PP_PROFILE=$profile python3 tests/run_cases.py --checker hw3-1-check \
         --wall-timeout 8 --outdir "$logdir/tiled" cases/05.txt cases/06.txt cases/07.txt
 else
     # Only after the candidate passes. Limit the A/B run to 05 and 06:

@@ -2,20 +2,21 @@
 
 ## Status
 
-The default CUDA implementation uses one thread per cell, a 32 x 8 thread block,
-two byte grids on the GPU, and one kernel launch per generation. An experimental
-tiled prefix-sum kernel is available via `PP_KERNEL=tiled`; the default remains
-`naive` pending validation. No sparse, graph, mapped-host, or bit-packed path is
-enabled. The initial copy,
+The default is now automatic dispatch: R>=5 uses tiled prefix sums; smaller
+radii use the naive one-thread-per-cell kernel. `PP_KERNEL=auto|naive|tiled`
+allows explicit comparisons; leaving it unset is equivalent to auto. Both
+paths use two byte grids and one kernel launch per generation. No sparse,
+graph, mapped-host, or bit-packed path is enabled. The initial copy,
 allocations, launches, final copy, and frees are inside `run()` and count toward
 the official Compute time. T=0 returns without allocating anything.
 Optional `PP_PROFILE=1` diagnostics report phase times to stderr; unset or 0
 disables all profiling events, clock reads and additional synchronization.
 
-This workstation has no detected nvcc/CUDA toolkit. The user has reported a
-naive judge run (below); candidate GPU compilation, full-grid comparison,
-checker results, and timings remain **unverified**. Do not infer candidate
-performance from its architecture or from CPU tests.
+This workstation has no detected nvcc/CUDA toolkit. User-provided Nano5 logs
+confirm that revision 1cd33f4 compiled, passed 22 tiled reference comparisons,
+and passed the official checker on 05-07 with profiling enabled. The latest
+automatic-dispatch edit still requires a Nano5 build/check. No same-allocation
+A/B result has been supplied; do not treat historical ratios as precise speedups.
 The original reference and the fixed main.cu/ca.hpp are unchanged.
 
 Local checks completed on 2026-10-22:
@@ -96,8 +97,10 @@ a matching output and, if specified, Compute time within the limit. Without
 It never overwrites an old log directory and returns nonzero on any failure.
 
 Record the revision, environment, GPU, allocation ID, correctness and all
-Compute times for each measurement. Future candidate/default changes require
-checker success and alternating A/B runs in the same allocation. The in-memory
+Compute times for each measurement. Require checker success for candidates;
+use alternating A/B runs in the same allocation to establish performance
+differences. The current default integration fixes the unselected validated
+path; R=5 is a conservative heuristic, not a measured optimal crossover. The in-memory
 harness is for correctness; its warm context is not an official timing setup.
 No EAGER global initializer is included in this first version.
 
@@ -157,10 +160,11 @@ activity, not recognize case numbers or seeds.
 
 ## Tiled candidate: short validation before more judge runs
 
-`PP_KERNEL=naive` preserves the baseline; `PP_KERNEL=tiled` selects the candidate
-for either shape and all radii. An invalid nonempty mode is rejected. The
-choice is read once in run(), not once per generation. No default switch or
-performance claim is made before correctness and controlled timing evidence.
+`PP_KERNEL=naive` preserves the baseline; `PP_KERNEL=tiled` forces tiled counting
+for either shape and all radii. Unset or `auto` selects tiled for R>=5 and naive
+otherwise. Invalid values are rejected. The choice is read once in run(), not
+once per generation. The initial candidate was opt-in; its successful user
+validation and subsequent default-routing correction are recorded below.
 
 Each 256-thread block produces a 64 x 32 tile. It loads an R-cell halo as
 alive flags and builds uint16 row prefixes with warp shuffles. Moore adds a
@@ -181,7 +185,8 @@ not an exhaustive replacement for the full correctness suite.
 Candidate-side local checks: Python/Bash syntax, the Slurm guard, ten A/B
 result-gate checks (including refusing WA/RE/timeouts), LF script endings,
 and integer/shared-memory size bounds for R=1..32 passed. CUDA compilation
-and the 22 candidate comparisons still require Nano5; none has run locally.
+and 22 candidate comparisons were later confirmed by the user's Nano5 log;
+none has run locally.
 
 After committing/pushing, on Nano5:
 
@@ -191,7 +196,8 @@ make hw3-1 tests/test_hw3-1 &&
 srun -A ACD115218 -p dev -N1 -n1 -c4 --gpus-per-node=1 -t 1 bash tests/run_tiled.sh
 ```
 
-This runs 22 small byte-for-byte comparisons in one process (20-second safety
+This now unsets PP_KERNEL to test the actual judge default, rather than forcing
+the candidate. It runs 22 small byte-for-byte comparisons in one process (20-second safety
 timeout), then only cases 05, 06 and 07 with the official checker (8-second
 whole-process timeout each). The allocation cap is 1 minute, about 0.83 SU.
 It does not run the full judge or the 206-case suite. Inspect
@@ -209,7 +215,7 @@ srun -A ACD115218 -p dev -N1 -n1 -c4 --gpus-per-node=1 -t 2 bash tests/run_tiled
 The A/B script permits AC/TLE rows (both require a correct output), but stops
 on WA, RE, wall timeout, missing timing/output or tool failure. It skips naive
 07 because the prior TLE+ makes it an expensive baseline. This comparison
-still does not validate an automatic dispatch policy for all other cases.
+still does not establish an optimal radius threshold or performance for all other cases.
 
 Suggested commit message:
 
@@ -271,7 +277,8 @@ never emit a profile line; its missing measurements remain blank, not zero.
 
 CUDA timing API reference:
 [CUDA 12.4 Event Management](https://docs.nvidia.com/cuda/archive/12.4.0/cuda-runtime-api/group__CUDART__EVENT.html).
-GPU compilation/execution of this diagnostic path still requires Nano5.
+The user has confirmed GPU compilation/execution of this diagnostic path at
+revision 1cd33f4 (recorded below); it cannot be compiled on this workstation.
 Local tooling validation passed: ten profile-parser boundary checks and four
 real subprocess/log/TSV round trips with synthetic diagnostics (on, off,
 malformed, and wrong-answer cases), plus Python/Bash syntax and the Slurm guard.
@@ -281,4 +288,50 @@ Suggested commit message when committing the tiled candidate and diagnostics tog
 
 ```text
 hw3-1: add tiled prefix sums and optional phase timing
+```
+
+## Validated tiled run and judge default correction (2026-10-22)
+
+User-provided evidence: job 399745, revision
+1cd33f40759fb01099e5334bd3af9b720c69d970, H100 80GB HBM3, driver 550.127.08,
+CUDA_MODULE_LOADING unset. Nano5 log directory:
+`tmp/tiled-399745-20261022-175224-3500648/`.
+The forced tiled path passed all 22 quick comparisons. Public results:
+
+| Case | Checker/verdict | Compute s | Alloc ms | H2D ms | Kernels ms | D2H ms | Free ms | Run host ms |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 05 | AC | 0.231243 | 0.433978 | 3.820352 | 213.022400 | 3.775072 | 10.104946 | 231.207857 |
+| 06 | AC | 0.214011 | 0.454332 | 4.295392 | 203.791397 | 4.279840 | 1.100376 | 213.973814 |
+| 07 | AC | 0.200238 | 7.207572 | 4.333024 | 177.488358 | 4.318688 | 6.796393 | 200.196723 |
+
+A subsequent plain judge run still reported 05=1.721 TLE, 06=1.940 TLE,
+07=5.508 TLE+, and 4/12 overall, holding the GPU for 47 seconds. Inspection
+confirmed that the source still defaulted to naive when PP_KERNEL was unset;
+the prior test script had forced PP_KERNEL=tiled. This explains the discrepancy
+without evidence of a tiled-kernel regression. The judge log itself did not
+print the selected kernel/environment, so that invocation's exact environment
+is not independently verified.
+
+Correction: the source now defaults to auto (R>=5 tiled, otherwise naive),
+while explicit naive/tiled overrides remain available. The short check/profile
+script now clears PP_KERNEL and exercises default dispatch. The harness labels
+an unset mode as auto, and profiling continues to report the actual chosen kernel.
+This selection is based on radius, never on case number, size/seed fingerprints,
+or precomputed outputs. It also routes case 09 through tiled; 09 has not been
+validated and still lacks sparse scheduling. No claim is made that 08-12 now
+meet their limits. Small-radius cases 01-04 and 08/10-12 keep the baseline path.
+
+After committing/pushing the correction, a single-case judge check avoids
+another full sweep over known unfinished paths:
+
+```bash
+cd ~/Parallel_Programming && git pull && cd hw3
+unset PP_KERNEL PP_PROFILE
+make hw3-1 && hw3-1-judge 05
+```
+
+Suggested commit message:
+
+```text
+hw3-1: select tiled counting automatically for large radii
 ```

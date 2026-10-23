@@ -61,7 +61,7 @@ int main(int argc, char **argv) {
     if (random_cases < 0 || random_cases > 1000) return 2;
     const char *kernel = std::getenv("PP_KERNEL");
     std::printf("kernel=%s seed=%u mode=%s random_cases=%d\n",
-                kernel ? kernel : "naive", seed, quick ? "quick" : "full", quick ? 0 : random_cases);
+                kernel ? kernel : "auto", seed, quick ? "quick" : "full", quick ? 0 : random_cases);
     check(cudaFree(nullptr));
     std::mt19937 rng(seed);
 
