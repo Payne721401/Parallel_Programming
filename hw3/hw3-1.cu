@@ -1,5 +1,6 @@
-// Automatic dispatch: tiled prefix sums for R>=5, naive for smaller radii.
-// PP_KERNEL=auto|naive|tiled overrides dispatch for controlled comparisons.
+// PP_KERNEL=auto|naive|tiled selects the neighbour-counting algorithm.
+// PP_ACTIVE=auto|0|1 selects adaptive, dense, or forced sparse entry.
+// Sparse entry always retains the one-way dense fallback on growth.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -9,6 +10,7 @@
 #include <cstring>
 
 #include "ca.hpp"
+#include "tile_geometry.hpp"
 
 namespace {
 
@@ -115,9 +117,10 @@ __global__ void step_naive(const uint8_t *__restrict__ src,
     dst[index] = next_state(r, src[index], n);
 }
 
-constexpr int TILE_W = 64;
-constexpr int TILE_H = 32;
+constexpr int TILE_W = tile_geometry::width;
+constexpr int TILE_H = tile_geometry::height;
 constexpr int TILE_WARPS = 8;
+static_assert(MAX_RADIUS <= 32, "tile influence storage assumes R<=32");
 static_assert((TILE_W + 2 * MAX_RADIUS) * (TILE_H + 2 * MAX_RADIUS) <= 65535,
               "tile summed-area table must fit uint16_t");
 
@@ -139,9 +142,12 @@ __device__ __forceinline__ unsigned warp_prefix(unsigned value, int lane) {
     return value;
 }
 
-template <bool Moore>
-__global__ void step_tiled(const uint8_t *__restrict__ src,
-                           uint8_t *__restrict__ dst, Problem p) {
+// Track is compiled out for dense execution. Flags report whether the input
+// tile (bit 0) and output tile (bit 1) contain any nonzero, including decay.
+template <bool Moore, bool Track>
+__device__ unsigned update_tiled(const uint8_t *__restrict__ src,
+                                 uint8_t *__restrict__ dst, const Problem &p,
+                                 int x0, int y0, uint16_t *sums) {
     // Launch exactly (32,8): a warp cooperatively scans one row or column.
     const int lane = int(threadIdx.x);
     const int warp = int(threadIdx.y);
@@ -150,9 +156,6 @@ __global__ void step_tiled(const uint8_t *__restrict__ src,
     const int rw = TILE_W + 2 * radius;
     const int rh = TILE_H + 2 * radius;
     const int pitch = rw + 1;
-    const int x0 = int(blockIdx.x) * TILE_W;
-    const int y0 = int(blockIdx.y) * TILE_H;
-    extern __shared__ uint16_t sums[];
 
     // P[y+1][x+1] initially holds an inclusive row prefix of (state == 1).
     // Row 0 and column 0 are zero, making interval endpoints uniform.
@@ -197,6 +200,7 @@ __global__ void step_tiled(const uint8_t *__restrict__ src,
     }
 
     // Invalid output threads still participated in all preceding collectives.
+    unsigned flags = 0;
     for (int cell = tid; cell < TILE_W * TILE_H; cell += 32 * TILE_WARPS) {
         const int x = cell % TILE_W;
         const int y = cell / TILE_W;
@@ -221,9 +225,221 @@ __global__ void step_tiled(const uint8_t *__restrict__ src,
         const size_t index = size_t(gy) * p.width + gx;
         const uint8_t state = src[index];
         if (!p.rule.count_centre && state == 1) --n;
-        dst[index] = next_state(p.rule, state, n);
+        const uint8_t output = next_state(p.rule, state, n);
+        dst[index] = output;
+        if constexpr (Track) flags |= unsigned(state != 0) | (unsigned(output != 0) << 1);
+    }
+    if constexpr (Track) {
+        const unsigned input_nonzero = __syncthreads_or((flags & 1) != 0);
+        const unsigned output_nonzero = __syncthreads_or((flags & 2) != 0);
+        return input_nonzero | (output_nonzero << 1);
+    }
+    return 0;
+}
+
+template <bool Moore>
+__global__ void step_tiled(const uint8_t *__restrict__ src,
+                           uint8_t *__restrict__ dst, Problem p) {
+    extern __shared__ uint16_t sums[];
+    update_tiled<Moore, false>(src, dst, p, int(blockIdx.x) * TILE_W,
+                              int(blockIdx.y) * TILE_H, sums);
+}
+
+// Small-radius sparse tiles avoid the prefix-table setup. Each lane writes
+// distinct cells; the two block OR reductions are the only cooperation needed.
+template <bool Track>
+__device__ unsigned update_direct(const uint8_t *__restrict__ src,
+                                  uint8_t *__restrict__ dst, const Problem &p,
+                                  int x0, int y0) {
+    const int tid = int(threadIdx.y) * 32 + int(threadIdx.x);
+    unsigned flags = 0;
+    for (int cell = tid; cell < TILE_W * TILE_H; cell += 256) {
+        const int x = x0 + cell % TILE_W, y = y0 + cell / TILE_W;
+        if (x >= p.width || y >= p.height) continue;
+        const Rule &r = p.rule;
+        int n = 0;
+        for (int dy = -r.radius; dy <= r.radius; ++dy) {
+            int ny = y + dy;
+            if (p.boundary == Boundary::Torus) ny = wrap_neighbour(ny, p.height);
+            else if (ny < 0 || ny >= p.height) continue;
+            const int ady = dy < 0 ? -dy : dy;
+            const int span = r.shape == Shape::Moore ? r.radius : r.radius - ady;
+            for (int dx = -span; dx <= span; ++dx) {
+                if (!dx && !dy && !r.count_centre) continue;
+                int nx = x + dx;
+                if (p.boundary == Boundary::Torus) nx = wrap_neighbour(nx, p.width);
+                else if (nx < 0 || nx >= p.width) continue;
+                n += src[size_t(ny) * p.width + nx] == 1;
+            }
+        }
+        const size_t index = size_t(y) * p.width + x;
+        const uint8_t input = src[index];
+        const uint8_t output = next_state(p.rule, input, n);
+        dst[index] = output;
+        if constexpr (Track) flags |= unsigned(input != 0) | (unsigned(output != 0) << 1);
+    }
+    if constexpr (Track) {
+        const unsigned input_nonzero = __syncthreads_or((flags & 1) != 0);
+        const unsigned output_nonzero = __syncthreads_or((flags & 2) != 0);
+        return input_nonzero | (output_nonzero << 1);
+    }
+    return 0;
+}
+
+struct TileQueue {
+    int *ids;
+    int *count;
+};
+
+struct SparseStats {
+    unsigned long long work_sum;
+    int work_max;
+    int dense_steps;
+};
+
+__device__ void enqueue_tile(int tile, TileQueue queue, int *stamp, int epoch) {
+    // Exactly one producer reserves a slot per tile/epoch. Consumers run only
+    // in a later kernel in the same stream, after all ID writes have finished.
+    if (atomicExch(stamp + tile, epoch) != epoch) {
+        const int slot = atomicAdd(queue.count, 1);
+        queue.ids[slot] = tile;
     }
 }
+
+__device__ void enqueue_influence(int tile, TileQueue queue, int *stamp, int epoch,
+                                  const Problem &p, int tiles_x) {
+    const bool torus = p.boundary == Boundary::Torus;
+    const auto xs = tile_geometry::influence(tile % tiles_x, TILE_W, p.width, p.rule.radius, torus);
+    const auto ys = tile_geometry::influence(tile / tiles_x, TILE_H, p.height, p.rule.radius, torus);
+    // Rectangular dilation is exact for Moore and a safe superset for diamonds.
+    for (int y = 0; y < ys.count; ++y)
+        for (int x = 0; x < xs.count; ++x)
+            enqueue_tile(ys.ids[y] * tiles_x + xs.ids[x], queue, stamp, epoch);
+}
+
+__global__ void mark_initial_tiles(const uint8_t *src, uint8_t *nonzero,
+                                    Problem p, int tiles_x) {
+    const int tile = int(blockIdx.x);
+    const int x0 = (tile % tiles_x) * TILE_W, y0 = (tile / tiles_x) * TILE_H;
+    bool any = false;
+    for (int cell = int(threadIdx.x); cell < TILE_W * TILE_H; cell += 256) {
+        const int x = x0 + cell % TILE_W, y = y0 + cell / TILE_W;
+        if (x < p.width && y < p.height) any |= src[size_t(y) * p.width + x] != 0;
+    }
+    const int nz = __syncthreads_or(any);
+    if (threadIdx.x == 0) nonzero[tile] = uint8_t(nz);
+}
+
+__global__ void seed_worklist(const uint8_t *nonzero, TileQueue queue,
+                              Problem p, int tiles_x, int tile_count) {
+    const int tile = int(blockIdx.x * blockDim.x + threadIdx.x);
+    if (tile >= tile_count) return;
+    const bool torus = p.boundary == Boundary::Torus;
+    const auto xs = tile_geometry::influence(tile % tiles_x, TILE_W, p.width, p.rule.radius, torus);
+    const auto ys = tile_geometry::influence(tile / tiles_x, TILE_H, p.height, p.rule.radius, torus);
+    bool needed = false;
+    for (int y = 0; y < ys.count && !needed; ++y)
+        for (int x = 0; x < xs.count; ++x)
+            needed |= nonzero[ys.ids[y] * tiles_x + xs.ids[x]] != 0;
+    if (needed) queue.ids[atomicAdd(queue.count, 1)] = tile;
+}
+
+__global__ void prepare_sparse(TileQueue current, TileQueue next, int *dense,
+                                int tile_count, SparseStats *stats) {
+    // A kernel boundary publishes the reset before any next-list producers run.
+    *next.count = 0;
+    if (*current.count > tile_count / 2) *dense = 1;
+    const int work = *dense ? tile_count : *current.count;
+    if (stats) {
+        stats->work_sum += static_cast<unsigned long long>(work);
+        if (work > stats->work_max) stats->work_max = work;
+        stats->dense_steps += *dense;
+    }
+}
+
+template <bool Tiled, bool Moore>
+__global__ void step_sparse(const uint8_t *__restrict__ src,
+                            uint8_t *__restrict__ dst, Problem p,
+                            TileQueue current, TileQueue next, int *stamp, int epoch,
+                            const int *dense, int tiles_x, int tile_count) {
+    extern __shared__ uint16_t sums[];
+    const bool full = *dense != 0;
+    const int count = full ? tile_count : *current.count;
+    for (int i = int(blockIdx.x); i < count; i += int(gridDim.x)) {
+        const int tile = full ? i : current.ids[i];
+        const int x0 = (tile % tiles_x) * TILE_W, y0 = (tile / tiles_x) * TILE_H;
+        unsigned flags = 0;
+        if (full) {
+            // One-way dense fallback: no flag reductions or queue atomics.
+            if constexpr (Tiled) update_tiled<Moore, false>(src, dst, p, x0, y0, sums);
+            else update_direct<false>(src, dst, p, x0, y0);
+        } else {
+            if constexpr (Tiled) flags = update_tiled<Moore, true>(src, dst, p, x0, y0, sums);
+            else flags = update_direct<true>(src, dst, p, x0, y0);
+            if (threadIdx.x == 0 && threadIdx.y == 0) {
+                // W_(t+1) = dilation(A_(t+1)) union A_t. The second term
+                // overwrites old nonzeros when this generation's src becomes dst.
+                if (flags & 2) enqueue_influence(tile, next, stamp, epoch, p, tiles_x);
+                if (flags & 1) enqueue_tile(tile, next, stamp, epoch);
+            }
+        }
+        // All reads of this tile's shared table must finish before another
+        // iteration reuses it, including the dense (no reductions) branch.
+        __syncthreads();
+    }
+}
+
+struct SparseWorkspace {
+    uint8_t *nonzero = nullptr;
+    int *ids[2]{};
+    int *counts = nullptr; // queue 0 count, queue 1 count, dense fallback flag
+    int *stamp = nullptr;
+    SparseStats *stats = nullptr;
+    int tiles_x = 0, tile_count = 0, initial_work = 0, workers = 0;
+
+    TileQueue queue(int index) const { return {ids[index], counts + index}; }
+
+    void allocate(const Problem &p, bool profile) {
+        tiles_x = (p.width + TILE_W - 1) / TILE_W;
+        tile_count = tiles_x * ((p.height + TILE_H - 1) / TILE_H);
+        check(cudaMalloc(&nonzero, size_t(tile_count)), "allocate initial tile flags");
+        for (auto &list : ids)
+            check(cudaMalloc(&list, size_t(tile_count) * sizeof(int)), "allocate tile list");
+        check(cudaMalloc(&counts, 3 * sizeof(int)), "allocate tile counters");
+        check(cudaMalloc(&stamp, size_t(tile_count) * sizeof(int)), "allocate tile stamps");
+        if (profile) check(cudaMalloc(&stats, sizeof(SparseStats)), "allocate sparse statistics");
+    }
+
+    bool initialize(const uint8_t *src, uint8_t *dst, const Problem &p, bool forced) {
+        check(cudaMemsetAsync(counts, 0, 3 * sizeof(int)), "initialize tile counters");
+        mark_initial_tiles<<<tile_count, 256>>>(src, nonzero, p, tiles_x);
+        check(cudaGetLastError(), "launch mark_initial_tiles");
+        seed_worklist<<<(tile_count + 255) / 256, 256>>>(nonzero, queue(0), p, tiles_x, tile_count);
+        check(cudaGetLastError(), "launch seed_worklist");
+        // One setup-time scalar transfer; never transfer a work count per generation.
+        check(cudaMemcpy(&initial_work, counts, sizeof(int), cudaMemcpyDeviceToHost), "read initial work count");
+        if (!forced && initial_work > tile_count / 4) return false;
+        // Establish the sparse invariant: skipped destination cells are zero.
+        check(cudaMemsetAsync(dst, 0, size_t(p.width) * p.height), "clear sparse destination");
+        check(cudaMemsetAsync(stamp, 0, size_t(tile_count) * sizeof(int)), "clear tile stamps");
+        if (stats) check(cudaMemsetAsync(stats, 0, sizeof(SparseStats)), "clear sparse statistics");
+        int device = 0, sms = 0;
+        check(cudaGetDevice(&device), "get CUDA device");
+        check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device), "get SM count");
+        // A modest grid reuses blocks over the list; hardware schedules residency.
+        // Four blocks/SM is a starting heuristic, not an occupancy claim.
+        workers = tile_count < 4 * sms ? tile_count : 4 * sms;
+        return true;
+    }
+
+    void release() {
+        if (stats) check(cudaFree(stats), "free sparse statistics");
+        if (stamp) check(cudaFree(stamp), "free tile stamps");
+        if (counts) check(cudaFree(counts), "free tile counters");
+        for (auto list : ids) if (list) check(cudaFree(list), "free tile list");
+        if (nonzero) check(cudaFree(nonzero), "free initial tile flags");
+    }
+};
 
 } // namespace
 
@@ -246,15 +462,28 @@ void run(uint8_t *grid, const Problem &p) {
     }
     const bool tiled = automatic ? p.rule.radius >= 5 : forced_tiled;
     const size_t bytes = size_t(p.width) * p.height;
+    const char *active = std::getenv("PP_ACTIVE");
+    const bool adaptive = !active || std::strcmp(active, "auto") == 0;
+    const bool force_sparse = active && std::strcmp(active, "1") == 0;
+    if (!adaptive && !force_sparse && std::strcmp(active, "0") != 0) {
+        std::fprintf(stderr, "hw3-1: PP_ACTIVE must be auto, 0 or 1\n");
+        std::exit(EXIT_FAILURE);
+    }
+    // Inspect actual state only where a full-grid scan can amortize over many
+    // large generations. No case IDs, seed fingerprints or expected answers.
+    const bool inspect_sparse = force_sparse || (adaptive && bytes >= (size_t(1) << 28) && p.steps >= 128);
+    SparseWorkspace sparse_work;
     uint8_t *src = nullptr, *dst = nullptr;
     const auto alloc_start = profile.enabled ? PhaseProfile::Clock::now() : PhaseProfile::Clock::time_point{};
     check(cudaMalloc(&src, bytes), "allocate source");
     check(cudaMalloc(&dst, bytes), "allocate destination");
+    if (inspect_sparse) sparse_work.allocate(p, profile.enabled);
     if (profile.enabled) profile.alloc_host_ms = PhaseProfile::elapsed_ms(alloc_start);
     profile.prepare();
     profile.mark(0);
     check(cudaMemcpy(src, grid, bytes, cudaMemcpyHostToDevice), "copy initial grid");
     profile.mark(1);
+    const bool sparse = inspect_sparse && sparse_work.initialize(src, dst, p, force_sparse);
 
     const dim3 threads(32, 8);
     const int tile_w = tiled ? TILE_W : 32;
@@ -262,14 +491,34 @@ void run(uint8_t *grid, const Problem &p) {
     const dim3 blocks((p.width + tile_w - 1) / tile_w, (p.height + tile_h - 1) / tile_h);
     const size_t shared_bytes = size_t(TILE_W + 2 * p.rule.radius + 1)
                               * (TILE_H + 2 * p.rule.radius + 1) * sizeof(uint16_t);
-    // One stream orders generations. Every output cell is written, so neither
-    // a memset nor a host synchronization per generation is necessary.
-    for (int t = 0; t < p.steps; ++t) {
-        if (!tiled) step_naive<<<blocks, threads>>>(src, dst, p);
+    // One stream orders generations and queue publication. Dense writes every
+    // cell; sparse maintains zero outside the tracked support/cleanup set.
+    const int iterations = sparse && sparse_work.initial_work == 0 ? 0 : p.steps;
+    for (int t = 0; t < iterations; ++t) {
+        if (sparse) {
+            const TileQueue current = sparse_work.queue(t & 1);
+            const TileQueue next = sparse_work.queue((t + 1) & 1);
+            prepare_sparse<<<1, 1>>>(current, next, sparse_work.counts + 2,
+                                      sparse_work.tile_count, sparse_work.stats);
+            check(cudaGetLastError(), "launch prepare_sparse");
+            if (!tiled)
+                step_sparse<false, false><<<sparse_work.workers, threads>>>(
+                    src, dst, p, current, next, sparse_work.stamp, t + 1,
+                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count);
+            else if (p.rule.shape == Shape::Moore)
+                step_sparse<true, true><<<sparse_work.workers, threads, shared_bytes>>>(
+                    src, dst, p, current, next, sparse_work.stamp, t + 1,
+                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count);
+            else
+                step_sparse<true, false><<<sparse_work.workers, threads, shared_bytes>>>(
+                    src, dst, p, current, next, sparse_work.stamp, t + 1,
+                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count);
+        }
+        else if (!tiled) step_naive<<<blocks, threads>>>(src, dst, p);
         else if (p.rule.shape == Shape::Moore)
             step_tiled<true><<<blocks, threads, shared_bytes>>>(src, dst, p);
         else step_tiled<false><<<blocks, threads, shared_bytes>>>(src, dst, p);
-        check(cudaGetLastError(), tiled ? "launch step_tiled" : "launch step_naive");
+        check(cudaGetLastError(), sparse ? "launch step_sparse" : tiled ? "launch step_tiled" : "launch step_naive");
         uint8_t *old_src = src;
         src = dst;
         dst = old_src;
@@ -278,11 +527,22 @@ void run(uint8_t *grid, const Problem &p) {
     // Blocking D2H waits for all preceding kernels; src holds the final state
     // for either parity of T. Asynchronous execution errors also surface here.
     check(cudaMemcpy(grid, src, bytes, cudaMemcpyDeviceToHost), "copy final grid");
+    SparseStats sparse_stats{};
+    if (profile.enabled && sparse)
+        check(cudaMemcpy(&sparse_stats, sparse_work.stats, sizeof(sparse_stats), cudaMemcpyDeviceToHost),
+              "read sparse statistics");
     profile.mark(3);
     profile.collect();
     const auto free_start = profile.enabled ? PhaseProfile::Clock::now() : PhaseProfile::Clock::time_point{};
     check(cudaFree(dst), "free destination");
     check(cudaFree(src), "free source");
+    sparse_work.release();
     if (profile.enabled) profile.free_host_ms = PhaseProfile::elapsed_ms(free_start);
-    profile.report(tiled ? "tiled" : "naive", p);
+    profile.report(sparse ? (tiled ? "sparse_tiled" : "sparse_naive") : (tiled ? "tiled" : "naive"), p);
+    if (profile.enabled && inspect_sparse)
+        std::fprintf(stderr,
+            "[PP_SPARSE] selected=%d tiles_total=%d initial_work=%d work_sum=%llu "
+            "work_max=%d dense_steps=%d steps=%d\n",
+            int(sparse), sparse_work.tile_count, sparse_work.initial_work,
+            sparse_stats.work_sum, sparse_stats.work_max, sparse_stats.dense_steps, p.steps);
 }

@@ -18,6 +18,8 @@ import time
 
 PROFILE_TIMES = ["alloc_host_ms", "h2d_ms", "kernels_ms", "d2h_ms", "free_host_ms", "run_host_ms"]
 PROFILE_COLUMNS = ["profile_status", "profile_kernel", *PROFILE_TIMES]
+SPARSE_COLUMNS = ["sparse_status", "sparse_selected", "sparse_tiles_total", "sparse_initial_work",
+                  "sparse_mean_work", "sparse_max_work", "sparse_dense_steps"]
 
 
 def parse_profile(log_text):
@@ -28,7 +30,7 @@ def parse_profile(log_text):
         if len(lines) != 1:
             raise ValueError("expected one profile per process")
         fields = dict(token.split("=", 1) for token in lines[0].split()[1:])
-        if fields["kernel"] not in ("naive", "tiled", "none"):
+        if fields["kernel"] not in ("naive", "tiled", "sparse_naive", "sparse_tiled", "none"):
             raise ValueError("invalid profile kernel")
         times = [float(fields[name]) for name in PROFILE_TIMES]
         if any(not math.isfinite(value) or value < 0 for value in times):
@@ -38,6 +40,27 @@ def parse_profile(log_text):
         # Preserve correctness/Compute time results, but do not present malformed
         # diagnostic values as valid measurements. The original log is retained.
         return ["invalid", "", *([""] * len(PROFILE_TIMES))]
+
+
+def parse_sparse(log_text):
+    lines = [line for line in log_text.splitlines() if line.startswith("[PP_SPARSE] ")]
+    empty = [""] * (len(SPARSE_COLUMNS) - 1)
+    if not lines:
+        return ["absent", *empty]
+    try:
+        if len(lines) != 1:
+            raise ValueError("expected one sparse diagnostic")
+        fields = dict(token.split("=", 1) for token in lines[0].split()[1:])
+        selected, total, initial, work_sum, maximum, dense, steps = (
+            int(fields[key]) for key in ("selected", "tiles_total", "initial_work", "work_sum",
+                                        "work_max", "dense_steps", "steps"))
+        if (selected not in (0, 1) or total <= 0 or steps <= 0 or not 0 <= initial <= total
+                or not 0 <= maximum <= total or not 0 <= work_sum <= total * steps
+                or not 0 <= dense <= steps or (not selected and (work_sum or maximum or dense))):
+            raise ValueError("invalid sparse counts")
+        return ["ok", selected, total, initial, work_sum / steps, maximum, dense]
+    except (KeyError, ValueError):
+        return ["invalid", *empty]
 
 
 def run_cases(args):
@@ -65,7 +88,7 @@ def run_cases(args):
     failed = 0
     with (outdir / "results.tsv").open("w", newline="", encoding="utf-8") as table:
         writer = csv.writer(table, delimiter="\t")
-        writer.writerow(["case", "verdict", "compute_s", "wall_s", "limit_s", *PROFILE_COLUMNS])
+        writer.writerow(["case", "verdict", "compute_s", "wall_s", "limit_s", *PROFILE_COLUMNS, *SPARSE_COLUMNS])
         for number, (path, golden) in enumerate(cases):
             stem = f"{number:02d}-{path.stem}"
             output = outdir / f"{stem}.out"
@@ -89,6 +112,7 @@ def run_cases(args):
             wall = time.monotonic() - start
             log_text = log.read_text(encoding="utf-8", errors="replace")
             profile = parse_profile(log_text)
+            sparse = parse_sparse(log_text)
             match = re.search(r"Compute time:\s*([0-9.eE+-]+)\s*s", log_text)
             if match:
                 try:
@@ -115,11 +139,14 @@ def run_cases(args):
                     if verdict == "PENDING":
                         verdict = "WA" if not same else "TLE" if limit is not None and compute > limit else "AC"
             failed += verdict != "AC"
-            writer.writerow([str(path), verdict, "" if compute is None else compute, f"{wall:.6f}", limit or "", *profile])
+            writer.writerow([str(path), verdict, "" if compute is None else compute, f"{wall:.6f}", limit or "", *profile, *sparse])
             table.flush()
             print(f"{path}: {verdict} compute={compute} wall={wall:.3f}s limit={limit}", flush=True)
             if profile[0] != "absent":
                 print("  " + " ".join(f"{key}={value}" for key, value in zip(PROFILE_COLUMNS, profile)
+                                       if value != ""), flush=True)
+            if sparse[0] != "absent":
+                print("  " + " ".join(f"{key}={value}" for key, value in zip(SPARSE_COLUMNS, sparse)
                                        if value != ""), flush=True)
     print(f"PASS {len(cases)-failed}/{len(cases)}; logs: {outdir}")
     return 1 if failed else 0

@@ -2,11 +2,12 @@
 
 ## Status
 
-The default is now automatic dispatch: R>=5 uses tiled prefix sums; smaller
-radii use the naive one-thread-per-cell kernel. `PP_KERNEL=auto|naive|tiled`
-allows explicit comparisons; leaving it unset is equivalent to auto. Both
-paths use two byte grids and one kernel launch per generation. No sparse,
-graph, mapped-host, or bit-packed path is enabled. The initial copy,
+The counting algorithm defaults to R>=5 tiled prefix sums, otherwise direct
+neighbour counting. `PP_KERNEL=auto|naive|tiled` controls counting independently
+of `PP_ACTIVE=auto|0|1`, which controls scheduling. Both defaults are `auto`.
+The new sparse candidate is implemented but still needs Nano5 compilation,
+correctness checks, and public timing. No sparse performance result exists yet.
+No graph, mapped-host, or bit-packed path is enabled. The initial copy,
 allocations, launches, final copy, and frees are inside `run()` and count toward
 the official Compute time. T=0 returns without allocating anything.
 Optional `PP_PROFILE=1` diagnostics report phase times to stderr; unset or 0
@@ -14,10 +15,85 @@ disables all profiling events, clock reads and additional synchronization.
 
 This workstation has no detected nvcc/CUDA toolkit. User-provided Nano5 logs
 confirm that revision 1cd33f4 compiled, passed 22 tiled reference comparisons,
-and passed the official checker on 05-07 with profiling enabled. The latest
-automatic-dispatch edit still requires a Nano5 build/check. No same-allocation
+and passed the official checker on 05-07 with profiling enabled. User-provided
+logs also confirm c102594 built and passed single-case judge 05 in 0.290 s
+with PP_KERNEL/PP_PROFILE unset (4 GPU seconds held). That verifies the previous
+default-dispatch fix, not the current sparse changes. No same-allocation
 A/B result has been supplied; do not treat historical ratios as precise speedups.
 The original reference and the fixed main.cu/ca.hpp are unchanged.
+
+## Sparse candidate (2026-10-23; GPU validation pending)
+
+Implementation walkthrough: [SPARSE.md](SPARSE.md).
+
+- Auto inspects initial state only for >=2^28 cells and >=128 generations.
+  A GPU scan marks nonzero tiles; a second kernel constructs the radius-dilated
+  initial worklist. One scalar D2H selects sparse entry only if work <=25% of
+  all tiles. These are heuristics, not measured crossover thresholds.
+- `PP_ACTIVE=0` bypasses all sparse discovery/metadata. `PP_ACTIVE=1` forces
+  sparse entry for small correctness cases too; it still permits dense fallback.
+- Each sparse generation resets the next queue in a one-thread kernel, then
+  a worker kernel processes the current list using a block-stride loop.
+  Initial worker count is min(tile count, 4*SM count), not a claim of occupancy.
+  There are no per-generation host count transfers or device synchronizations.
+- Input/output block OR reductions include decay states. Output support dilates
+  into the next list; input support adds its own tile for stale-buffer cleanup.
+  Atomic epoch stamps deduplicate list entries; each list has capacity for every
+  tile, so unique appends cannot overflow. Kernel completion publishes IDs.
+- If work exceeds 50%, GPU switches permanently to full-grid tile processing,
+  avoiding further flag reductions and queue atomics. It does not re-detect
+  sparsity after that switch. Forced entry retains this safeguard.
+- Initial dst is zeroed once; no full-grid memset occurs per generation.
+  A provably empty initial grid skips all evolution launches. Final D2H remains
+  a full-grid copy. Include `tile_geometry.hpp` beside `hw3-1.cu` in submission.
+
+Profile additions (`PP_PROFILE=1`):
+
+- `profile_kernel=sparse_naive|sparse_tiled` means sparse entry was selected;
+  inspect `sparse_dense_steps` to see whether it later switched to dense.
+- `sparse_initial_work`, `sparse_mean_work`, `sparse_max_work` count scheduled
+  tiles (including halo expansion and cleanup), not live cells.
+- `sparse_tiles_total` is the denominator for work ratios. `sparse_selected=0`
+  means initial-density fallback; mean/max work fields are then unmeasured zeros.
+- `kernels_ms` includes initial GPU discovery, its scalar-transfer/host-decision
+  interval, clearing metadata/dst, queue preparation, and evolution. It is not
+  pure arithmetic time. `d2h_ms` also includes the optional tiny statistics copy.
+
+Completed locally (no GPU): CPU geometry test compiled with GCC C++17/O2 and
+warnings-as-errors; 103,570 exact axis-influence comparisons and 24 full-grid
+sparse buffer/list models passed. Both modified shell runners passed Bash
+syntax checks; Python syntax and 10 profile/sparse parser checks passed. The
+sparse runner correctly refused execution outside Slurm. These do not validate
+CUDA compilation, collectives, or atomics.
+
+After committing/pushing all changes, including the new header, run on Nano5:
+
+```bash
+cd ~/Parallel_Programming && git pull && cd hw3
+unset PP_KERNEL PP_ACTIVE PP_PROFILE
+make hw3-1 tests/test_hw3-1 &&
+srun -A ACD115218 -p dev -N1 -n1 -c4 \
+  --gpus-per-node=1 -t 2 bash tests/run_sparse.sh profile
+```
+
+Two minutes is the allocation limit; the script exits as soon as work finishes.
+It runs 22 dense, 22 forced-entry, and 30 targeted sparse reference comparisons
+before public 08/09/10 with the real defaults. Any wrong answer, runtime error,
+or timeout stops the script; correct-but-slow TLE continues to collect the other
+cases. No full-size naive A/B and no full judge sweep are run. Use `gate` instead
+of `profile` to run correctness only, or `check` for unprofiled public timing.
+Do not run all three modes routinely; start with the single profile run above.
+
+Inspect only this run's logs (replace RUN with the printed directory):
+
+```bash
+cat RUN/session.log
+column -t -s $'\t' RUN/08/results.tsv
+column -t -s $'\t' RUN/09/results.tsv
+column -t -s $'\t' RUN/10/results.tsv
+```
+
+Suggested commit message: `hw3-1: add adaptive sparse tile scheduling and validation`
 
 Local checks completed on 2026-10-22:
 

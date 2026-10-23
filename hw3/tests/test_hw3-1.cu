@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <utility>
 #include <vector>
 #include "ca.hpp"
 
@@ -48,22 +49,90 @@ static void compare(const Problem &p, const std::vector<uint8_t> &initial) {
     ++tested;
 }
 
+static void sparse_checks(std::mt19937 &rng) {
+    for (Boundary boundary : {Boundary::Dead, Boundary::Torus}) {
+        Rule life{1, 2, false, 2, 3, 3, 3, Shape::Moore};
+        Problem p{321, 161, life, boundary, 7}; // 6x6 tiles, with thin final tiles
+        std::vector<uint8_t> initial(size_t(p.width)*p.height, 0);
+        auto put = [&](int x, int y, uint8_t s) {
+            initial[size_t(y % p.height)*p.width + x % p.width] = s;
+        };
+        compare(p, initial); // empty worklist, no generation work necessary
+        put(320, 160, 1);
+        p.rule = Rule{1, 2, false, 8, 8, 8, 8, Shape::Moore};
+        p.steps = 5;
+        compare(p, initial); // death must clear the reused source buffer
+        p.rule = life;
+        std::fill(initial.begin(), initial.end(), 0);
+        for (auto origin : {std::pair<int,int>{62,30}, {319,159}}) {
+            const int x = origin.first, y = origin.second;
+            put(x+1,y,1); put(x+2,y+1,1);
+            put(x,y+2,1); put(x+1,y+2,1); put(x+2,y+2,1);
+        }
+        for (int steps : {0, 1, 2, 9, 16}) {
+            p.steps = steps;
+            compare(p, initial); // motion across tile boundaries and torus seams
+        }
+        p.rule = Rule{1, 3, false, 8, 8, 2, 2, Shape::Moore};
+        p.steps = 9;
+        for (int y = 27; y < 36; ++y)
+            for (int x = 59; x < 70; ++x) put(x,y,uint8_t(rng()%3));
+        put(320,160,2);
+        compare(p, initial); // C3, including decay initially and after live cells die
+        p.rule = Rule{1, 16, false, 0, 8, 1, 8, Shape::Moore};
+        std::fill(initial.begin(), initial.end(), 0);
+        put(0,0,2); put(63,31,7); put(64,32,15); put(320,160,2);
+        p.steps = 17;
+        compare(p, initial); // no alive cells: nonzero tracking must continue decay
+        p.rule = Rule{1, 2, false, 0, 8, 1, 8, Shape::Moore};
+        std::fill(initial.begin(), initial.end(), 0);
+        for (int x = 0; x < p.width; ++x) put(x,31,1);
+        p.steps = 70;
+        compare(p, initial); // initially sparse band grows past dense fallback threshold
+        p.rule = life;
+        p.steps = 3;
+        for (auto &s : initial) s = uint8_t(rng()%2);
+        compare(p, initial); // forced entry with a full queue; dense fallback immediately
+    }
+    for (Boundary boundary : {Boundary::Dead, Boundary::Torus})
+    for (Shape shape : {Shape::Moore, Shape::VonNeumann})
+    for (bool centre : {false, true}) {
+        Rule r{5, shape == Shape::Moore ? 2 : 4, centre, 12, 34, 34, 52, shape};
+        Problem p{321, 161, r, boundary, 4};
+        std::vector<uint8_t> initial(size_t(p.width)*p.height, 0);
+        for (int y = 22; y < 50; ++y)
+            for (int x = 54; x < 82; ++x) initial[size_t(y)*p.width+x] = rng()%100 < 40;
+        // Last tile width/height is 1: radius 5 reaches beyond its immediate tile neighbour.
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 4; ++x) initial[size_t(p.height-1-y)*p.width+p.width-1-x] = 1;
+        compare(p, initial);
+    }
+    std::printf("PASS %d/%d (sparse full-grid comparison; not timing)\n", tested, tested);
+}
+
 int main(int argc, char **argv) {
     int random_cases = 64;
     unsigned seed = 20261022;
     const bool quick = argc == 2 && std::strcmp(argv[1], "--quick") == 0;
+    const bool sparse = argc == 2 && std::strcmp(argv[1], "--sparse") == 0;
     if (argc > 3) {
-        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse\n", argv[0]);
         return 2;
     }
-    if (argc >= 2 && !quick) random_cases = std::atoi(argv[1]);
+    if (argc >= 2 && !quick && !sparse) random_cases = std::atoi(argv[1]);
     if (argc >= 3) seed = unsigned(std::strtoul(argv[2], nullptr, 10));
     if (random_cases < 0 || random_cases > 1000) return 2;
     const char *kernel = std::getenv("PP_KERNEL");
-    std::printf("kernel=%s seed=%u mode=%s random_cases=%d\n",
-                kernel ? kernel : "auto", seed, quick ? "quick" : "full", quick ? 0 : random_cases);
+    const char *active = std::getenv("PP_ACTIVE");
+    std::printf("kernel=%s active=%s seed=%u mode=%s random_cases=%d\n",
+                kernel ? kernel : "auto", active ? active : "auto", seed,
+                sparse ? "sparse" : quick ? "quick" : "full", (quick || sparse) ? 0 : random_cases);
     check(cudaFree(nullptr));
     std::mt19937 rng(seed);
+    if (sparse) {
+        sparse_checks(rng);
+        return 0;
+    }
 
     if (quick) {
         // Twenty deliberately varied cases: multi-tile/partial blocks, narrow

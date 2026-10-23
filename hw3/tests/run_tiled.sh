@@ -29,11 +29,11 @@ fi
 git status --short
 nvidia-smi --query-gpu=name,driver_version --format=csv
 echo 'Correctness gate: default dispatch vs the original CPU reference, 22 small cases'
-env -u PP_KERNEL PP_PROFILE=0 timeout 20s ./tests/test_hw3-1 --quick
+env -u PP_KERNEL -u PP_ACTIVE PP_PROFILE=0 timeout 20s ./tests/test_hw3-1 --quick
 
 if [[ $mode != ab ]]; then
     # A first candidate check, not a causal A/B speedup measurement.
-    env -u PP_KERNEL PP_PROFILE=$profile python3 tests/run_cases.py --checker hw3-1-check \
+    env -u PP_KERNEL -u PP_ACTIVE PP_PROFILE=$profile python3 tests/run_cases.py --checker hw3-1-check \
         --wall-timeout 8 --outdir "$logdir/tiled" cases/05.txt cases/06.txt cases/07.txt
 else
     # Only after the candidate passes. Limit the A/B run to 05 and 06:
@@ -45,7 +45,7 @@ else
         # The baseline is known to TLE. Continue on timing failures, but stop
         # immediately on a wrong answer, runtime error, or wall timeout.
         status=0
-        PP_KERNEL=$kernel PP_PROFILE=0 python3 tests/run_cases.py --checker hw3-1-check \
+        PP_KERNEL=$kernel PP_ACTIVE=0 PP_PROFILE=0 python3 tests/run_cases.py --checker hw3-1-check \
             --wall-timeout 8 --outdir "$logdir/$round-$kernel" cases/05.txt cases/06.txt || status=$?
         python3 tests/check_timing_results.py "$logdir/$round-$kernel/results.tsv" "$status"
     done
