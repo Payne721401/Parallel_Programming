@@ -2,16 +2,24 @@
 
 ## Status
 
-An opt-in Moore sliding-window candidate is now available with PP_MOORE=sliding;
-unset or sat retains the validated SAT default. No measured candidate speedup
-or CUDA validation is available yet. See [SLIDING.md](SLIDING.md) for the bounded
-05/09 same-allocation comparison and optional baseline-only diagnostic.
+The working tree now promotes tiled Moore R>=5 to sliding under PP_MOORE=auto
+(also the unset default); PP_MOORE=sat retains the old implementation. This new
+default still needs a full public integration run. The feature matrix/trace tools
+are implemented but not yet executed on Nano5: see [FEATURE_MATRIX.md](FEATURE_MATRIX.md).
+Revision 152fec2 compiled on
+Nano5 and passed 78 CPU-reference checks. User-supplied job 405529 measured
+SAT/sliding speedups of 1.424x on 05 and 1.216x on 09 in a profiled ABBA run.
+The subsequent unprofiled R20 case 07 ABBA passed all four runs: SAT mean
+0.189035 s, sliding mean 0.1351475 s (1.399x, 28.5% time reduction).
+Unprofiled 05/09 and hidden performance remain unmeasured.
+See [SLIDING.md](SLIDING.md) for the evidence and next targeted check.
 
 Revision 0713fba adds dense packed R1 and compiled on Nano5. User-supplied job
 404889 passed 90 default dense and 30 sparse GPU/CPU-reference comparisons,
 then passed the official checker and limits for 11/12 (0.202853 / 0.317 s).
 Defaults are R1 packed-byte/shared-memory counting in both schedules, R2-4
-direct counting, and R>=5 tiled prefix sums. See [DENSE_R1.md](DENSE_R1.md)
+direct counting, and R>=5 tiled counting (Moore sliding, von Neumann row prefixes).
+See [DENSE_R1.md](DENSE_R1.md)
 for the change, limits, and the targeted 11/12 validation command.
 Sparse R1 already uses packed-byte/shared-memory counting. Revision a284817
 compiled on Nano5, passed 94 small GPU/CPU-reference comparisons, and passed

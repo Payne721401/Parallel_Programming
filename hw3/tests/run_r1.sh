@@ -7,7 +7,7 @@ if [[ -z ${SLURM_JOB_ID:-} ]]; then
     exit 2
 fi
 mode=${1:-profile}
-unset PP_MOORE # Keep sliding experiments isolated in run_sliding.sh.
+unset PP_MOORE # Use current defaults, not an inherited manual override.
 if [[ $mode != profile && $mode != check && $mode != ab ]]; then
     echo 'usage: bash tests/run_r1.sh [profile|check|ab]' >&2
     exit 2

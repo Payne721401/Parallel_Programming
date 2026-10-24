@@ -2,7 +2,7 @@
 // PP_ACTIVE=auto|0|1 selects adaptive, dense, or forced sparse entry.
 // Sparse entry always retains the one-way dense fallback on growth.
 // PP_R1=auto|direct|packed controls R1 dense/sparse counting; auto uses packed.
-// PP_MOORE=sat|sliding selects tiled Moore counting; default remains validated SAT.
+// PP_MOORE=auto|sat|sliding selects tiled Moore counting; auto uses sliding for R>=5.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -618,13 +618,16 @@ void run(uint8_t *grid, const Problem &p) {
     }
     const bool tiled = automatic ? p.rule.radius >= 5 : forced_tiled;
     const char *moore_mode = std::getenv("PP_MOORE");
+    const bool moore_auto = !moore_mode || std::strcmp(moore_mode, "auto") == 0;
     const bool sliding_requested = moore_mode && std::strcmp(moore_mode, "sliding") == 0;
-    if (moore_mode && !sliding_requested && std::strcmp(moore_mode, "sat") != 0) {
-        std::fprintf(stderr, "hw3-1: PP_MOORE must be sat or sliding\n");
+    if (!moore_auto && !sliding_requested && std::strcmp(moore_mode, "sat") != 0) {
+        std::fprintf(stderr, "hw3-1: PP_MOORE must be auto, sat or sliding\n");
         std::exit(EXIT_FAILURE);
     }
-    // Experimental opt-in only; packed R1 and von Neumann retain their paths.
-    const bool sliding = tiled && p.rule.shape == Shape::Moore && sliding_requested;
+    // R5/R20 ABBA and small R1..32 reference checks support this general policy;
+    // SAT remains available for crossover measurements on unseen workloads.
+    const bool sliding = tiled && p.rule.shape == Shape::Moore
+                       && (sliding_requested || (moore_auto && p.rule.radius >= 5));
     const char *r1_mode = std::getenv("PP_R1");
     const bool r1_auto = !r1_mode || std::strcmp(r1_mode, "auto") == 0;
     const bool r1_force = r1_mode && std::strcmp(r1_mode, "packed") == 0;

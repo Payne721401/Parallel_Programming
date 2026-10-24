@@ -223,7 +223,7 @@ int main(int argc, char **argv) {
     const char *moore_mode = std::getenv("PP_MOORE");
     std::printf("kernel=%s active=%s r1=%s moore=%s seed=%u mode=%s random_cases=%d\n",
                 kernel ? kernel : "auto", active ? active : "auto", r1_mode ? r1_mode : "auto",
-                moore_mode ? moore_mode : "sat", seed,
+                moore_mode ? moore_mode : "auto", seed,
                 sliding ? "sliding" : dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
                 (quick || sparse || r1 || dense_r1 || sliding) ? 0 : random_cases);
     check(cudaFree(nullptr));

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Opt-in candidate; keep the validated default. No GPU work on a login node.
+# Explicit SAT/sliding comparison, independent of default policy. Slurm only.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [[ -z ${SLURM_JOB_ID:-} ]]; then

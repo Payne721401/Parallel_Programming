@@ -22,7 +22,10 @@ hw3-1-seq: main.cu original_version/hw3-1.cu ca.hpp
 tests/test_hw3-1: tests/test_hw3-1.cu hw3-1.cu original_version/hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp
 	$(NVCC) $(NVCCFLAGS) -I. tests/test_hw3-1.cu hw3-1.cu -o $@
 
+tests/trace_hw3-1: tests/trace_main.cu main.cu hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp
+	$(NVCC) $(NVCCFLAGS) -I. tests/trace_main.cu hw3-1.cu -o $@
+
 clean:
-	rm -f hw3-1 hw3-1-seq tests/test_hw3-1
+	rm -f hw3-1 hw3-1-seq tests/test_hw3-1 tests/trace_hw3-1
 
 .PHONY: clean
