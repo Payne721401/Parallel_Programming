@@ -179,6 +179,29 @@ static void dense_r1_checks(std::mt19937 &rng) {
     std::printf("PASS %d/%d (dense R1 boundaries, distributions and long runs; not timing)\n", tested, tested);
 }
 
+static void sliding_checks(std::mt19937 &rng) {
+    for (int radius : {1, 2, 5, 12, 20, 32})
+    for (Boundary boundary : {Boundary::Dead, Boundary::Torus})
+    for (bool centre : {false, true})
+    for (int variant = 0; variant < 2; ++variant) {
+        const int maxn = (2 * radius + 1) * (2 * radius + 1) - 1 + int(centre);
+        Rule r{radius, variant == 0 ? 2 : centre ? 16 : 4, centre,
+               variant == 0 ? int(centre) : maxn / 3,
+               variant == 0 ? maxn : maxn / 2,
+               variant == 0 ? maxn : maxn / 4,
+               variant == 0 ? maxn : maxn / 3, Shape::Moore};
+        const int side = 2 * radius + 1;
+        Problem p{side + 7 * variant, side + 3 * variant, r, boundary, 1 + variant};
+        std::vector<uint8_t> initial(size_t(p.width) * p.height);
+        for (auto &s : initial)
+            s = rng() % 100 < 35 ? 1 : uint8_t(rng() % r.states);
+        // Minimum dimensions wrap the tile halo repeatedly; larger odd/partial
+        // dimensions cross output segments and tiles. Compare every cell.
+        compare(p, initial);
+    }
+    std::printf("PASS %d/%d (Moore sliding radius/boundary/state checks; not timing)\n", tested, tested);
+}
+
 int main(int argc, char **argv) {
     int random_cases = 64;
     unsigned seed = 20261022;
@@ -186,22 +209,29 @@ int main(int argc, char **argv) {
     const bool sparse = argc == 2 && std::strcmp(argv[1], "--sparse") == 0;
     const bool r1 = argc == 2 && std::strcmp(argv[1], "--r1") == 0;
     const bool dense_r1 = argc == 2 && std::strcmp(argv[1], "--dense-r1") == 0;
+    const bool sliding = argc == 2 && std::strcmp(argv[1], "--sliding") == 0;
     if (argc > 3) {
-        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1 | --sliding\n", argv[0]);
         return 2;
     }
-    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1) random_cases = std::atoi(argv[1]);
+    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1 && !sliding) random_cases = std::atoi(argv[1]);
     if (argc >= 3) seed = unsigned(std::strtoul(argv[2], nullptr, 10));
     if (random_cases < 0 || random_cases > 1000) return 2;
     const char *kernel = std::getenv("PP_KERNEL");
     const char *active = std::getenv("PP_ACTIVE");
     const char *r1_mode = std::getenv("PP_R1");
-    std::printf("kernel=%s active=%s r1=%s seed=%u mode=%s random_cases=%d\n",
-                kernel ? kernel : "auto", active ? active : "auto", r1_mode ? r1_mode : "auto", seed,
-                dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
-                (quick || sparse || r1 || dense_r1) ? 0 : random_cases);
+    const char *moore_mode = std::getenv("PP_MOORE");
+    std::printf("kernel=%s active=%s r1=%s moore=%s seed=%u mode=%s random_cases=%d\n",
+                kernel ? kernel : "auto", active ? active : "auto", r1_mode ? r1_mode : "auto",
+                moore_mode ? moore_mode : "sat", seed,
+                sliding ? "sliding" : dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
+                (quick || sparse || r1 || dense_r1 || sliding) ? 0 : random_cases);
     check(cudaFree(nullptr));
     std::mt19937 rng(seed);
+    if (sliding) {
+        sliding_checks(rng);
+        return 0;
+    }
     if (dense_r1) {
         dense_r1_checks(rng);
         return 0;

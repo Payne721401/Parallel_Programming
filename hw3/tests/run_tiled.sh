@@ -8,6 +8,7 @@ if [[ -z ${SLURM_JOB_ID:-} ]]; then
     exit 2
 fi
 mode=${1:-check}
+unset PP_MOORE # This runner measures the validated SAT baseline.
 if [[ $mode != check && $mode != profile && $mode != ab ]]; then
     echo 'usage: bash tests/run_tiled.sh [check|profile|ab]' >&2
     exit 2

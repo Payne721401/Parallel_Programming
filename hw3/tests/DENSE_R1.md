@@ -1,7 +1,11 @@
 # Dense packed R1：11/12 的第一階段
 
-狀態：已加入程式，尚未在 Nano5 編譯或量測。a284817 的 sparse R1
-曾通過 94 個小圖比對與 public 08/10；這不是新 dense wrapper 的驗證結果。
+狀態：0713fba 已在 Nano5 編譯成功。使用者提供的 job 404889 通過
+90 個 default dense 與 30 個 sparse 小圖逐格比對；11/12 均通過官方 checker
+及 0.8 秒限制，Compute time 分別為 0.202853 / 0.317 秒（PP_PROFILE=1）。
+兩題都確認使用 dense_r1。完整時間與環境記錄見 [PERF.md](PERF.md)。
+後續使用者提供的完整 public judge 已通過 12/12，總計 2.573 秒；11/12
+為 0.180 / 0.275 秒。該 judge 摘錄沒有 revision/job ID；hidden 尚未驗證。
 
 ## 修改與原理
 
@@ -21,7 +25,8 @@
    語意，除非同時明確要求 `PP_R1=packed`。`PP_KERNEL=tiled` 仍強制 tiled。
 
 11 的初始隨機全圖通常使 sparse 檢查拒絕稀疏路徑；12 的 128 MiB 大小
-低於目前 256 MiB 的自動檢查門檻。因此兩者預期都走新 dense wrapper。
+低於目前 256 MiB 的自動檢查門檻。job 404889 確認兩者都走新 dense wrapper，
+其中 11 的 initial_work=tiles_total=131072、sparse_selected=0。
 這不是 case ID 判斷：所有符合 R1 條件的 dense 輸入（包括 01-03）都會使用它。
 
 ## 解決與未解決的問題
@@ -65,7 +70,11 @@ srun -A ACD115218 -p dev -N1 -n1 -c4 \
 結果以便診斷，WA/RE/timeout 則中止。最後的 `Outputs verified correct`
 不代表已通過時間限制，仍須看 AC/TLE。
 
-先跑 profile 就好，不需要現在重跑全套 judge。
+這一輪 profile 與後續完整 public judge 都已通過，不需要重複跑。
+`unset PP_KERNEL PP_ACTIVE PP_R1 PP_PROFILE` 會移除目前 shell 的覆寫設定，
+使後續啟動的程式使用內建 auto/auto/auto 與關閉 profiling 的預設值。
+它不修改 source、binary 或 shell 設定檔；不需要因此重新編譯。
+judge 自己提交 Slurm job，不要再外包一層 srun。
 
 ## 只有需要精確比較時才跑 A/B
 
@@ -78,5 +87,6 @@ srun -A ACD115218 -p dev -N1 -n1 -c4 \
 自動，profiling 關閉，每輪都驗證輸出。`check` 模式則只做 gates 與新版
 11/12 一輪（profiling 關閉）。歷史不同 job 的時間只能作參考，不當作受控加速比。
 
-若新路徑仍超時，再依分段量測決定是否做 K=2 temporal blocking，
-先不把排程門檻調整與跨代計算混在這次改動中。
+目前 11/12 已有明顯時間餘裕，先保留這版，不為了這兩題通過而再做 A/B
+或 temporal blocking。若後續有新的效能需求，再依證據決定是否加入 K=2
+跨代計算或改善 sparse/dense 派送。

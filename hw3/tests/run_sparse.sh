@@ -7,6 +7,7 @@ if [[ -z ${SLURM_JOB_ID:-} ]]; then
     exit 2
 fi
 mode=${1:-profile}
+unset PP_MOORE # Keep sliding experiments isolated in run_sliding.sh.
 if [[ $mode != check && $mode != profile && $mode != gate ]]; then
     echo 'usage: bash tests/run_sparse.sh [profile|check|gate]' >&2
     exit 2

@@ -2,7 +2,14 @@
 
 ## Status
 
-Current working tree adds dense packed R1 (pending Nano5 compilation/validation).
+An opt-in Moore sliding-window candidate is now available with PP_MOORE=sliding;
+unset or sat retains the validated SAT default. No measured candidate speedup
+or CUDA validation is available yet. See [SLIDING.md](SLIDING.md) for the bounded
+05/09 same-allocation comparison and optional baseline-only diagnostic.
+
+Revision 0713fba adds dense packed R1 and compiled on Nano5. User-supplied job
+404889 passed 90 default dense and 30 sparse GPU/CPU-reference comparisons,
+then passed the official checker and limits for 11/12 (0.202853 / 0.317 s).
 Defaults are R1 packed-byte/shared-memory counting in both schedules, R2-4
 direct counting, and R>=5 tiled prefix sums. See [DENSE_R1.md](DENSE_R1.md)
 for the change, limits, and the targeted 11/12 validation command.
@@ -16,8 +23,9 @@ of `PP_ACTIVE=auto|0|1`, which controls scheduling. Both defaults are `auto`.
 The older direct sparse version passed single-case judge 09 in 0.571 s.
 The latest packed version passed 08 in 0.426054 s and 10 in 0.390084 s with
 profiling enabled and default dispatch. The test initializer-list fix compiled
-successfully. A full judge/leaderboard run at this revision is not recorded;
-11/12 remain unverified with the new dense wrapper. See the versioned evidence below.
+successfully. A subsequent user-supplied full public judge run passed 12/12
+with total 2.573 s; see below. The judge excerpt does not identify its revision
+or job ID. Hidden correctness/performance remains unverified.
 No graph, mapped-host, or one-bit-per-cell path is enabled. The initial copy,
 allocations, launches, final copy, and frees are inside `run()` and count toward
 the official Compute time. T=0 returns without allocating anything.
@@ -32,6 +40,59 @@ with PP_KERNEL/PP_PROFILE unset (4 GPU seconds held). That verifies the previous
 default-dispatch fix, not the current sparse changes. No same-allocation
 A/B result has been supplied; do not treat historical ratios as precise speedups.
 The original reference and the fixed main.cu/ca.hpp are unchanged.
+
+## Full public judge result (2026-10-24)
+
+User supplied the following result after the dense R1 validation. Build reported
+hw3-1 up to date; the excerpt has no exact revision, job ID or environment dump.
+The recommended invocation clears PP_KERNEL, PP_ACTIVE, PP_R1 and PP_PROFILE.
+
+| Case | Verdict | Compute s |
+| --- | --- | ---: |
+| 01 | AC | 0.003 |
+| 02 | AC | 0.003 |
+| 03 | AC | 0.003 |
+| 04 | AC | 0.010 |
+| 05 | AC | 0.224 |
+| 06 | AC | 0.215 |
+| 07 | AC | 0.189 |
+| 08 | AC | 0.423 |
+| 09 | AC | 0.573 |
+| 10 | AC | 0.474 |
+| 11 | AC | 0.180 |
+| 12 | AC | 0.275 |
+
+Judge total: 12/12, 2.573 s (displayed per-case values are rounded).
+GPU held: 0.39 GPU-minutes, reported as 23 s x 1 GPU.
+User-reported leaderboard position: 50/66 at that time, not independently checked.
+The old 24.04 total included failed-case penalties; its ratio to 2.573 is not
+a measured kernel speedup. Cases 08-10 account for approximately 57% of the
+displayed total. Case 09 is nearest its limit: 0.573 / 0.7 s.
+Preserve this passing implementation as the baseline before further experiments.
+No full sweep needs repeating just to reconfirm this result.
+
+## Dense R1 validation (2026-10-24)
+
+User-supplied log: revision 0713fba4ca2d3558b84582765aac21c3186ebc3e,
+job 404889, H100 80GB HBM3, driver 550.127.08, CUDA_MODULE_LOADING unset.
+Main and test executables compiled with nvcc 12.4. Default dense gate passed
+90/90; forced sparse regression gate passed 30/30 (including R5).
+Public cases used default dispatch with PP_PROFILE=1:
+
+| Case | Verdict | Compute s | Limit s | H2D ms | Kernel interval ms | D2H ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 11 | AC | 0.202853 | 0.8 | 4.960000 | 191.184479 | 5.467552 |
+| 12 | AC | 0.317000 | 0.8 | 2.523584 | 310.848877 | 2.745536 |
+
+Both report profile_status=ok and profile_kernel=dense_r1. Case 11 reports
+sparse_selected=0 and initial_work=tiles_total=131072, confirming rejection
+of sparse entry. Its zero sparse work statistics do not mean no computation:
+the dense kernel performed the updates. Case 12 does not enter sparse inspection.
+Logs: tmp/dense-r1-404889-20261024-174746-1798483/default.
+
+The subsequent full public judge integration run is recorded above. No further
+A/B or temporal blocking is needed just to pass 11/12. Hidden performance remains
+unverified. This record is based on supplied cluster output, not local CUDA execution.
 
 ## R1 profile evidence and packed candidate (2026-10-23)
 
