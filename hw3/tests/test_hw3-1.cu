@@ -110,7 +110,7 @@ static void sparse_checks(std::mt19937 &rng) {
     std::printf("PASS %d/%d (sparse full-grid comparison; not timing)\n", tested, tested);
 }
 
-static void r1_checks(std::mt19937 &rng) {
+static void r1_checks(std::mt19937 &rng, bool report = true) {
     const int state_counts[] = {2, 3, 3, 16, 4, 2, 16, 4};
     for (int width : {3, 4, 65, 68, 128, 129, 641, 644})
     for (int mode = 0; mode < 8; ++mode) {
@@ -139,7 +139,44 @@ static void r1_checks(std::mt19937 &rng) {
                     initial[size_t(y)*p.width+x] = uint8_t(rng()%r.states);
         compare(p, initial);
     }
-    std::printf("PASS %d/%d (R1 packed boundaries and rules; not timing)\n", tested, tested);
+    if (report)
+        std::printf("PASS %d/%d (R1 packed boundaries and rules; not timing)\n", tested, tested);
+}
+
+static void dense_r1_checks(std::mt19937 &rng) {
+    r1_checks(rng, false); // 64 aligned/unaligned, Moore/VN, M0/M1, C2..16 cases
+    for (int states : {2, 4}) {
+        Rule r{1, states, false, states == 2 ? 4 : 3, 5, 2, 2, Shape::Moore};
+        for (Boundary boundary : {Boundary::Dead, Boundary::Torus})
+        for (int pattern = 0; pattern < 5; ++pattern) {
+            Problem p{129, 65, r, boundary, 17 + pattern};
+            std::vector<uint8_t> initial(size_t(p.width) * p.height, 0);
+            if (pattern == 1 || pattern == 2) {
+                // Nine live cells: same density, either one cluster or one per tile.
+                for (int y = 0; y < 3; ++y)
+                    for (int x = 0; x < 3; ++x) {
+                        const int gx = pattern == 1 ? 62 + x : 64 * x;
+                        const int gy = pattern == 1 ? 30 + y : 32 * y;
+                        initial[size_t(gy) * p.width + gx] = 1;
+                    }
+            } else if (pattern == 3) {
+                for (auto &s : initial) s = uint8_t(rng() % states);
+            } else if (pattern == 4) {
+                // Dense initially, then empty: decay without births (or C2 death).
+                for (auto &s : initial)
+                    s = states == 2 ? 1 : uint8_t(2 + rng() % (states - 2));
+                if (states == 2) p.rule.survive_lo = p.rule.survive_hi = 0;
+            }
+            compare(p, initial); // includes empty and thin final tiles
+        }
+        for (int steps : {0, 403, 1190}) {
+            Problem p{17, 19, r, states == 2 ? Boundary::Torus : Boundary::Dead, steps};
+            std::vector<uint8_t> initial(size_t(p.width) * p.height);
+            for (auto &s : initial) s = uint8_t(rng() % states);
+            compare(p, initial); // zero steps and long odd/even ping-pong chains
+        }
+    }
+    std::printf("PASS %d/%d (dense R1 boundaries, distributions and long runs; not timing)\n", tested, tested);
 }
 
 int main(int argc, char **argv) {
@@ -148,11 +185,12 @@ int main(int argc, char **argv) {
     const bool quick = argc == 2 && std::strcmp(argv[1], "--quick") == 0;
     const bool sparse = argc == 2 && std::strcmp(argv[1], "--sparse") == 0;
     const bool r1 = argc == 2 && std::strcmp(argv[1], "--r1") == 0;
+    const bool dense_r1 = argc == 2 && std::strcmp(argv[1], "--dense-r1") == 0;
     if (argc > 3) {
-        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1\n", argv[0]);
         return 2;
     }
-    if (argc >= 2 && !quick && !sparse && !r1) random_cases = std::atoi(argv[1]);
+    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1) random_cases = std::atoi(argv[1]);
     if (argc >= 3) seed = unsigned(std::strtoul(argv[2], nullptr, 10));
     if (random_cases < 0 || random_cases > 1000) return 2;
     const char *kernel = std::getenv("PP_KERNEL");
@@ -160,9 +198,14 @@ int main(int argc, char **argv) {
     const char *r1_mode = std::getenv("PP_R1");
     std::printf("kernel=%s active=%s r1=%s seed=%u mode=%s random_cases=%d\n",
                 kernel ? kernel : "auto", active ? active : "auto", r1_mode ? r1_mode : "auto", seed,
-                r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full", (quick || sparse || r1) ? 0 : random_cases);
+                dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
+                (quick || sparse || r1 || dense_r1) ? 0 : random_cases);
     check(cudaFree(nullptr));
     std::mt19937 rng(seed);
+    if (dense_r1) {
+        dense_r1_checks(rng);
+        return 0;
+    }
     if (r1) {
         r1_checks(rng);
         return 0;

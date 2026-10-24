@@ -2,18 +2,22 @@
 
 ## Status
 
-Dense counting defaults to R>=5 tiled prefix sums, otherwise direct counting.
-Sparse R1 now has a packed-byte/shared-memory candidate enabled by default;
-this newest change still needs Nano5 compilation and GPU validation.
-`PP_R1=direct` restores the measured old sparse R1 path; `PP_R1=packed` requests
-the candidate for R1 sparse entry. Other radii and dense entry are unaffected.
+Current working tree adds dense packed R1 (pending Nano5 compilation/validation).
+Defaults are R1 packed-byte/shared-memory counting in both schedules, R2-4
+direct counting, and R>=5 tiled prefix sums. See [DENSE_R1.md](DENSE_R1.md)
+for the change, limits, and the targeted 11/12 validation command.
+Sparse R1 already uses packed-byte/shared-memory counting. Revision a284817
+compiled on Nano5, passed 94 small GPU/CPU-reference comparisons, and passed
+the official checker and published limits for 08/10 in job 402239.
+`PP_R1=direct` restores direct R1 counting in either schedule; `PP_R1=packed`
+requests packed R1 unless PP_KERNEL=tiled. Other radii are unaffected.
 `PP_KERNEL=auto|naive|tiled` controls counting independently
 of `PP_ACTIVE=auto|0|1`, which controls scheduling. Both defaults are `auto`.
-User logs confirm the sparse candidate's main executable compiled on Nano5.
-Single-case judge results are 08 TLE 1.333 s, 09 AC 0.571 s, and 10 TLE 0.989 s.
-The small CUDA reference gates remain unrun: the test executable failed to
-compile its mixed pair initializer list; a local explicit-array fix is pending
-Nano5 verification. The later profiling run below confirms 08/10 correctness too.
+The older direct sparse version passed single-case judge 09 in 0.571 s.
+The latest packed version passed 08 in 0.426054 s and 10 in 0.390084 s with
+profiling enabled and default dispatch. The test initializer-list fix compiled
+successfully. A full judge/leaderboard run at this revision is not recorded;
+11/12 remain unverified with the new dense wrapper. See the versioned evidence below.
 No graph, mapped-host, or one-bit-per-cell path is enabled. The initial copy,
 allocations, launches, final copy, and frees are inside `run()` and count toward
 the official Compute time. T=0 returns without allocating anything.
@@ -49,7 +53,7 @@ queue management and launch gaps: they do not isolate arithmetic vs atomics.
 Scheduled cell updates over all generations are 68,812,943,360 and
 51,394,205,696, including inactive cells within scheduled tiles.
 
-The next candidate replaces only R1 sparse tile arithmetic with four byte lanes
+The packed implementation replaces only R1 sparse tile arithmetic with four byte lanes
 per uint32_t plus shared-memory staging. Each 64x32 tile loads 18x34 words (one
 word halo horizontally, one row vertically). State and alive tables together
 use 4896 bytes. Each of 256 threads updates two words/eight cells. Counts never
@@ -57,7 +61,7 @@ exceed nine per byte, so sums have no inter-byte carry; comparisons use high-bit
 sentinels to prevent inter-byte borrow. General C2..C16 transitions are handled.
 Aligned rows use 32-bit memory operations; other widths use scalar packing and
 valid-byte masking. Grid storage stays one byte per cell; this is instruction
-packing, not a fourfold reduction in grid storage or a measured speedup.
+packing, not a fourfold reduction in grid storage or a guaranteed fourfold speedup.
 
 Scheduling, tile dimensions, worklist atomics, fallback thresholds and full-grid
 copies are unchanged. PP_R1=auto selects packed only for sparse R1 with automatic
@@ -67,11 +71,11 @@ PP_KERNEL=tiled takes precedence. Profile reports sparse_r1 for the new path.
 Local validation: test_r1_packed.cpp compiled with GCC C++17/O2 and warnings as
 errors; 20,079,304 scalar comparisons of the exact production header passed.
 These exhaust byte equality, count ranges, C2..C16 transitions and compare
-random packed Moore/diamond neighbourhoods with scalar counts. GPU memory
-accesses, barriers, and performance remain unverified. The new runner has Bash
+random packed Moore/diamond neighbourhoods with scalar counts. The GPU checks
+and timings below provide subsequent hardware validation. The runner has Bash
 syntax/Slurm guard checks and its profile label is accepted by the parser.
 
-Next run, after committing/pushing the new header and all related changes:
+Command used for the completed packed validation (no routine rerun needed):
 
 ```bash
 cd ~/Parallel_Programming && git pull && cd hw3
@@ -85,9 +89,32 @@ This runs 64 R1 boundary/rule comparisons and 30 sparse regressions before
 profiling only 08/10 with default dispatch. No public 09 rerun or full judge.
 Use the printed session.log; expected candidate label is sparse_r1. Optional
 `ab` runs direct/packed/packed/direct without profiling in the same allocation;
-do not add this routinely before the first candidate result is known.
+do not add this routinely just to repeat the successful candidate check.
 Submission now also needs r1_packed.hpp beside tile_geometry.hpp and hw3-1.cu.
 Suggested commit: `hw3-1: pack R1 sparse updates into shared-memory byte lanes`.
+
+### Packed GPU validation: job 402239
+
+User supplied revision a284817df59d4253fa71dea5b052e2b2a29a3502, H100 80GB HBM3,
+driver 550.127.08, CUDA_MODULE_LOADING unset. Both main and test executables
+compiled successfully with nvcc sm_90/C++17. Logs:
+`tmp/r1-402239-20261023-224701-1948449` (public TSV under `default/`).
+
+- Gate 1: PASS 64/64 packed R1 aligned/unaligned boundaries and rule cases.
+- Gate 2: PASS 30/30 motion, decay, stale cleanup, growth and R5 regressions.
+- Public 08/10: default dispatch, PP_PROFILE=1, profile_kernel=sparse_r1.
+
+| Case | Verdict | Compute s | H2D ms | Kernel interval ms | D2H ms | Alloc ms | Free ms | Run host ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 08 | AC | 0.426054 | 19.522911 | 382.049652 | 21.850945 | 1.122966 | 1.411161 | 426.006573 |
+| 10 | AC | 0.390084 | 19.531200 | 346.076172 | 21.833023 | 1.175486 | 1.373719 | 390.036835 |
+
+Both limits are 0.7 s. Sparse initial/mean/max work counts exactly match job
+402205 above, with zero dense fallback steps. Scheduled work did not decrease;
+the observed reduction is in time to process it. Total-time ratios are about
+2.98x for 08 and 2.55x for 10 across separate jobs, not controlled same-allocation
+speedup measurements. Preserve this validated revision; no further 08/10 quota
+is needed just to reconfirm these results. Next unfinished paths are 11/12.
 
 ## Sparse candidate (2026-10-23; partial GPU validation)
 
@@ -101,14 +128,14 @@ User-supplied single-case judge results (separate jobs, no phase profiling):
 | 09 | AC | 0.571 | 0.7 | 3 |
 | 10 | TLE | 0.989 | 0.7 | 4 |
 
-The judge excerpts do not print a revision or chosen kernel. Local HEAD is
-ccd2825, with the test initializer fix uncommitted. These are observed timings,
+The judge excerpts did not print a revision or chosen kernel. At that point,
+local HEAD was ccd2825 with the test initializer fix uncommitted. These were observed timings,
 not a controlled speedup measurement. Case 09 is verified correct within its
-limit; 08/10 require checker confirmation and bottleneck diagnosis. Both have
-R=1, whose default counting algorithm is direct rather than prefix sums; actual
-sparse selection, work density, and dense fallback are not yet observed.
+limit; 08/10 still required checker confirmation and bottleneck diagnosis then.
+Both have R=1 and used direct counting before the packed change. Subsequent
+profiles and validation above resolve the previous unknowns.
 
-Next diagnostic: only 08 and 10 in one bounded allocation, using the already
+Historical diagnostic command (completed in job 402205): only 08 and 10, using the already
 built main binary (no dependency on the test executable or its pending fix):
 
 ```bash

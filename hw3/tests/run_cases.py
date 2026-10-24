@@ -30,7 +30,7 @@ def parse_profile(log_text):
         if len(lines) != 1:
             raise ValueError("expected one profile per process")
         fields = dict(token.split("=", 1) for token in lines[0].split()[1:])
-        if fields["kernel"] not in ("naive", "tiled", "sparse_naive", "sparse_tiled", "sparse_r1", "none"):
+        if fields["kernel"] not in ("naive", "tiled", "dense_r1", "sparse_naive", "sparse_tiled", "sparse_r1", "none"):
             raise ValueError("invalid profile kernel")
         times = [float(fields[name]) for name in PROFILE_TIMES]
         if any(not math.isfinite(value) or value < 0 for value in times):
