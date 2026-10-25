@@ -202,6 +202,53 @@ static void sliding_checks(std::mt19937 &rng) {
     std::printf("PASS %d/%d (Moore sliding radius/boundary/state checks; not timing)\n", tested, tested);
 }
 
+static void graph_checks(std::mt19937 &rng) {
+    for (Boundary boundary : {Boundary::Dead, Boundary::Torus}) {
+        Rule life{1, 2, false, 2, 3, 3, 3, Shape::Moore};
+        for (int steps : {0, 1, 31, 32, 33, 63, 64, 65, 97}) {
+            Problem p{steps % 2 ? 321 : 320, 161, life, boundary, steps};
+            std::vector<uint8_t> initial(size_t(p.width) * p.height, 0);
+            auto put = [&](int x, int y) {
+                initial[size_t(y % p.height) * p.width + x % p.width] = 1;
+            };
+            // Moving gliders cross tiles/seams and revisit stamp storage after replay.
+            const int origins[][2] = {{62, 30}, {p.width-2, 159}};
+            for (const auto &origin : origins) {
+                int x = origin[0], y = origin[1];
+                put(x+1,y); put(x+2,y+1); put(x,y+2); put(x+1,y+2); put(x+2,y+2);
+            }
+            compare(p, initial);
+        }
+        for (int pattern = 0; pattern < 3; ++pattern) {
+            Problem p{321, 161, life, boundary, 97};
+            std::vector<uint8_t> initial(size_t(p.width) * p.height, 0);
+            if (pattern == 1) {
+                p.rule.states = 16;
+                initial[0] = 2; initial[63] = 15; // Decay then empty across replays.
+            } else if (pattern == 2) {
+                p.rule = Rule{1, 2, false, 0, 8, 1, 8, Shape::Moore};
+                for (int x = 0; x < p.width; ++x) initial[31*p.width+x] = 1;
+                // Sparse growth triggers one-way dense fallback during the graph.
+            }
+            compare(p, initial);
+        }
+        for (int radius : {1, 2, 5})
+        for (Shape shape : {Shape::Moore, Shape::VonNeumann}) {
+            const int maxn = shape == Shape::Moore ? (2*radius+1)*(2*radius+1) : 2*radius*(radius+1)+1;
+            Rule r{radius, 4, true, 1, maxn, 2, 3, shape};
+            Problem p{33, 17, r, boundary, 65};
+            std::vector<uint8_t> initial(size_t(p.width) * p.height);
+            for (auto &s : initial) s = uint8_t(rng()%4);
+            compare(p, initial); // M1, C4, VN, direct R2 and tiled R5, odd tail.
+        }
+        Problem p{7, 9, life, boundary, 5000};
+        std::vector<uint8_t> initial(63, 0);
+        initial[16] = initial[17] = initial[23] = initial[24] = 1;
+        compare(p, initial); // Maximum T, repeated run() calls must reset epoch.
+    }
+    std::printf("PASS %d/%d (graph batches, parity, epochs and fallback; not timing)\n", tested, tested);
+}
+
 int main(int argc, char **argv) {
     int random_cases = 64;
     unsigned seed = 20261022;
@@ -210,11 +257,12 @@ int main(int argc, char **argv) {
     const bool r1 = argc == 2 && std::strcmp(argv[1], "--r1") == 0;
     const bool dense_r1 = argc == 2 && std::strcmp(argv[1], "--dense-r1") == 0;
     const bool sliding = argc == 2 && std::strcmp(argv[1], "--sliding") == 0;
+    const bool graphs = argc == 2 && std::strcmp(argv[1], "--graphs") == 0;
     if (argc > 3) {
-        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1 | --sliding\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1 | --sliding | --graphs\n", argv[0]);
         return 2;
     }
-    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1 && !sliding) random_cases = std::atoi(argv[1]);
+    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1 && !sliding && !graphs) random_cases = std::atoi(argv[1]);
     if (argc >= 3) seed = unsigned(std::strtoul(argv[2], nullptr, 10));
     if (random_cases < 0 || random_cases > 1000) return 2;
     const char *kernel = std::getenv("PP_KERNEL");
@@ -224,10 +272,15 @@ int main(int argc, char **argv) {
     std::printf("kernel=%s active=%s r1=%s moore=%s seed=%u mode=%s random_cases=%d\n",
                 kernel ? kernel : "auto", active ? active : "auto", r1_mode ? r1_mode : "auto",
                 moore_mode ? moore_mode : "auto", seed,
-                sliding ? "sliding" : dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
-                (quick || sparse || r1 || dense_r1 || sliding) ? 0 : random_cases);
+                graphs ? "graphs" : sliding ? "sliding" : dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
+                (quick || sparse || r1 || dense_r1 || sliding || graphs) ? 0 : random_cases);
+    std::printf("graph=%s\n", std::getenv("PP_GRAPH") ? std::getenv("PP_GRAPH") : "0");
     check(cudaFree(nullptr));
     std::mt19937 rng(seed);
+    if (graphs) {
+        graph_checks(rng);
+        return 0;
+    }
     if (sliding) {
         sliding_checks(rng);
         return 0;

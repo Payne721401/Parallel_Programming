@@ -52,9 +52,10 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual(counts[0], counts[1])
 
     def test_environment_and_slurm_guard(self):
-        with patch.dict(os.environ, {'PP_KERNEL':'naive', 'PP_MOORE':'sat', 'PP_PROFILE':'0'}):
+        with patch.dict(os.environ, {'PP_KERNEL':'naive', 'PP_MOORE':'sat', 'PP_PROFILE':'0', 'PP_GRAPH':'1'}):
             env = matrix.environment()
             self.assertNotIn('PP_KERNEL', env)
+            self.assertNotIn('PP_GRAPH', env)
             self.assertNotIn('PP_MOORE', env)
             self.assertEqual(env['PP_PROFILE'], '1')
             ref = matrix.environment(reference=True)

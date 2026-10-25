@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Dense R1: default-dispatch correctness, sparse regression, then public 11/12 only.
 set -euo pipefail
+export PP_GRAPH=0 # Preserve the non-graph baseline for this existing experiment.
 cd "$(dirname "$0")/.."
 if [[ -z ${SLURM_JOB_ID:-} ]]; then
     echo 'Run this script through srun/sbatch on Nano5.' >&2

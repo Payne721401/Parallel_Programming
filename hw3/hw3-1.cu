@@ -3,6 +3,7 @@
 // Sparse entry always retains the one-way dense fallback on growth.
 // PP_R1=auto|direct|packed controls R1 dense/sparse counting; auto uses packed.
 // PP_MOORE=auto|sat|sliding selects tiled Moore counting; auto uses sliding for R>=5.
+// PP_GRAPH=0|1 enables experimental 32-generation replay; default is 0.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -498,9 +499,10 @@ __global__ void seed_worklist(const uint8_t *nonzero, TileQueue queue,
 }
 
 __global__ void prepare_sparse(TileQueue current, TileQueue next, int *dense,
-                                int tile_count, SparseStats *stats) {
+                                int tile_count, SparseStats *stats, int *epoch) {
     // A kernel boundary publishes the reset before any next-list producers run.
     *next.count = 0;
+    if (epoch) ++*epoch; // Runtime generation, not the captured host loop index.
     if (*current.count > tile_count / 2) *dense = 1;
     const int work = *dense ? tile_count : *current.count;
     if (stats) {
@@ -514,7 +516,9 @@ template <bool Tiled, bool Moore, bool Packed = false, bool Sliding = false>
 __global__ void step_sparse(const uint8_t *__restrict__ src,
                             uint8_t *__restrict__ dst, Problem p,
                             TileQueue current, TileQueue next, int *stamp, int epoch,
-                            const int *dense, int tiles_x, int tile_count) {
+                            const int *dense, int tiles_x, int tile_count,
+                            const int *device_epoch) {
+    if (device_epoch) epoch = *device_epoch;
     extern __shared__ uint32_t scratch[];
     uint16_t *sums = reinterpret_cast<uint16_t *>(scratch);
     const bool full = *dense != 0;
@@ -548,7 +552,7 @@ __global__ void step_sparse(const uint8_t *__restrict__ src,
 struct SparseWorkspace {
     uint8_t *nonzero = nullptr;
     int *ids[2]{};
-    int *counts = nullptr; // queue 0 count, queue 1 count, dense fallback flag
+    int *counts = nullptr; // queue 0 count, queue 1 count, dense flag, graph epoch
     int *stamp = nullptr;
     SparseStats *stats = nullptr;
     int tiles_x = 0, tile_count = 0, initial_work = 0, workers = 0;
@@ -561,13 +565,13 @@ struct SparseWorkspace {
         check(cudaMalloc(&nonzero, size_t(tile_count)), "allocate initial tile flags");
         for (auto &list : ids)
             check(cudaMalloc(&list, size_t(tile_count) * sizeof(int)), "allocate tile list");
-        check(cudaMalloc(&counts, 3 * sizeof(int)), "allocate tile counters");
+        check(cudaMalloc(&counts, 4 * sizeof(int)), "allocate tile counters");
         check(cudaMalloc(&stamp, size_t(tile_count) * sizeof(int)), "allocate tile stamps");
         if (profile) check(cudaMalloc(&stats, sizeof(SparseStats)), "allocate sparse statistics");
     }
 
     bool initialize(const uint8_t *src, uint8_t *dst, const Problem &p, bool forced) {
-        check(cudaMemsetAsync(counts, 0, 3 * sizeof(int)), "initialize tile counters");
+        check(cudaMemsetAsync(counts, 0, 4 * sizeof(int)), "initialize tile counters");
         mark_initial_tiles<<<tile_count, 256>>>(src, nonzero, p, tiles_x);
         check(cudaGetLastError(), "launch mark_initial_tiles");
         seed_worklist<<<(tile_count + 255) / 256, 256>>>(nonzero, queue(0), p, tiles_x, tile_count);
@@ -601,6 +605,12 @@ struct SparseWorkspace {
 
 void run(uint8_t *grid, const Problem &p) {
     PhaseProfile profile;
+    const char *graph_mode = std::getenv("PP_GRAPH");
+    const bool graph_requested = graph_mode && std::strcmp(graph_mode, "1") == 0;
+    if (graph_mode && !graph_requested && std::strcmp(graph_mode, "0") != 0) {
+        std::fprintf(stderr, "hw3-1: PP_GRAPH must be 0 or 1\n");
+        std::exit(EXIT_FAILURE);
+    }
     if (p.steps == 0) {
         profile.report("none", p); // all phase times zero; no CUDA events allocated
         return;
@@ -672,53 +682,81 @@ void run(uint8_t *grid, const Problem &p) {
     // One stream orders generations and queue publication. Dense writes every
     // cell; sparse maintains zero outside the tracked support/cleanup set.
     const int iterations = sparse && sparse_work.initial_work == 0 ? 0 : p.steps;
-    for (int t = 0; t < iterations; ++t) {
+    constexpr int GRAPH_BATCH = 32; // Even: both grid and queue parity return to zero.
+    const bool graph_selected = graph_requested && iterations >= GRAPH_BATCH;
+    cudaStream_t stream = nullptr;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    double graph_build_ms = 0;
+    int *device_epoch = graph_selected && sparse ? sparse_work.counts + 3 : nullptr;
+    auto launch_step = [&](int t) {
         if (sparse) {
             const TileQueue current = sparse_work.queue(t & 1);
             const TileQueue next = sparse_work.queue((t + 1) & 1);
-            prepare_sparse<<<1, 1>>>(current, next, sparse_work.counts + 2,
-                                      sparse_work.tile_count, sparse_work.stats);
+            prepare_sparse<<<1, 1, 0, stream>>>(current, next, sparse_work.counts + 2,
+                                      sparse_work.tile_count, sparse_work.stats, device_epoch);
             check(cudaGetLastError(), "launch prepare_sparse");
             if (packed && p.rule.shape == Shape::Moore)
-                step_sparse<false, true, true><<<sparse_work.workers, threads, R1_SHARED_BYTES>>>(
+                step_sparse<false, true, true><<<sparse_work.workers, threads, R1_SHARED_BYTES, stream>>>(
                     src, dst, p, current, next, sparse_work.stamp, t + 1,
-                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count);
+                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
             else if (packed)
-                step_sparse<false, false, true><<<sparse_work.workers, threads, R1_SHARED_BYTES>>>(
+                step_sparse<false, false, true><<<sparse_work.workers, threads, R1_SHARED_BYTES, stream>>>(
                     src, dst, p, current, next, sparse_work.stamp, t + 1,
-                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count);
+                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
             else if (!tiled)
-                step_sparse<false, false><<<sparse_work.workers, threads>>>(
+                step_sparse<false, false><<<sparse_work.workers, threads, 0, stream>>>(
                     src, dst, p, current, next, sparse_work.stamp, t + 1,
-                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count);
+                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
             else if (sliding)
-                step_sparse<true, true, false, true><<<sparse_work.workers, threads, shared_bytes>>>(
+                step_sparse<true, true, false, true><<<sparse_work.workers, threads, shared_bytes, stream>>>(
                     src, dst, p, current, next, sparse_work.stamp, t + 1,
-                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count);
+                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
             else if (p.rule.shape == Shape::Moore)
-                step_sparse<true, true><<<sparse_work.workers, threads, shared_bytes>>>(
+                step_sparse<true, true><<<sparse_work.workers, threads, shared_bytes, stream>>>(
                     src, dst, p, current, next, sparse_work.stamp, t + 1,
-                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count);
+                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
             else
-                step_sparse<true, false><<<sparse_work.workers, threads, shared_bytes>>>(
+                step_sparse<true, false><<<sparse_work.workers, threads, shared_bytes, stream>>>(
                     src, dst, p, current, next, sparse_work.stamp, t + 1,
-                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count);
+                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
         }
         else if (packed && p.rule.shape == Shape::Moore)
-            step_r1_dense<true><<<blocks, threads, R1_SHARED_BYTES>>>(src, dst, p);
+            step_r1_dense<true><<<blocks, threads, R1_SHARED_BYTES, stream>>>(src, dst, p);
         else if (packed)
-            step_r1_dense<false><<<blocks, threads, R1_SHARED_BYTES>>>(src, dst, p);
-        else if (!tiled) step_naive<<<blocks, threads>>>(src, dst, p);
+            step_r1_dense<false><<<blocks, threads, R1_SHARED_BYTES, stream>>>(src, dst, p);
+        else if (!tiled) step_naive<<<blocks, threads, 0, stream>>>(src, dst, p);
         else if (sliding)
-            step_tiled<true, true><<<blocks, threads, shared_bytes>>>(src, dst, p);
+            step_tiled<true, true><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
         else if (p.rule.shape == Shape::Moore)
-            step_tiled<true><<<blocks, threads, shared_bytes>>>(src, dst, p);
-        else step_tiled<false><<<blocks, threads, shared_bytes>>>(src, dst, p);
+            step_tiled<true><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
+        else step_tiled<false><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
         check(cudaGetLastError(), sparse ? "launch step_sparse" : packed ? "launch step_r1_dense"
                                    : tiled ? "launch step_tiled" : "launch step_naive");
         uint8_t *old_src = src;
         src = dst;
         dst = old_src;
+    };
+    if (graph_selected) {
+        // Complete default-stream setup before capture on a private stream.
+        // One setup wait and one final wait only; no per-generation host waits.
+        check(cudaStreamSynchronize(0), "finish setup before graph capture");
+        const auto build_start = profile.enabled ? PhaseProfile::Clock::now() : PhaseProfile::Clock::time_point{};
+        check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create graph stream");
+        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "begin graph capture");
+        // Capture records nodes; it does not execute the updates or advance epoch.
+        // An even batch restores the host src/dst pointers after recording.
+        for (int t = 0; t < GRAPH_BATCH; ++t) launch_step(t);
+        check(cudaStreamEndCapture(stream, &graph), "end graph capture");
+        check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "instantiate generation graph");
+        if (profile.enabled) graph_build_ms = PhaseProfile::elapsed_ms(build_start);
+        for (int batch = 0; batch < iterations / GRAPH_BATCH; ++batch)
+            check(cudaGraphLaunch(executable, stream), "launch generation graph");
+        // Full batches are even. Tail launches use the same device epoch and stream.
+        for (int t = iterations / GRAPH_BATCH * GRAPH_BATCH; t < iterations; ++t) launch_step(t);
+        check(cudaStreamSynchronize(stream), "finish graph and tail");
+    } else {
+        for (int t = 0; t < iterations; ++t) launch_step(t);
     }
     profile.mark(2);
     // Blocking D2H waits for all preceding kernels; src holds the final state
@@ -731,12 +769,21 @@ void run(uint8_t *grid, const Problem &p) {
     profile.mark(3);
     profile.collect();
     const auto free_start = profile.enabled ? PhaseProfile::Clock::now() : PhaseProfile::Clock::time_point{};
+    if (executable) check(cudaGraphExecDestroy(executable), "destroy executable graph");
+    if (graph) check(cudaGraphDestroy(graph), "destroy generation graph");
+    if (stream) check(cudaStreamDestroy(stream), "destroy graph stream");
     check(cudaFree(dst), "free destination");
     check(cudaFree(src), "free source");
     sparse_work.release();
     if (profile.enabled) profile.free_host_ms = PhaseProfile::elapsed_ms(free_start);
     profile.report(sparse ? (packed ? "sparse_r1" : sliding ? "sparse_sliding" : tiled ? "sparse_tiled" : "sparse_naive")
                          : (packed ? "dense_r1" : sliding ? "sliding" : tiled ? "tiled" : "naive"), p);
+    if (profile.enabled)
+        std::fprintf(stderr,
+            "[PP_GRAPH] requested=%d selected=%d batch=%d replays=%d tail=%d build_host_ms=%.6f\n",
+            int(graph_requested), int(graph_selected), GRAPH_BATCH,
+            graph_selected ? iterations / GRAPH_BATCH : 0,
+            graph_selected ? iterations % GRAPH_BATCH : iterations, graph_build_ms);
     if (profile.enabled && inspect_sparse)
         std::fprintf(stderr,
             "[PP_SPARSE] selected=%d tiles_total=%d initial_work=%d work_sum=%llu "

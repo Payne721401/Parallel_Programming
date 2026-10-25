@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Targeted R1 candidate: small reference checks, then only public 08 and 10.
 set -euo pipefail
+export PP_GRAPH=0 # Preserve the non-graph baseline for this existing experiment.
 cd "$(dirname "$0")/.."
 if [[ -z ${SLURM_JOB_ID:-} ]]; then
     echo 'Run this script through srun/sbatch on Nano5.' >&2
