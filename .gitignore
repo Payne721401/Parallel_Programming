@@ -65,3 +65,4 @@ hw3/hw3-1
 hw3/hw3-1-seq
 hw3/tests/test_hw3-1
 hw3/tests/trace_hw3-1
+hw3/tests/test_evolution

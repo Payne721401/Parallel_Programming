@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PP_EVOLVE=0 # Evolution scans must not contaminate performance comparisons.
 export PP_GRAPH=0 # Preserve the non-graph baseline for this existing experiment.
 cd "$(dirname "$0")/.."
 fail() { echo "ERROR: $*" >&2; exit 1; }

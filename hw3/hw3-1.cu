@@ -4,6 +4,7 @@
 // PP_R1=auto|direct|packed controls R1 dense/sparse counting; auto uses packed.
 // PP_MOORE=auto|sat|sliding selects tiled Moore counting; auto uses sliding for R>=5.
 // PP_GRAPH=0|1 enables experimental 32-generation replay; default is 0.
+// PP_EVOLVE=1 enables sampled full-grid evolution diagnostics; default is 0.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "ca.hpp"
 #include "tile_geometry.hpp"
@@ -601,17 +603,24 @@ struct SparseWorkspace {
     }
 };
 
+#include "evolution_diag.cuh"
+
 } // namespace
 
 void run(uint8_t *grid, const Problem &p) {
     PhaseProfile profile;
+    EvolutionProfile evolution;
     const char *graph_mode = std::getenv("PP_GRAPH");
     const bool graph_requested = graph_mode && std::strcmp(graph_mode, "1") == 0;
     if (graph_mode && !graph_requested && std::strcmp(graph_mode, "0") != 0) {
         std::fprintf(stderr, "hw3-1: PP_GRAPH must be 0 or 1\n");
         std::exit(EXIT_FAILURE);
     }
-    if (p.steps == 0) {
+    if (evolution.enabled && graph_requested) {
+        std::fprintf(stderr, "hw3-1: PP_EVOLVE=1 requires PP_GRAPH=0; measure graph speed separately\n");
+        std::exit(EXIT_FAILURE);
+    }
+    if (p.steps == 0 && !evolution.enabled) {
         profile.report("none", p); // all phase times zero; no CUDA events allocated
         return;
     }
@@ -670,6 +679,9 @@ void run(uint8_t *grid, const Problem &p) {
     check(cudaMemcpy(src, grid, bytes, cudaMemcpyHostToDevice), "copy initial grid");
     profile.mark(1);
     const bool sparse = inspect_sparse && sparse_work.initialize(src, dst, p, force_sparse);
+    evolution.prepare(p);
+    evolution.sample(0, src, nullptr, p, sparse ? sparse_work.counts : nullptr,
+                     sparse ? sparse_work.counts+2 : nullptr);
 
     const dim3 threads(32, 8);
     const int tile_w = (tiled || packed) ? TILE_W : 32;
@@ -681,7 +693,7 @@ void run(uint8_t *grid, const Problem &p) {
                                            * sizeof(uint16_t) : 0);
     // One stream orders generations and queue publication. Dense writes every
     // cell; sparse maintains zero outside the tracked support/cleanup set.
-    const int iterations = sparse && sparse_work.initial_work == 0 ? 0 : p.steps;
+    const int iterations = !evolution.enabled && sparse && sparse_work.initial_work == 0 ? 0 : p.steps;
     constexpr int GRAPH_BATCH = 32; // Even: both grid and queue parity return to zero.
     const bool graph_selected = graph_requested && iterations >= GRAPH_BATCH;
     cudaStream_t stream = nullptr;
@@ -736,6 +748,9 @@ void run(uint8_t *grid, const Problem &p) {
         uint8_t *old_src = src;
         src = dst;
         dst = old_src;
+        if (evolution.enabled)
+            evolution.sample(t+1, src, dst, p, sparse ? sparse_work.counts+((t+1)&1) : nullptr,
+                             sparse ? sparse_work.counts+2 : nullptr);
     };
     if (graph_selected) {
         // Complete default-stream setup before capture on a private stream.
@@ -768,6 +783,7 @@ void run(uint8_t *grid, const Problem &p) {
               "read sparse statistics");
     profile.mark(3);
     profile.collect();
+    evolution.finish(p, sparse);
     const auto free_start = profile.enabled ? PhaseProfile::Clock::now() : PhaseProfile::Clock::time_point{};
     if (executable) check(cudaGraphExecDestroy(executable), "destroy executable graph");
     if (graph) check(cudaGraphDestroy(graph), "destroy generation graph");

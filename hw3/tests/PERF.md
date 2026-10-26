@@ -2,17 +2,16 @@
 
 ## Status
 
-The working tree now promotes tiled Moore R>=5 to sliding under PP_MOORE=auto
-(also the unset default); PP_MOORE=sat retains the old implementation. This new
-default still needs a full public integration run. The feature matrix/trace tools
-are implemented but not yet executed on Nano5: see [FEATURE_MATRIX.md](FEATURE_MATRIX.md).
-Revision 152fec2 compiled on
-Nano5 and passed 78 CPU-reference checks. User-supplied job 405529 measured
-SAT/sliding speedups of 1.424x on 05 and 1.216x on 09 in a profiled ABBA run.
-The subsequent unprofiled R20 case 07 ABBA passed all four runs: SAT mean
-0.189035 s, sliding mean 0.1351475 s (1.399x, 28.5% time reduction).
-Unprofiled 05/09 and hidden performance remain unmeasured.
-See [SLIDING.md](SLIDING.md) for the evidence and next targeted check.
+Latest user-provided full judge (2026-10-26): 12/12 AC, total 2.261 s versus
+2.573 s previously. Moore sliding is the default for tiled R>=5. The new judge
+05/07/09 times (0.157/0.135/0.471 s) agree with prior SAT/sliding A/B evidence.
+The full judge excerpt does not identify its revision or inherited environment.
+Feature matrix job 405871 and trace job 406000 completed. Graph comparison job
+408274 passed correctness but did not establish net speedup; PP_GRAPH remains 0.
+See [OPTIMIZATION_STATUS.md](OPTIMIZATION_STATUS.md) for current dispatch,
+measured benefits, limitations and the remaining gap to a 0.3 s total.
+Sampled evolution diagnostics are now implemented, with GPU validation pending:
+[EVOLUTION.md](EVOLUTION.md). Diagnostic timings must not be treated as judge speed.
 
 Revision 0713fba adds dense packed R1 and compiled on Nano5. User-supplied job
 404889 passed 90 default dense and 30 sparse GPU/CPU-reference comparisons,
