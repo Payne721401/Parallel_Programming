@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # First experiment: graph submission only, retaining all existing update kernels.
 set -euo pipefail
+export PP_BITPLANE=0 # Preserve the established experiment baseline.
 export PP_SUPPORT=tile # Preserve the reference influence policy.
 export PP_EVOLVE=0 # Evolution scans must not contaminate performance comparisons.
 cd "$(dirname "$0")/.."

@@ -6,6 +6,7 @@
 // PP_GRAPH=0|1 enables experimental 32-generation replay; default is 0.
 // PP_EVOLVE=1 enables sampled full-grid evolution diagnostics; default is 0.
 // PP_SUPPORT=tile|bbox selects sparse influence; default bbox (tile for evolution diagnostics).
+// PP_BITPLANE=0|1 opts into dense R1 C=2 bit planes; default 0. PP_BIT_ROWS=1|4.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -19,6 +20,7 @@
 #include "ca.hpp"
 #include "tile_geometry.hpp"
 #include "r1_packed.hpp"
+#include "r1_bits.hpp"
 
 namespace {
 
@@ -501,6 +503,8 @@ __global__ void step_r1_dense(const uint8_t *__restrict__ src,
         int(blockIdx.x) * TILE_W, int(blockIdx.y) * TILE_H, words);
 }
 
+#include "r1_bitplane.cuh"
+
 struct TileQueue {
     int *ids;
     int *count;
@@ -692,6 +696,7 @@ struct SparseWorkspace {
 void run(uint8_t *grid, const Problem &p) {
     PhaseProfile profile;
     EvolutionProfile evolution;
+    BitplaneExperiment bitplane;
     const char *support_mode = std::getenv("PP_SUPPORT");
     const bool tight_support = support_mode ? std::strcmp(support_mode, "bbox") == 0 : !evolution.enabled;
     if (support_mode && !tight_support && std::strcmp(support_mode, "tile") != 0) {
@@ -716,6 +721,8 @@ void run(uint8_t *grid, const Problem &p) {
     }
     if (p.steps == 0 && !evolution.enabled) {
         profile.report("none", p); // all phase times zero; no CUDA events allocated
+        bitplane.reason = bitplane.requested ? "zero_steps" : "disabled";
+        bitplane.report(profile.enabled);
         return;
     }
     // The default must work in the judge without an environment override.
@@ -751,6 +758,13 @@ void run(uint8_t *grid, const Problem &p) {
     // Respect an explicit PP_KERNEL=naive baseline unless packed is requested.
     const bool packed = p.rule.radius == 1 && !tiled && (r1_force || (r1_auto && automatic));
     const size_t bytes = size_t(p.width) * p.height;
+    const bool bit_eligible = bitplane.requested && packed && p.rule.states == 2
+                           && !graph_requested && !evolution.enabled;
+    const size_t bit_words = size_t((p.width+31)/32)*p.height;
+    // Tiny unaligned rows may use more bytes when padded to 32 bits (e.g. W=3).
+    // Reuse the existing two allocations; pack/evolve/unpack never alias in one launch.
+    const size_t allocation_bytes = bit_eligible && bit_words*sizeof(uint32_t) > bytes
+                                  ? bit_words*sizeof(uint32_t) : bytes;
     const char *active = std::getenv("PP_ACTIVE");
     const bool adaptive = !active || std::strcmp(active, "auto") == 0;
     const bool force_sparse = active && std::strcmp(active, "1") == 0;
@@ -764,8 +778,8 @@ void run(uint8_t *grid, const Problem &p) {
     SparseWorkspace sparse_work;
     uint8_t *src = nullptr, *dst = nullptr;
     const auto alloc_start = profile.enabled ? PhaseProfile::Clock::now() : PhaseProfile::Clock::time_point{};
-    check(cudaMalloc(&src, bytes), "allocate source");
-    check(cudaMalloc(&dst, bytes), "allocate destination");
+    check(cudaMalloc(&src, allocation_bytes), "allocate source");
+    check(cudaMalloc(&dst, allocation_bytes), "allocate destination");
     if (inspect_sparse) sparse_work.allocate(p, profile.enabled);
     if (profile.enabled) profile.alloc_host_ms = PhaseProfile::elapsed_ms(alloc_start);
     profile.prepare();
@@ -773,6 +787,11 @@ void run(uint8_t *grid, const Problem &p) {
     check(cudaMemcpy(src, grid, bytes, cudaMemcpyHostToDevice), "copy initial grid");
     profile.mark(1);
     const bool sparse = inspect_sparse && sparse_work.initialize(src, dst, p, force_sparse);
+    bitplane.reason = !bitplane.requested ? "disabled" : evolution.enabled ? "evolution" :
+        graph_requested ? "graph" : !packed ? "not_packed_r1" : p.rule.states != 2 ? "states" :
+        sparse ? "sparse" : "enabled";
+    bitplane.selected = std::strcmp(bitplane.reason,"enabled")==0;
+    bitplane.prepare(profile.enabled);
     evolution.prepare(p);
     evolution.sample(0, src, nullptr, p, sparse ? sparse_work.counts : nullptr,
                      sparse ? sparse_work.counts+2 : nullptr);
@@ -853,7 +872,39 @@ void run(uint8_t *grid, const Problem &p) {
             evolution.sample(t+1, src, dst, p, sparse ? sparse_work.counts+((t+1)&1) : nullptr,
                              sparse ? sparse_work.counts+2 : nullptr);
     };
-    if (graph_selected) {
+    if (bitplane.selected) {
+        auto swap_buffers = [&]() { uint8_t *old=src; src=dst; dst=old; };
+        const unsigned conversion_blocks = unsigned((bit_words+7)/8 < 8192 ? (bit_words+7)/8 : 8192);
+        bitplane.mark(0);
+        pack_r1_bits<<<conversion_blocks,256>>>(src,reinterpret_cast<uint32_t *>(dst),p.width,p.height);
+        check(cudaGetLastError(),"launch bit pack");
+        swap_buffers();
+        bitplane.mark(1);
+        auto evolve_bits = [&](auto row_tag) {
+            constexpr int Rows = decltype(row_tag)::value;
+            const dim3 bt(32,4), bg(((p.width+31)/32+31)/32,(p.height+4*Rows-1)/(4*Rows));
+            for (int t=0; t<iterations; ++t) {
+                const auto *input=reinterpret_cast<const uint32_t *>(src);
+                auto *output=reinterpret_cast<uint32_t *>(dst);
+                if (p.boundary == Boundary::Torus) {
+                    if (p.rule.shape == Shape::Moore) step_r1_bits<Rows,true,true><<<bg,bt>>>(input,output,p);
+                    else step_r1_bits<Rows,false,true><<<bg,bt>>>(input,output,p);
+                } else {
+                    if (p.rule.shape == Shape::Moore) step_r1_bits<Rows,true,false><<<bg,bt>>>(input,output,p);
+                    else step_r1_bits<Rows,false,false><<<bg,bt>>>(input,output,p);
+                }
+                check(cudaGetLastError(),"launch bit-plane step");
+                swap_buffers();
+            }
+        };
+        if (bitplane.rows == 1) evolve_bits(std::integral_constant<int,1>{});
+        else evolve_bits(std::integral_constant<int,4>{});
+        bitplane.mark(2);
+        unpack_r1_bits<<<conversion_blocks,256>>>(reinterpret_cast<const uint32_t *>(src),dst,p.width,p.height);
+        check(cudaGetLastError(),"launch bit unpack");
+        swap_buffers();
+        bitplane.mark(3);
+    } else if (graph_selected) {
         // Complete default-stream setup before capture on a private stream.
         // One setup wait and one final wait only; no per-generation host waits.
         check(cudaStreamSynchronize(0), "finish setup before graph capture");
@@ -884,6 +935,7 @@ void run(uint8_t *grid, const Problem &p) {
               "read sparse statistics");
     profile.mark(3);
     profile.collect();
+    bitplane.finish();
     evolution.finish(p, sparse);
     const auto free_start = profile.enabled ? PhaseProfile::Clock::now() : PhaseProfile::Clock::time_point{};
     if (executable) check(cudaGraphExecDestroy(executable), "destroy executable graph");
@@ -894,7 +946,8 @@ void run(uint8_t *grid, const Problem &p) {
     sparse_work.release();
     if (profile.enabled) profile.free_host_ms = PhaseProfile::elapsed_ms(free_start);
     profile.report(sparse ? (packed ? "sparse_r1" : sliding ? "sparse_sliding" : tiled ? "sparse_tiled" : "sparse_naive")
-                         : (packed ? "dense_r1" : sliding ? "sliding" : tiled ? "tiled" : "naive"), p);
+                         : (bitplane.selected ? "dense_bits" : packed ? "dense_r1" : sliding ? "sliding" : tiled ? "tiled" : "naive"), p);
+    bitplane.report(profile.enabled);
     if (profile.enabled)
         std::fprintf(stderr,
             "[PP_GRAPH] requested=%d selected=%d batch=%d replays=%d tail=%d build_host_ms=%.6f\n",

@@ -279,6 +279,39 @@ static void graph_checks(std::mt19937 &rng) {
     std::printf("PASS %d/%d (graph batches, parity, epochs and fallback; not timing)\n", tested, tested);
 }
 
+static void bitplane_checks(std::mt19937 &rng) {
+    // Cross bit/word/warp seams; every shape, boundary, M and zero/odd/even T.
+    for (int width : {3,31,32,33,63,64,65,1023,1024,1025,1057})
+    for (Boundary boundary : {Boundary::Dead,Boundary::Torus})
+    for (Shape shape : {Shape::Moore,Shape::VonNeumann})
+    for (int centre : {0,1})
+    for (int steps : {0,1,2,7,17}) {
+        const int maxn = (shape == Shape::Moore ? 8 : 4)+centre;
+        const int slo = centre + int(rng()%unsigned(maxn-centre+1));
+        const int blo = 1 + int(rng()%unsigned(maxn));
+        Rule rule{1,2,bool(centre),slo,slo+int(rng()%unsigned(maxn-slo+1)),
+                  blo,blo+int(rng()%unsigned(maxn-blo+1)),shape};
+        // Two larger checks exceed the conversion grid stride (65536 words).
+        const int height = width==1057 && steps==2 && shape==Shape::Moore && centre==0
+                         ? 2113 : width==3 ? 3 : centre ? 19 : 5;
+        Problem p{width,height,rule,boundary,steps};
+        std::vector<uint8_t> initial(size_t(p.width)*p.height);
+        for (auto &s:initial) s=uint8_t(rng()&1u);
+        // Include occupied corners, so padding/torus seams cannot rely on zeros.
+        initial.front()=initial.back()=1;
+        compare(p,initial);
+    }
+    // Unsupported state counts and radius must retain the exact byte path.
+    for (int states : {3,4,16}) for (int radius : {1,2})
+    for (Shape shape : {Shape::Moore,Shape::VonNeumann}) {
+        Problem p{67,19,Rule{radius,states,false,2,3,3,3,shape},Boundary::Torus,7};
+        std::vector<uint8_t> initial(size_t(p.width)*p.height);
+        for (auto &s:initial) s=uint8_t(rng()%states);
+        compare(p,initial);
+    }
+    std::printf("PASS %d/%d (bit-plane boundaries, rules, parity and fallbacks; not timing)\n",tested,tested);
+}
+
 int main(int argc, char **argv) {
     int random_cases = 64;
     unsigned seed = 20261022;
@@ -289,11 +322,12 @@ int main(int argc, char **argv) {
     const bool sliding = argc == 2 && std::strcmp(argv[1], "--sliding") == 0;
     const bool graphs = argc == 2 && std::strcmp(argv[1], "--graphs") == 0;
     const bool support = argc == 2 && std::strcmp(argv[1], "--support") == 0;
+    const bool bits = argc == 2 && std::strcmp(argv[1], "--bitplane") == 0;
     if (argc > 3) {
-        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1 | --sliding | --graphs | --support\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1 | --sliding | --graphs | --support | --bitplane\n", argv[0]);
         return 2;
     }
-    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1 && !sliding && !graphs && !support) random_cases = std::atoi(argv[1]);
+    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1 && !sliding && !graphs && !support && !bits) random_cases = std::atoi(argv[1]);
     if (argc >= 3) seed = unsigned(std::strtoul(argv[2], nullptr, 10));
     if (random_cases < 0 || random_cases > 1000) return 2;
     const char *kernel = std::getenv("PP_KERNEL");
@@ -303,12 +337,13 @@ int main(int argc, char **argv) {
     std::printf("kernel=%s active=%s r1=%s moore=%s seed=%u mode=%s random_cases=%d\n",
                 kernel ? kernel : "auto", active ? active : "auto", r1_mode ? r1_mode : "auto",
                 moore_mode ? moore_mode : "auto", seed,
-                support ? "support" : graphs ? "graphs" : sliding ? "sliding" : dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
-                (quick || sparse || r1 || dense_r1 || sliding || graphs || support) ? 0 : random_cases);
+                bits ? "bitplane" : support ? "support" : graphs ? "graphs" : sliding ? "sliding" : dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
+                (quick || sparse || r1 || dense_r1 || sliding || graphs || support || bits) ? 0 : random_cases);
     std::printf("graph=%s\n", std::getenv("PP_GRAPH") ? std::getenv("PP_GRAPH") : "0");
     std::printf("support=%s\n", std::getenv("PP_SUPPORT") ? std::getenv("PP_SUPPORT") : "default");
     check(cudaFree(nullptr));
     std::mt19937 rng(seed);
+    if (bits) { bitplane_checks(rng); return 0; }
     if (support) { support_checks(); return 0; }
     if (graphs) {
         graph_checks(rng);

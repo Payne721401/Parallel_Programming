@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Same-allocation sparse influence ABBA. No GPU work outside Slurm; bbox is the normal default.
 set -euo pipefail
+export PP_BITPLANE=0 # Preserve the established experiment baseline.
 cd "$(dirname "$0")/.."
 if [[ -z ${SLURM_JOB_ID:-} ]]; then
     echo 'Run through srun/sbatch on Nano5.' >&2
