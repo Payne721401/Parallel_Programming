@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Same-allocation sparse influence ABBA. No default promotion and no GPU work outside Slurm.
 set -euo pipefail
+export PP_TEMPORAL=1 # Isolate this experiment from temporal batching.
 cd "$(dirname "$0")/.."
 if [[ -z ${SLURM_JOB_ID:-} ]]; then
     echo 'Run through srun/sbatch on Nano5.' >&2

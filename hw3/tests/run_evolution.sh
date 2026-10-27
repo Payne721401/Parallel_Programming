@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Diagnostic only: samples full state but never changes evolution or stops early.
 set -euo pipefail
+export PP_TEMPORAL=1 # Isolate this experiment from temporal batching.
 export PP_SUPPORT=tile # Preserve the reference influence policy.
 cd "$(dirname "$0")/.."
 fail() { echo "ERROR: $*" >&2; exit 1; }

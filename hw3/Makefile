@@ -13,19 +13,19 @@ ifneq ($(wildcard $(GXX)),)
 NVCCFLAGS += -ccbin $(GXX) -Xcompiler -static-libstdc++,-static-libgcc
 endif
 
-hw3-1: main.cu hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp evolution_diag.cuh
+hw3-1: main.cu hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp r1_temporal.cuh evolution_diag.cuh
 	$(NVCC) $(NVCCFLAGS) main.cu hw3-1.cu -o $@
 
 hw3-1-seq: main.cu original_version/hw3-1.cu ca.hpp
 	$(NVCC) $(NVCCFLAGS) -I. main.cu original_version/hw3-1.cu -o $@
 
-tests/test_hw3-1: tests/test_hw3-1.cu hw3-1.cu original_version/hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp evolution_diag.cuh
+tests/test_hw3-1: tests/test_hw3-1.cu hw3-1.cu original_version/hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp r1_temporal.cuh evolution_diag.cuh
 	$(NVCC) $(NVCCFLAGS) -I. tests/test_hw3-1.cu hw3-1.cu -o $@
 
-tests/trace_hw3-1: tests/trace_main.cu main.cu hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp evolution_diag.cuh
+tests/trace_hw3-1: tests/trace_main.cu main.cu hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp r1_temporal.cuh evolution_diag.cuh
 	$(NVCC) $(NVCCFLAGS) -I. tests/trace_main.cu hw3-1.cu -o $@
 
-tests/test_evolution: tests/test_evolution.cu hw3-1.cu original_version/hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp evolution_diag.cuh
+tests/test_evolution: tests/test_evolution.cu hw3-1.cu original_version/hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp r1_temporal.cuh evolution_diag.cuh
 	$(NVCC) $(NVCCFLAGS) -I. tests/test_evolution.cu hw3-1.cu -o $@
 
 clean:
