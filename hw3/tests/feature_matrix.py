@@ -54,9 +54,9 @@ def generate(root):
 
 def environment(active="auto", reference=False):
     env = os.environ.copy()
-    for key in ("PP_KERNEL", "PP_ACTIVE", "PP_R1", "PP_PROFILE", "PP_MOORE", "PP_GRAPH", "PP_EVOLVE", "PP_EVOLVE_EVERY", "PP_SUPPORT", "PP_TEMPORAL"):
+    for key in ("PP_KERNEL", "PP_ACTIVE", "PP_R1", "PP_PROFILE", "PP_MOORE", "PP_GRAPH", "PP_EVOLVE", "PP_EVOLVE_EVERY", "PP_SUPPORT"):
         env.pop(key, None)
-    env.update(PP_ACTIVE=active, PP_PROFILE="1", PP_SUPPORT="tile", PP_TEMPORAL="1")
+    env.update(PP_ACTIVE=active, PP_PROFILE="1", PP_SUPPORT="tile")
     if reference:
         env.update(PP_KERNEL="tiled", PP_MOORE="sat", PP_R1="direct", PP_ACTIVE="0", PP_PROFILE="0")
     return env

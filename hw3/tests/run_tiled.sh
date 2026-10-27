@@ -2,7 +2,6 @@
 # Small correctness gate + selected public cases. Use 1 minute for check,
 # or 2 minutes for the optional alternating A/B run after correctness passes.
 set -euo pipefail
-export PP_TEMPORAL=1 # Isolate this experiment from temporal batching.
 export PP_SUPPORT=tile # Preserve the reference influence policy.
 export PP_EVOLVE=0 # Evolution scans must not contaminate performance comparisons.
 export PP_GRAPH=0 # Preserve the non-graph baseline for this existing experiment.

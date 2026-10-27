@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Dense R1: default-dispatch correctness, sparse regression, then public 11/12 only.
 set -euo pipefail
-export PP_TEMPORAL=1 # Isolate this experiment from temporal batching.
 export PP_SUPPORT=tile # Preserve the reference influence policy.
 export PP_EVOLVE=0 # Evolution scans must not contaminate performance comparisons.
 export PP_GRAPH=0 # Preserve the non-graph baseline for this existing experiment.

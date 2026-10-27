@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Same-allocation sparse influence ABBA. No default promotion and no GPU work outside Slurm.
+# Same-allocation sparse influence ABBA. No GPU work outside Slurm; bbox is the normal default.
 set -euo pipefail
-export PP_TEMPORAL=1 # Isolate this experiment from temporal batching.
 cd "$(dirname "$0")/.."
 if [[ -z ${SLURM_JOB_ID:-} ]]; then
     echo 'Run through srun/sbatch on Nano5.' >&2
@@ -54,4 +53,4 @@ for round in 1 2 3 4; do
     python3 tests/check_timing_results.py "$logdir/$round-$method/results.tsv" "$status"
 done
 python3 tests/summarize_support.py "$logdir" "$profile"
-echo "Logs: $logdir; bbox remains opt-in. Correctness is separate from timing."
+echo "Logs: $logdir; bbox is the normal default. Correctness is separate from timing."

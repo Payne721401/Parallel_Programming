@@ -6,7 +6,6 @@
 // PP_GRAPH=0|1 enables experimental 32-generation replay; default is 0.
 // PP_EVOLVE=1 enables sampled full-grid evolution diagnostics; default is 0.
 // PP_SUPPORT=tile|bbox selects sparse influence; default bbox (tile for evolution diagnostics).
-// PP_TEMPORAL=1|2|4|8 selects experimental dense packed R1 depth; default 1.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -502,8 +501,6 @@ __global__ void step_r1_dense(const uint8_t *__restrict__ src,
         int(blockIdx.x) * TILE_W, int(blockIdx.y) * TILE_H, words);
 }
 
-#include "r1_temporal.cuh"
-
 struct TileQueue {
     int *ids;
     int *count;
@@ -717,18 +714,6 @@ void run(uint8_t *grid, const Problem &p) {
         std::fprintf(stderr, "hw3-1: PP_EVOLVE=1 requires PP_GRAPH=0; measure graph speed separately\n");
         std::exit(EXIT_FAILURE);
     }
-    const char *temporal_mode = std::getenv("PP_TEMPORAL");
-    int temporal_requested = 1;
-    if (temporal_mode) {
-        if (!std::strcmp(temporal_mode, "1")) temporal_requested = 1;
-        else if (!std::strcmp(temporal_mode, "2")) temporal_requested = 2;
-        else if (!std::strcmp(temporal_mode, "4")) temporal_requested = 4;
-        else if (!std::strcmp(temporal_mode, "8")) temporal_requested = 8;
-        else {
-            std::fprintf(stderr, "hw3-1: PP_TEMPORAL must be 1, 2, 4 or 8\n");
-            std::exit(EXIT_FAILURE);
-        }
-    }
     if (p.steps == 0 && !evolution.enabled) {
         profile.report("none", p); // all phase times zero; no CUDA events allocated
         return;
@@ -803,14 +788,6 @@ void run(uint8_t *grid, const Problem &p) {
     // One stream orders generations and queue publication. Dense writes every
     // cell; sparse maintains zero outside the tracked support/cleanup set.
     const int iterations = !evolution.enabled && sparse && sparse_work.initial_work == 0 ? 0 : p.steps;
-    // Unsupported paths keep their existing correct algorithm. In particular,
-    // sparse->dense fallback inside step_sparse does not enter temporal mode.
-    const char *temporal_reason = temporal_requested == 1 ? "disabled" :
-        evolution.enabled ? "evolution" : graph_requested ? "graph" :
-        sparse ? "sparse" : !packed ? "not_packed_r1" :
-        iterations < temporal_requested ? "short_run" : "enabled";
-    const bool temporal_selected = std::strcmp(temporal_reason, "enabled") == 0;
-    const int temporal_depth = temporal_selected ? temporal_requested : 1;
     constexpr int GRAPH_BATCH = 32; // Even: both grid and queue parity return to zero.
     const bool graph_selected = graph_requested && iterations >= GRAPH_BATCH;
     cudaStream_t stream = nullptr;
@@ -876,25 +853,7 @@ void run(uint8_t *grid, const Problem &p) {
             evolution.sample(t+1, src, dst, p, sparse ? sparse_work.counts+((t+1)&1) : nullptr,
                              sparse ? sparse_work.counts+2 : nullptr);
     };
-    if (temporal_selected) {
-        auto launch_temporal = [&](auto depth_tag) {
-            constexpr int K = decltype(depth_tag)::value;
-            if (p.rule.shape == Shape::Moore)
-                step_r1_temporal<K, true><<<blocks, threads>>>(src, dst, p);
-            else step_r1_temporal<K, false><<<blocks, threads>>>(src, dst, p);
-        };
-        int t = 0;
-        for (; t + temporal_depth <= iterations; t += temporal_depth) {
-            if (temporal_depth == 2) launch_temporal(std::integral_constant<int, 2>{});
-            else if (temporal_depth == 4) launch_temporal(std::integral_constant<int, 4>{});
-            else launch_temporal(std::integral_constant<int, 8>{});
-            check(cudaGetLastError(), "launch dense R1 temporal batch");
-            // One global swap PER BATCH, independent of the number of generations
-            // inside shared memory. The final pointer, not t parity, owns G_t.
-            uint8_t *old = src; src = dst; dst = old;
-        }
-        for (; t < iterations; ++t) launch_step(t);
-    } else if (graph_selected) {
+    if (graph_selected) {
         // Complete default-stream setup before capture on a private stream.
         // One setup wait and one final wait only; no per-generation host waits.
         check(cudaStreamSynchronize(0), "finish setup before graph capture");
@@ -951,9 +910,4 @@ void run(uint8_t *grid, const Problem &p) {
     if (profile.enabled)
         std::fprintf(stderr, "[PP_SUPPORT] mode=%s selected=%d initial=tile\n",
                      tight_support ? "bbox" : "tile", int(tight_support && sparse));
-    if (profile.enabled)
-        std::fprintf(stderr, "[PP_TEMPORAL] requested=%d selected=%d depth=%d batches=%d tail=%d reason=%s\n",
-            temporal_requested, int(temporal_selected), temporal_depth,
-            temporal_selected ? iterations/temporal_depth : 0,
-            temporal_selected ? iterations%temporal_depth : iterations, temporal_reason);
 }

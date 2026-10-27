@@ -279,31 +279,6 @@ static void graph_checks(std::mt19937 &rng) {
     std::printf("PASS %d/%d (graph batches, parity, epochs and fallback; not timing)\n", tested, tested);
 }
 
-static void temporal_checks(std::mt19937 &rng) {
-    r1_checks(rng, false); // 64 shape/state/alignment cases, including short-run fallback
-    for (Boundary boundary : {Boundary::Dead, Boundary::Torus})
-    for (Shape shape : {Shape::Moore, Shape::VonNeumann})
-    for (int states : {2,16}) {
-        const bool centre = states == 16;
-        const int maxn = (shape == Shape::Moore ? 8 : 4) + int(centre);
-        Rule rule{1,states,centre,2,maxn-1,2,3,shape};
-        for (int steps : {0,1,2,3,4,7,8,9,15,16,17}) {
-            Problem p{boundary == Boundary::Dead ? 68 : 67,
-                      shape == Shape::Moore ? 35 : 65,rule,boundary,steps};
-            std::vector<uint8_t> initial(size_t(p.width)*p.height);
-            for (auto &s : initial) s = uint8_t(rng()%states);
-            compare(p, initial); // batches+tails, >1 output tile, state==15 wrapping
-        }
-        for (int steps : {17,18}) {
-            Problem p{3,3,rule,boundary,steps};
-            std::vector<uint8_t> initial(9);
-            for (auto &s : initial) s = uint8_t(rng()%states);
-            compare(p,initial); // virtual halo wraps repeatedly; dead outside stays zero
-        }
-    }
-    std::printf("PASS %d/%d (temporal batches, shrinking halos, dead boundaries and tails; not timing)\n",tested,tested);
-}
-
 int main(int argc, char **argv) {
     int random_cases = 64;
     unsigned seed = 20261022;
@@ -314,12 +289,11 @@ int main(int argc, char **argv) {
     const bool sliding = argc == 2 && std::strcmp(argv[1], "--sliding") == 0;
     const bool graphs = argc == 2 && std::strcmp(argv[1], "--graphs") == 0;
     const bool support = argc == 2 && std::strcmp(argv[1], "--support") == 0;
-    const bool temporal = argc == 2 && std::strcmp(argv[1], "--temporal") == 0;
     if (argc > 3) {
-        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1 | --sliding | --graphs | --support | --temporal\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1 | --sliding | --graphs | --support\n", argv[0]);
         return 2;
     }
-    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1 && !sliding && !graphs && !support && !temporal) random_cases = std::atoi(argv[1]);
+    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1 && !sliding && !graphs && !support) random_cases = std::atoi(argv[1]);
     if (argc >= 3) seed = unsigned(std::strtoul(argv[2], nullptr, 10));
     if (random_cases < 0 || random_cases > 1000) return 2;
     const char *kernel = std::getenv("PP_KERNEL");
@@ -329,14 +303,12 @@ int main(int argc, char **argv) {
     std::printf("kernel=%s active=%s r1=%s moore=%s seed=%u mode=%s random_cases=%d\n",
                 kernel ? kernel : "auto", active ? active : "auto", r1_mode ? r1_mode : "auto",
                 moore_mode ? moore_mode : "auto", seed,
-                temporal ? "temporal" : support ? "support" : graphs ? "graphs" : sliding ? "sliding" : dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
-                (quick || sparse || r1 || dense_r1 || sliding || graphs || support || temporal) ? 0 : random_cases);
+                support ? "support" : graphs ? "graphs" : sliding ? "sliding" : dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
+                (quick || sparse || r1 || dense_r1 || sliding || graphs || support) ? 0 : random_cases);
     std::printf("graph=%s\n", std::getenv("PP_GRAPH") ? std::getenv("PP_GRAPH") : "0");
-    std::printf("support=%s temporal=%s\n", std::getenv("PP_SUPPORT") ? std::getenv("PP_SUPPORT") : "default",
-                std::getenv("PP_TEMPORAL") ? std::getenv("PP_TEMPORAL") : "1");
+    std::printf("support=%s\n", std::getenv("PP_SUPPORT") ? std::getenv("PP_SUPPORT") : "default");
     check(cudaFree(nullptr));
     std::mt19937 rng(seed);
-    if (temporal) { temporal_checks(rng); return 0; }
     if (support) { support_checks(); return 0; }
     if (graphs) {
         graph_checks(rng);
