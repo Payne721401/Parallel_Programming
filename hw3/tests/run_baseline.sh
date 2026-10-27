@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run inside one short allocation, after compiling on the login node.
 set -euo pipefail
+export PP_SUPPORT=tile # Preserve the reference influence policy.
 export PP_EVOLVE=0 # Evolution scans must not contaminate performance comparisons.
 cd "$(dirname "$0")/.."
 if [[ -z ${SLURM_JOB_ID:-} ]]; then

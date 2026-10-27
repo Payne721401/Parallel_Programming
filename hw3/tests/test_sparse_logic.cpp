@@ -25,7 +25,7 @@ static std::set<int> neighbours(int tile, const Problem &p) {
     return result;
 }
 
-static void model(Problem p, std::vector<uint8_t> src) {
+static void model(Problem p, std::vector<uint8_t> src, bool tight) {
     const int nx = (p.width + 63) / 64, ny = (p.height + 31) / 32;
     std::vector<uint8_t> dst(src.size(), 0);
     std::set<int> initial, work;
@@ -50,15 +50,27 @@ static void model(Problem p, std::vector<uint8_t> src) {
         std::set<int> next;
         for (int tile : work) {
             bool in = false, out = false;
+            tile_geometry::Bounds bounds;
             const int x0 = (tile % nx)*64, y0 = (tile / nx)*32;
             for (int y = y0; y < std::min(y0+32, p.height); ++y)
                 for (int x = x0; x < std::min(x0+64, p.width); ++x) {
                     const size_t i = size_t(y)*p.width+x;
                     in |= src[i] != 0;
                     out |= expected[i] != 0;
+                    if (expected[i] == 1) bounds.include(x-x0, y-y0);
                     dst[i] = expected[i];
                 }
-            if (out) {
+            if (tight) {
+                if (!bounds.empty()) {
+                    const auto xs = tile_geometry::influence_interval(x0+bounds.xmin, x0+bounds.xmax+1,
+                        64, p.width, p.rule.radius, p.boundary == Boundary::Torus);
+                    const auto ys = tile_geometry::influence_interval(y0+bounds.ymin, y0+bounds.ymax+1,
+                        32, p.height, p.rule.radius, p.boundary == Boundary::Torus);
+                    for (int y = 0; y < ys.count; ++y)
+                        for (int x = 0; x < xs.count; ++x) next.insert(ys.ids[y]*nx+xs.ids[x]);
+                }
+                if (out) next.insert(tile); // decay without any alive neighbours
+            } else if (out) {
                 const auto ns = neighbours(tile, p);
                 next.insert(ns.begin(), ns.end());
             }
@@ -89,6 +101,24 @@ int main() {
             }
             require(int(got.size()) == actual.count && got == expected, "axis influence set");
             ++axis_checks;
+            // Independent interval oracle: singleton endpoints, interior and
+            // full intervals, including every partial final tile and R=1..32.
+            const int begin = tile*size, end = std::min((tile+1)*size, extent);
+            const int intervals[][2] = {{begin,begin+1},{end-1,end},
+                {begin+(end-begin)/3,begin+2*(end-begin)/3+1}};
+            for (const auto &interval : intervals) {
+                const auto narrowed = tile_geometry::influence_interval(interval[0],interval[1],size,extent,radius,torus);
+                std::set<int> narrowed_set(narrowed.ids,narrowed.ids+narrowed.count), oracle;
+                for (int pos=interval[0]-radius; pos<interval[1]+radius; ++pos) {
+                    const int x = torus ? (pos%extent+extent)%extent : pos;
+                    if (x>=0 && x<extent) oracle.insert(x/size);
+                }
+                require(narrowed.count <= 4 && int(narrowed_set.size()) == narrowed.count
+                    && narrowed_set == oracle, "bbox interval influence set");
+                require(std::includes(got.begin(),got.end(),narrowed_set.begin(),narrowed_set.end()),
+                    "bbox must be a subset of whole-tile influence");
+                ++axis_checks;
+            }
         }
     }
     for (Boundary boundary : {Boundary::Dead, Boundary::Torus})
@@ -102,8 +132,21 @@ int main() {
         std::vector<uint8_t> src(size_t(p.width)*p.height, 0);
         for (int y : {0, 31, 32, 96})
             for (int x : {0, 63, 64, 192}) src[size_t(y)*p.width+x] = pattern == 2 ? 2 : 1;
-        model(p, src);
-        ++models;
+        for (bool tight : {false, true}) { model(p, src, tight); ++models; }
+    }
+    // Same population, different layout; mixed alive/decay and cleanup over
+    // repeated buffer reuse. No CUDA fallback in this model, so skips are tested.
+    for (Boundary boundary : {Boundary::Dead, Boundary::Torus})
+    for (int pattern = 0; pattern < 3; ++pattern) {
+        Problem p{193,97,Rule{1,4,false,2,3,3,3,Shape::Moore},boundary,19};
+        std::vector<uint8_t> src(size_t(p.width)*p.height,0);
+        for (int k=0; k<9; ++k) {
+            const int x=pattern==0 ? 20+k%3 : pattern==1 ? (k%3)*64 : (191+k%3)%p.width;
+            const int y=pattern==0 ? 12+k/3 : pattern==1 ? (k/3)*32 : (95+k/3)%p.height;
+            src[size_t(y)*p.width+x]=1;
+        }
+        src[31*p.width+63]=2;
+        for (bool tight : {false,true}) { model(p,src,tight); ++models; }
     }
     std::printf("PASS %d axis influence checks; %d sparse buffer models (CPU only)\n", axis_checks, models);
 }

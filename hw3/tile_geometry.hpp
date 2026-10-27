@@ -11,6 +11,18 @@ namespace tile_geometry {
 constexpr int width = 64;
 constexpr int height = 32;
 
+// Tile-local inclusive bounding box of actual state==1 cells. Empty is explicit.
+struct Bounds {
+    int xmin = width, ymin = height, xmax = -1, ymax = -1;
+    PP_HD void include(int x, int y) {
+        xmin = x < xmin ? x : xmin;
+        ymin = y < ymin ? y : ymin;
+        xmax = x > xmax ? x : xmax;
+        ymax = y > ymax ? y : ymax;
+    }
+    PP_HD bool empty() const { return xmax < xmin; }
+};
+
 struct AxisTiles {
     int ids[4]{};
     int count = 0;
@@ -26,11 +38,12 @@ struct AxisTiles {
 // R<=32 and tile_size>=32 imply at most four distinct tile IDs, including
 // a narrow final tile across a torus seam. Never wrap tile indices directly:
 // wrapping cells and then dividing is different for partial final tiles.
-PP_HD inline AxisTiles influence(int tile, int tile_size, int extent,
-                                 int radius, bool torus) {
+// [begin,end) must lie within one valid source tile. Thus the same four-ID
+// bound applies to both a complete tile and an alive bounding interval.
+PP_HD inline AxisTiles influence_interval(int begin, int end, int tile_size, int extent,
+                                          int radius, bool torus) {
     AxisTiles result;
-    const int begin = tile * tile_size;
-    const int end = begin + tile_size < extent ? begin + tile_size : extent;
+    if (begin >= end) return result;
     int lo = begin - radius;
     int length = end - begin + 2 * radius;
     if (!torus) {
@@ -56,6 +69,13 @@ PP_HD inline AxisTiles influence(int tile, int tile_size, int extent,
         }
     }
     return result;
+}
+
+PP_HD inline AxisTiles influence(int tile, int tile_size, int extent,
+                                 int radius, bool torus) {
+    const int begin = tile * tile_size;
+    const int end = begin + tile_size < extent ? begin + tile_size : extent;
+    return influence_interval(begin, end, tile_size, extent, radius, torus);
 }
 } // namespace tile_geometry
 

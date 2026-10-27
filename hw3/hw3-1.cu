@@ -5,6 +5,7 @@
 // PP_MOORE=auto|sat|sliding selects tiled Moore counting; auto uses sliding for R>=5.
 // PP_GRAPH=0|1 enables experimental 32-generation replay; default is 0.
 // PP_EVOLVE=1 enables sampled full-grid evolution diagnostics; default is 0.
+// PP_SUPPORT=tile|bbox selects sparse influence; experimental bbox is opt-in.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -13,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <type_traits>
 
 #include "ca.hpp"
 #include "tile_geometry.hpp"
@@ -151,12 +153,52 @@ __device__ __forceinline__ unsigned warp_prefix(unsigned value, int lane) {
     return value;
 }
 
+using AliveBounds = tile_geometry::Bounds;
+
+// All 256 threads participate, including invalid lanes in partial tiles.
+// Only thread 0 consumes the returned block result. Static shared storage is
+// separate from the update scratch, and step_sparse barriers protect its reuse.
+__device__ AliveBounds reduce_alive_bounds(AliveBounds b) {
+    __shared__ int warps[8][4];
+    const int lane = int(threadIdx.x), warp = int(threadIdx.y);
+#pragma unroll
+    for (int d = 16; d; d >>= 1) {
+        const int xlo = __shfl_down_sync(0xffffffffu, b.xmin, d);
+        const int ylo = __shfl_down_sync(0xffffffffu, b.ymin, d);
+        const int xhi = __shfl_down_sync(0xffffffffu, b.xmax, d);
+        const int yhi = __shfl_down_sync(0xffffffffu, b.ymax, d);
+        b.xmin = xlo < b.xmin ? xlo : b.xmin;
+        b.ymin = ylo < b.ymin ? ylo : b.ymin;
+        b.xmax = xhi > b.xmax ? xhi : b.xmax;
+        b.ymax = yhi > b.ymax ? yhi : b.ymax;
+    }
+    if (lane == 0) {
+        warps[warp][0] = b.xmin; warps[warp][1] = b.ymin;
+        warps[warp][2] = b.xmax; warps[warp][3] = b.ymax;
+    }
+    __syncthreads();
+    // Eight entries only; thread 0 merges them without a second block barrier.
+    if (lane == 0 && warp == 0) {
+        b = AliveBounds{};
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            if (warps[w][2] >= warps[w][0]) {
+                b.include(warps[w][0], warps[w][1]);
+                b.include(warps[w][2], warps[w][3]);
+            }
+        }
+    }
+    return b;
+}
+
 // Track is compiled out for dense execution. Flags report whether the input
 // tile (bit 0) and output tile (bit 1) contain any nonzero, including decay.
-template <bool Moore, bool Track, bool Sliding = false>
+template <bool Moore, bool Track, bool Sliding = false, bool Tight = false>
 __device__ unsigned update_tiled(const uint8_t *__restrict__ src,
                                  uint8_t *__restrict__ dst, const Problem &p,
-                                 int x0, int y0, uint16_t *sums) {
+                                 int x0, int y0, uint16_t *sums, AliveBounds *support = nullptr) {
+    static_assert(!Tight || Track, "support requires tracking");
+    AliveBounds local;
     // Launch exactly (32,8): a warp cooperatively scans one row or column.
     const int lane = int(threadIdx.x);
     const int warp = int(threadIdx.y);
@@ -227,6 +269,7 @@ __device__ unsigned update_tiled(const uint8_t *__restrict__ src,
                     const int n = window - int(!p.rule.count_centre && state == 1);
                     const uint8_t output = next_state(p.rule, state, n);
                     dst[index] = output;
+                    if constexpr (Tight) if (output == 1) local.include(x, y);
                     if constexpr (Track)
                         flags |= unsigned(state != 0) | (unsigned(output != 0) << 1);
                 }
@@ -239,6 +282,7 @@ __device__ unsigned update_tiled(const uint8_t *__restrict__ src,
         if constexpr (Track) {
             const unsigned input_nonzero = __syncthreads_or((flags & 1) != 0);
             const unsigned output_nonzero = __syncthreads_or((flags & 2) != 0);
+            if constexpr (Tight) *support = reduce_alive_bounds(local);
             return input_nonzero | (output_nonzero << 1);
         }
         return 0;
@@ -289,11 +333,13 @@ __device__ unsigned update_tiled(const uint8_t *__restrict__ src,
         if (!p.rule.count_centre && state == 1) --n;
         const uint8_t output = next_state(p.rule, state, n);
         dst[index] = output;
+        if constexpr (Tight) if (output == 1) local.include(x, y);
         if constexpr (Track) flags |= unsigned(state != 0) | (unsigned(output != 0) << 1);
     }
     if constexpr (Track) {
         const unsigned input_nonzero = __syncthreads_or((flags & 1) != 0);
         const unsigned output_nonzero = __syncthreads_or((flags & 2) != 0);
+        if constexpr (Tight) *support = reduce_alive_bounds(local);
         return input_nonzero | (output_nonzero << 1);
     }
     return 0;
@@ -308,11 +354,13 @@ __global__ void step_tiled(const uint8_t *__restrict__ src,
 }
 
 // Small-radius sparse tiles avoid the prefix-table setup. Each lane writes
-// distinct cells; the two block OR reductions are the only cooperation needed.
-template <bool Track>
+// distinct cells. Tracking uses two OR reductions, plus optional alive bounds.
+template <bool Track, bool Tight = false>
 __device__ unsigned update_direct(const uint8_t *__restrict__ src,
                                   uint8_t *__restrict__ dst, const Problem &p,
-                                  int x0, int y0) {
+                                  int x0, int y0, AliveBounds *support = nullptr) {
+    static_assert(!Tight || Track, "support requires tracking");
+    AliveBounds local;
     const int tid = int(threadIdx.y) * 32 + int(threadIdx.x);
     unsigned flags = 0;
     for (int cell = tid; cell < TILE_W * TILE_H; cell += 256) {
@@ -338,11 +386,13 @@ __device__ unsigned update_direct(const uint8_t *__restrict__ src,
         const uint8_t input = src[index];
         const uint8_t output = next_state(p.rule, input, n);
         dst[index] = output;
+        if constexpr (Tight) if (output == 1) local.include(x - x0, y - y0);
         if constexpr (Track) flags |= unsigned(input != 0) | (unsigned(output != 0) << 1);
     }
     if constexpr (Track) {
         const unsigned input_nonzero = __syncthreads_or((flags & 1) != 0);
         const unsigned output_nonzero = __syncthreads_or((flags & 2) != 0);
+        if constexpr (Tight) *support = reduce_alive_bounds(local);
         return input_nonzero | (output_nonzero << 1);
     }
     return 0;
@@ -377,10 +427,12 @@ __device__ uint32_t load_r1_word(const uint8_t *src, const Problem &p, int x, in
     return word;
 }
 
-template <bool Moore, bool Track>
+template <bool Moore, bool Track, bool Tight = false>
 __device__ unsigned update_r1_packed(const uint8_t *__restrict__ src,
                                      uint8_t *__restrict__ dst, const Problem &p,
-                                     int x0, int y0, uint32_t *words) {
+                                     int x0, int y0, uint32_t *words, AliveBounds *support = nullptr) {
+    static_assert(!Tight || Track, "support requires tracking");
+    AliveBounds local;
     const int tid = int(threadIdx.y) * 32 + int(threadIdx.x);
     uint32_t *alive = words + R1_WORD_COUNT;
     for (int i = tid; i < R1_WORD_COUNT; i += 256) {
@@ -413,6 +465,12 @@ __device__ unsigned update_r1_packed(const uint8_t *__restrict__ src,
         // be stored nor contribute to the tile's nonzero flags.
         const int valid = p.width - x < 4 ? p.width - x : 4;
         const uint32_t mask = valid == 4 ? 0xffffffffu : (1u << (8 * valid)) - 1u;
+        if constexpr (Tight) {
+#pragma unroll
+            for (int b = 0; b < 4; ++b)
+                if (b < valid && uint8_t(output >> (8 * b)) == 1)
+                    local.include(x - x0 + b, y - y0);
+        }
         if ((p.width & 3) == 0) {
             *reinterpret_cast<uint32_t *>(dst + index) = output;
         } else {
@@ -426,6 +484,7 @@ __device__ unsigned update_r1_packed(const uint8_t *__restrict__ src,
     if constexpr (Track) {
         const unsigned input_nonzero = __syncthreads_or((flags & 1) != 0);
         const unsigned output_nonzero = __syncthreads_or((flags & 2) != 0);
+        if constexpr (Tight) *support = reduce_alive_bounds(local);
         return input_nonzero | (output_nonzero << 1);
     }
     return 0;
@@ -473,6 +532,22 @@ __device__ void enqueue_influence(int tile, TileQueue queue, int *stamp, int epo
             enqueue_tile(ys.ids[y] * tiles_x + xs.ids[x], queue, stamp, epoch);
 }
 
+__device__ void enqueue_alive_bounds(const AliveBounds &b, int x0, int y0,
+                                    TileQueue queue, int *stamp, int epoch,
+                                    const Problem &p, int tiles_x) {
+    if (b.empty()) return;
+    const bool torus = p.boundary == Boundary::Torus;
+    const auto xs = tile_geometry::influence_interval(x0 + b.xmin, x0 + b.xmax + 1,
+        TILE_W, p.width, p.rule.radius, torus);
+    const auto ys = tile_geometry::influence_interval(y0 + b.ymin, y0 + b.ymax + 1,
+        TILE_H, p.height, p.rule.radius, torus);
+    // The rectangle can contain holes; for VN it also includes diamond corners.
+    // Both are conservative overestimates, never exclusions of reachable cells.
+    for (int y = 0; y < ys.count; ++y)
+        for (int x = 0; x < xs.count; ++x)
+            enqueue_tile(ys.ids[y] * tiles_x + xs.ids[x], queue, stamp, epoch);
+}
+
 __global__ void mark_initial_tiles(const uint8_t *src, uint8_t *nonzero,
                                     Problem p, int tiles_x) {
     const int tile = int(blockIdx.x);
@@ -514,7 +589,7 @@ __global__ void prepare_sparse(TileQueue current, TileQueue next, int *dense,
     }
 }
 
-template <bool Tiled, bool Moore, bool Packed = false, bool Sliding = false>
+template <bool Tiled, bool Moore, bool Packed = false, bool Sliding = false, bool Tight = false>
 __global__ void step_sparse(const uint8_t *__restrict__ src,
                             uint8_t *__restrict__ dst, Problem p,
                             TileQueue current, TileQueue next, int *stamp, int epoch,
@@ -535,14 +610,21 @@ __global__ void step_sparse(const uint8_t *__restrict__ src,
             else if constexpr (Tiled) update_tiled<Moore, false, Sliding>(src, dst, p, x0, y0, sums);
             else update_direct<false>(src, dst, p, x0, y0);
         } else {
-            if constexpr (Packed) flags = update_r1_packed<Moore, true>(src, dst, p, x0, y0, scratch);
-            else if constexpr (Tiled) flags = update_tiled<Moore, true, Sliding>(src, dst, p, x0, y0, sums);
-            else flags = update_direct<true>(src, dst, p, x0, y0);
+            AliveBounds support;
+            if constexpr (Packed) flags = update_r1_packed<Moore, true, Tight>(src, dst, p, x0, y0, scratch, &support);
+            else if constexpr (Tiled) flags = update_tiled<Moore, true, Sliding, Tight>(src, dst, p, x0, y0, sums, &support);
+            else flags = update_direct<true, Tight>(src, dst, p, x0, y0, &support);
             if (threadIdx.x == 0 && threadIdx.y == 0) {
-                // W_(t+1) = dilation(A_(t+1)) union A_t. The second term
-                // overwrites old nonzeros when this generation's src becomes dst.
-                if (flags & 2) enqueue_influence(tile, next, stamp, epoch, p, tiles_x);
-                if (flags & 1) enqueue_tile(tile, next, stamp, epoch);
+                if constexpr (Tight) {
+                    // Next work = dilation(alive output) union nonzero output
+                    // union nonzero input. Decay needs self updates; nonzero
+                    // input must be cleared when src is reused as destination.
+                    enqueue_alive_bounds(support, x0, y0, next, stamp, epoch, p, tiles_x);
+                    if (flags & 3) enqueue_tile(tile, next, stamp, epoch);
+                } else {
+                    if (flags & 2) enqueue_influence(tile, next, stamp, epoch, p, tiles_x);
+                    if (flags & 1) enqueue_tile(tile, next, stamp, epoch);
+                }
             }
         }
         // All reads of this tile's shared table must finish before another
@@ -610,6 +692,18 @@ struct SparseWorkspace {
 void run(uint8_t *grid, const Problem &p) {
     PhaseProfile profile;
     EvolutionProfile evolution;
+    const char *support_mode = std::getenv("PP_SUPPORT");
+    const bool tight_support = support_mode && std::strcmp(support_mode, "bbox") == 0;
+    if (support_mode && !tight_support && std::strcmp(support_mode, "tile") != 0) {
+        std::fprintf(stderr, "hw3-1: PP_SUPPORT must be tile or bbox\n");
+        std::exit(EXIT_FAILURE);
+    }
+    // The existing diagnostic checks exact equality against whole-tile dilation.
+    // Do not silently compare a tighter queue with that different definition.
+    if (evolution.enabled && tight_support) {
+        std::fprintf(stderr, "hw3-1: PP_EVOLVE=1 requires PP_SUPPORT=tile; use PP_PROFILE for bbox work counts\n");
+        std::exit(EXIT_FAILURE);
+    }
     const char *graph_mode = std::getenv("PP_GRAPH");
     const bool graph_requested = graph_mode && std::strcmp(graph_mode, "1") == 0;
     if (graph_mode && !graph_requested && std::strcmp(graph_mode, "0") != 0) {
@@ -708,30 +802,37 @@ void run(uint8_t *grid, const Problem &p) {
             prepare_sparse<<<1, 1, 0, stream>>>(current, next, sparse_work.counts + 2,
                                       sparse_work.tile_count, sparse_work.stats, device_epoch);
             check(cudaGetLastError(), "launch prepare_sparse");
-            if (packed && p.rule.shape == Shape::Moore)
-                step_sparse<false, true, true><<<sparse_work.workers, threads, R1_SHARED_BYTES, stream>>>(
-                    src, dst, p, current, next, sparse_work.stamp, t + 1,
-                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
-            else if (packed)
-                step_sparse<false, false, true><<<sparse_work.workers, threads, R1_SHARED_BYTES, stream>>>(
-                    src, dst, p, current, next, sparse_work.stamp, t + 1,
-                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
-            else if (!tiled)
-                step_sparse<false, false><<<sparse_work.workers, threads, 0, stream>>>(
-                    src, dst, p, current, next, sparse_work.stamp, t + 1,
-                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
-            else if (sliding)
-                step_sparse<true, true, false, true><<<sparse_work.workers, threads, shared_bytes, stream>>>(
-                    src, dst, p, current, next, sparse_work.stamp, t + 1,
-                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
-            else if (p.rule.shape == Shape::Moore)
-                step_sparse<true, true><<<sparse_work.workers, threads, shared_bytes, stream>>>(
-                    src, dst, p, current, next, sparse_work.stamp, t + 1,
-                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
-            else
-                step_sparse<true, false><<<sparse_work.workers, threads, shared_bytes, stream>>>(
-                    src, dst, p, current, next, sparse_work.stamp, t + 1,
-                    sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+            // Separate template instantiations keep bbox reductions/registers
+            // out of the reference kernel, rather than a per-cell runtime branch.
+            auto launch_sparse = [&](auto tight_tag) {
+                constexpr bool Tight = decltype(tight_tag)::value;
+                if (packed && p.rule.shape == Shape::Moore)
+                    step_sparse<false, true, true, false, Tight><<<sparse_work.workers, threads, R1_SHARED_BYTES, stream>>>(
+                        src, dst, p, current, next, sparse_work.stamp, t + 1,
+                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+                else if (packed)
+                    step_sparse<false, false, true, false, Tight><<<sparse_work.workers, threads, R1_SHARED_BYTES, stream>>>(
+                        src, dst, p, current, next, sparse_work.stamp, t + 1,
+                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+                else if (!tiled)
+                    step_sparse<false, false, false, false, Tight><<<sparse_work.workers, threads, 0, stream>>>(
+                        src, dst, p, current, next, sparse_work.stamp, t + 1,
+                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+                else if (sliding)
+                    step_sparse<true, true, false, true, Tight><<<sparse_work.workers, threads, shared_bytes, stream>>>(
+                        src, dst, p, current, next, sparse_work.stamp, t + 1,
+                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+                else if (p.rule.shape == Shape::Moore)
+                    step_sparse<true, true, false, false, Tight><<<sparse_work.workers, threads, shared_bytes, stream>>>(
+                        src, dst, p, current, next, sparse_work.stamp, t + 1,
+                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+                else
+                    step_sparse<true, false, false, false, Tight><<<sparse_work.workers, threads, shared_bytes, stream>>>(
+                        src, dst, p, current, next, sparse_work.stamp, t + 1,
+                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+            };
+            if (tight_support) launch_sparse(std::true_type{});
+            else launch_sparse(std::false_type{});
         }
         else if (packed && p.rule.shape == Shape::Moore)
             step_r1_dense<true><<<blocks, threads, R1_SHARED_BYTES, stream>>>(src, dst, p);
@@ -806,4 +907,7 @@ void run(uint8_t *grid, const Problem &p) {
             "work_max=%d dense_steps=%d steps=%d\n",
             int(sparse), sparse_work.tile_count, sparse_work.initial_work,
             sparse_stats.work_sum, sparse_stats.work_max, sparse_stats.dense_steps, p.steps);
+    if (profile.enabled)
+        std::fprintf(stderr, "[PP_SUPPORT] mode=%s selected=%d initial=tile\n",
+                     tight_support ? "bbox" : "tile", int(tight_support && sparse));
 }
