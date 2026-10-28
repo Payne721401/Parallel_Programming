@@ -6,7 +6,8 @@
 // PP_GRAPH=0|1 enables experimental 32-generation replay; default is 0.
 // PP_EVOLVE=1 enables sampled full-grid evolution diagnostics; default is 0.
 // PP_SUPPORT=tile|bbox selects sparse influence; default bbox (tile for evolution diagnostics).
-// PP_BITPLANE=0|1 opts into dense R1 C=2 bit planes; default 0. PP_BIT_ROWS=1|4.
+// PP_BITPLANE=0|1 opts into dense R1 C=2 bit planes; default 0. PP_BIT_ROWS=1|2|4.
+// PP_BIT_LOGIC=reference|compact compares rule logic; default reference.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -880,25 +881,31 @@ void run(uint8_t *grid, const Problem &p) {
         check(cudaGetLastError(),"launch bit pack");
         swap_buffers();
         bitplane.mark(1);
-        auto evolve_bits = [&](auto row_tag) {
+        auto evolve_bits = [&](auto row_tag, auto logic_tag) {
             constexpr int Rows = decltype(row_tag)::value;
+            constexpr bool Compact = decltype(logic_tag)::value;
             const dim3 bt(32,4), bg(((p.width+31)/32+31)/32,(p.height+4*Rows-1)/(4*Rows));
             for (int t=0; t<iterations; ++t) {
                 const auto *input=reinterpret_cast<const uint32_t *>(src);
                 auto *output=reinterpret_cast<uint32_t *>(dst);
                 if (p.boundary == Boundary::Torus) {
-                    if (p.rule.shape == Shape::Moore) step_r1_bits<Rows,true,true><<<bg,bt>>>(input,output,p);
-                    else step_r1_bits<Rows,false,true><<<bg,bt>>>(input,output,p);
+                    if (p.rule.shape == Shape::Moore) step_r1_bits<Rows,true,true,Compact><<<bg,bt>>>(input,output,p);
+                    else step_r1_bits<Rows,false,true,Compact><<<bg,bt>>>(input,output,p);
                 } else {
-                    if (p.rule.shape == Shape::Moore) step_r1_bits<Rows,true,false><<<bg,bt>>>(input,output,p);
-                    else step_r1_bits<Rows,false,false><<<bg,bt>>>(input,output,p);
+                    if (p.rule.shape == Shape::Moore) step_r1_bits<Rows,true,false,Compact><<<bg,bt>>>(input,output,p);
+                    else step_r1_bits<Rows,false,false,Compact><<<bg,bt>>>(input,output,p);
                 }
                 check(cudaGetLastError(),"launch bit-plane step");
                 swap_buffers();
             }
         };
-        if (bitplane.rows == 1) evolve_bits(std::integral_constant<int,1>{});
-        else evolve_bits(std::integral_constant<int,4>{});
+        auto choose_rows = [&](auto logic_tag) {
+            if (bitplane.rows == 1) evolve_bits(std::integral_constant<int,1>{},logic_tag);
+            else if (bitplane.rows == 2) evolve_bits(std::integral_constant<int,2>{},logic_tag);
+            else evolve_bits(std::integral_constant<int,4>{},logic_tag);
+        };
+        if (bitplane.compact) choose_rows(std::true_type{});
+        else choose_rows(std::false_type{});
         bitplane.mark(2);
         unpack_r1_bits<<<conversion_blocks,256>>>(reinterpret_cast<const uint32_t *>(src),dst,p.width,p.height);
         check(cudaGetLastError(),"launch bit unpack");

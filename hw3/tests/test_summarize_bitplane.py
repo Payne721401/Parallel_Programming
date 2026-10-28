@@ -28,6 +28,10 @@ class BitplaneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp,contextlib.redirect_stdout(io.StringIO()):
             path=Path(tmp)/'gate.log'; path.write_text('\n'.join(lines))
             gate(path,4,'dense')
+            with self.assertRaises(ValueError): gate(path,4,'dense','compact')
+            path.write_text('\n'.join(lines).replace('requested=1','requested=1 logic=compact'))
+            gate(path,4,'dense','compact')
+            with self.assertRaises(ValueError): gate(path,4,'dense','reference')
             path.write_text('\n'.join(lines).replace('selected=1','selected=0',1))
             with self.assertRaises(ValueError): gate(path,4,'dense')
 

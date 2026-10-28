@@ -8,7 +8,7 @@ if [[ $mode != compare && $mode != check ]]; then echo 'usage: bash tests/run_bi
 command -v hw3-1-check >/dev/null
 [[ -x ./hw3-1 && -x ./tests/test_hw3-1 ]]
 unset PP_KERNEL PP_ACTIVE PP_R1 PP_MOORE PP_SUPPORT PP_EVOLVE_EVERY
-export PP_GRAPH=0 PP_EVOLVE=0 PP_PROFILE=1 PP_BITPLANE=1 PP_BIT_ROWS=4
+export PP_GRAPH=0 PP_EVOLVE=0 PP_PROFILE=1 PP_BITPLANE=1 PP_BIT_ROWS=4 PP_BIT_LOGIC=reference
 logdir="tmp/bitplane-${SLURM_JOB_ID}-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$logdir"
 exec > >(tee "$logdir/session.log") 2>&1

@@ -52,9 +52,9 @@ __device__ __forceinline__ BitRow bit_row(const uint32_t *src, int wx, int y,
     }
     return {left,c,right};
 }
-template <int Rows, bool Moore, bool Torus>
+template <int Rows, bool Moore, bool Torus, bool Compact = false>
 __global__ void step_r1_bits(const uint32_t *src, uint32_t *dst, Problem p) {
-    static_assert(Rows == 1 || Rows == 4, "bounded spatial reuse variants");
+    static_assert(Rows == 1 || Rows == 2 || Rows == 4, "bounded spatial reuse variants");
     const int wx = int(blockIdx.x)*32 + int(threadIdx.x);
     const int y0 = (int(blockIdx.y)*int(blockDim.y)+int(threadIdx.y))*Rows;
     const int pitch = (p.width+31)/32;
@@ -72,8 +72,13 @@ __global__ void step_r1_bits(const uint32_t *src, uint32_t *dst, Problem p) {
         else
             n = r1_bits::count9(0,up.centre,0,mid.left,mid.right,0,down.centre,0,
                                p.rule.count_centre ? mid.centre : 0);
-        const uint32_t out = r1_bits::next(mid.centre,n,p.rule.survive_lo,p.rule.survive_hi,
-                                         p.rule.birth_lo,p.rule.birth_hi);
+        uint32_t out;
+        if constexpr (Compact)
+            out = r1_bits::next_compact(mid.centre,n,p.rule.survive_lo,p.rule.survive_hi,
+                                      p.rule.birth_lo,p.rule.birth_hi);
+        else
+            out = r1_bits::next(mid.centre,n,p.rule.survive_lo,p.rule.survive_hi,
+                              p.rule.birth_lo,p.rule.birth_hi);
         if (wx < pitch && y < p.height)
             dst[size_t(y)*pitch+wx] = out & r1_bits::mask(p.width,wx);
         up = mid; mid = down;
@@ -83,6 +88,7 @@ __global__ void step_r1_bits(const uint32_t *src, uint32_t *dst, Problem p) {
 struct BitplaneExperiment {
     bool requested = false, selected = false, timed = false;
     int rows = 4;
+    bool compact = false;
     const char *reason = "disabled";
     cudaEvent_t events[4]{};
     float pack_ms=0, evolve_ms=0, unpack_ms=0;
@@ -94,8 +100,14 @@ struct BitplaneExperiment {
         }
         const char *r = std::getenv("PP_BIT_ROWS");
         if (r && std::strcmp(r,"1")==0) rows=1;
+        else if (r && std::strcmp(r,"2")==0) rows=2;
         else if (r && std::strcmp(r,"4")!=0) {
-            std::fprintf(stderr,"hw3-1: PP_BIT_ROWS must be 1 or 4\n"); std::exit(EXIT_FAILURE);
+            std::fprintf(stderr,"hw3-1: PP_BIT_ROWS must be 1, 2 or 4\n"); std::exit(EXIT_FAILURE);
+        }
+        const char *logic = std::getenv("PP_BIT_LOGIC");
+        if (logic && std::strcmp(logic,"compact")==0) compact=true;
+        else if (logic && std::strcmp(logic,"reference")!=0) {
+            std::fprintf(stderr,"hw3-1: PP_BIT_LOGIC must be reference or compact\n"); std::exit(EXIT_FAILURE);
         }
     }
     void prepare(bool profile) {
@@ -113,7 +125,7 @@ struct BitplaneExperiment {
     }
     void report(bool profile) const {
         if (profile) std::fprintf(stderr,
-            "[PP_BITPLANE] requested=%d selected=%d rows=%d reason=%s pack_ms=%.6f evolve_ms=%.6f unpack_ms=%.6f\n",
-            int(requested),int(selected),rows,reason,pack_ms,evolve_ms,unpack_ms);
+            "[PP_BITPLANE] requested=%d selected=%d rows=%d logic=%s reason=%s pack_ms=%.6f evolve_ms=%.6f unpack_ms=%.6f\n",
+            int(requested),int(selected),rows,compact ? "compact" : "reference",reason,pack_ms,evolve_ms,unpack_ms);
     }
 };

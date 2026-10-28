@@ -40,6 +40,28 @@ PP_BITS_HD uint32_t next(uint32_t state, Count n, unsigned slo, unsigned shi,
     const uint32_t birth = ge(n,blo) & ~ge(n,bhi+1);
     return (state & survive) | (~state & birth);
 }
+// Independent candidate: compare from low to high bits. A higher unequal bit
+// overrides the lower-bit result; equal bits retain it. Thresholds are 0..15
+// (R1 needs only 0..10). Unsigned masks avoid per-bit control flow and the
+// reference comparator's separate equal/greater accumulators.
+PP_BITS_HD uint32_t ge_compact(Count n, unsigned threshold) {
+    uint32_t acc = ~uint32_t(0);
+    const uint32_t bits[4] = {n.b0,n.b1,n.b2,n.b3};
+#ifdef __CUDACC__
+#pragma unroll
+#endif
+    for (int b=0; b<4; ++b) {
+        const uint32_t zero = 0u - (1u ^ ((threshold >> b) & 1u));
+        acc = (bits[b] & acc) | ((bits[b] | acc) & zero);
+    }
+    return acc;
+}
+PP_BITS_HD uint32_t next_compact(uint32_t state, Count n, unsigned slo, unsigned shi,
+                                unsigned blo, unsigned bhi) {
+    const uint32_t survive = ge_compact(n,slo) & ~ge_compact(n,shi+1);
+    const uint32_t birth = ge_compact(n,blo) & ~ge_compact(n,bhi+1);
+    return (state & survive) | (~state & birth);
+}
 PP_BITS_HD uint32_t mask(int width, int word) {
     const int valid = width - word*32;
     return valid >= 32 ? ~uint32_t(0) : valid <= 0 ? 0 : (uint32_t(1)<<valid)-1;

@@ -21,7 +21,7 @@ def verify(record, requested, rows, selected, reason=None):
         if not math.isfinite(value) or value<0 or (not selected and value!=0):
             raise ValueError('invalid bit-plane interval')
 
-def gate(path, rows, kind):
+def gate(path, rows, kind, logic=None):
     text=path.read_text(encoding='utf-8')
     expected={'dense':452,'sparse':30,'graphs':38,'tiled':22}[kind]
     if f'PASS {expected}/{expected} ' not in text:
@@ -30,6 +30,8 @@ def gate(path, rows, kind):
     if len(data)!=expected or len(profiles)!=expected:
         raise ValueError('missing gate dispatch records; rebuild binaries')
     for i,(record,profile) in enumerate(zip(data,profiles)):
+        if logic is not None and record.get('logic') != logic:
+            raise ValueError('wrong/missing comparator dispatch; rebuild binaries')
         if kind=='dense':
             selected=int(i<440 and i%5!=0)
             reason='enabled' if selected else 'zero_steps' if i<440 else ('states' if (i-440)%4<2 else 'not_packed_r1')

@@ -17,13 +17,19 @@ int main() {
             unsigned sum=0; for (auto v:a) sum+=(v>>b)&1u;
             require((((n.b0>>b)&1u) | (((n.b1>>b)&1u)<<1) |
                      (((n.b2>>b)&1u)<<2) | (((n.b3>>b)&1u)<<3))==sum);
-            for (unsigned t=0;t<=10;++t) { require(((r1_bits::ge(n,t)>>b)&1u)==unsigned(sum>=t)); ++checks; }
+            for (unsigned t=0;t<=15;++t) {
+                require(((r1_bits::ge(n,t)>>b)&1u)==unsigned(sum>=t));
+                require(((r1_bits::ge_compact(n,t)>>b)&1u)==unsigned(sum>=t)); checks+=2;
+            }
         }
         const uint32_t state=rng();
         // Every legal interval up to count nine; independent survival/birth masks.
         for (unsigned lo=0;lo<=9;++lo) for (unsigned hi=lo;hi<=9;++hi) {
             const auto out=r1_bits::next(state,n,lo,hi,1,9);
             const auto out_birth=r1_bits::next(state,n,0,9,lo==0 ? 1 : lo,hi==0 ? 1 : hi);
+            require(r1_bits::next_compact(state,n,lo,hi,1,9)==out);
+            require(r1_bits::next_compact(state,n,0,9,lo==0 ? 1 : lo,hi==0 ? 1 : hi)==out_birth);
+            checks+=2;
             for (int b=0;b<32;++b) {
                 unsigned sum=0; for (auto v:a) sum+=(v>>b)&1u;
                 const bool live=(state>>b)&1u;
