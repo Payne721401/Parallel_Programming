@@ -68,6 +68,36 @@ int main() {
         }
     }
     std::mt19937 rng(20261023);
+    // Check both overlapping output rows against independent scalar counts.
+    // Randomize states, not just alive bits, so decaying cells cannot count.
+    for (int sample = 0; sample < 20000; ++sample) {
+        const int states = 2 + sample % 15;
+        unsigned cells[4][12];
+        uint32_t words[12]{};
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 12; ++x) {
+                cells[y][x] = rng() % states;
+                words[3*y+x/4] |= unsigned(cells[y][x] == 1) << (8*(x%4));
+            }
+        for (bool moore : {false,true})
+        for (bool centre : {false,true}) {
+            const auto pair = moore
+                ? r1_packed::count_pair<true>(words[0],words[1],words[2],words[3],words[4],words[5],words[6],words[7],words[8],words[9],words[10],words[11],centre)
+                : r1_packed::count_pair<false>(words[0],words[1],words[2],words[3],words[4],words[5],words[6],words[7],words[8],words[9],words[10],words[11],centre);
+            for (int row = 0; row < 2; ++row)
+            for (int b = 0; b < 4; ++b) {
+                unsigned expected = 0;
+                for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (!centre && !dx && !dy) continue;
+                    if (!moore && std::abs(dx)+std::abs(dy)>1) continue;
+                    expected += cells[row+1+dy][4+b+dx] == 1;
+                }
+                require(byte(row == 0 ? pair.first : pair.second,b) == expected,"shared pair counts");
+                ++comparisons;
+            }
+        }
+    }
     for (int sample = 0; sample < 20000; ++sample) {
         unsigned cells[3][12];
         uint32_t words[9]{};

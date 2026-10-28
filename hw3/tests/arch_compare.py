@@ -15,8 +15,9 @@ from run_cases import run_cases
 from summarize_bitplane import records, verify_public_dispatch
 
 CASES = {"reduce": ("08", "09", "10"), "r1": ("08", "10", "12"),
+         "r1shared": ("08", "10", "12"),
          "large": ("05", "06", "07"), "all": tuple(f"{i:02d}" for i in range(1,13))}
-BITS = {"baseline": 0, "reduce": 1, "r1": 2, "large": 4, "all": 7}
+BITS = {"baseline": 0, "reduce": 1, "r1": 2, "large": 4, "all": 7, "r1shared": 8}
 
 
 def configure(method, **overrides):
@@ -35,7 +36,8 @@ def verify_arch(record, row, header, method):
     expected = dict(mode=method, merged=str(int(bool(bits & 1) and sparse)),
                     r1_warp=str(int(bool(bits & 2) and kernel in ("dense_r1", "sparse_r1"))),
                     vn_diagonal=str(int(bool(bits & 4) and kernel in ("tiled", "sparse_tiled")
-                                        and "NN" in header[1] and radius <= 30)))
+                                        and "NN" in header[1] and radius <= 30)),
+                    r1_shared=str(int(bool(bits & 8) and kernel in ("dense_r1", "sparse_r1"))))
     if record != expected:
         raise ValueError("wrong architecture selection: " + str(record) + "; expected " + str(expected))
 
@@ -51,7 +53,7 @@ def gates(root, method):
         specs += [(method,"--sparse",30,{"PP_ACTIVE":"1","PP_KERNEL":"naive"}),
                   (method,"--sparse",30,{"PP_ACTIVE":"1","PP_KERNEL":"tiled","PP_MOORE":"sat"}),
                   (method,"--sparse",30,{"PP_ACTIVE":"1","PP_KERNEL":"tiled","PP_MOORE":"sliding"})]
-    if method in ("r1", "all"):
+    if method in ("r1", "r1shared", "all"):
         specs += [(method,"--r1",64,{"PP_ACTIVE":"1"}),
                   (method,"--dense-r1",90,{"PP_ACTIVE":"0"})]
     if method in ("large", "all"):
@@ -111,7 +113,8 @@ def main():
         (root/"COMPLETE").write_text("CPU reference gates completed; no public timing run.\n")
         return
     samples=[]
-    for number, selected in enumerate(("baseline",args.method,args.method,"baseline","baseline",args.method),1):
+    for number, selected in enumerate(("baseline",args.method,args.method,"baseline",
+                                        "baseline",args.method,args.method,"baseline"),1):
         profiled=number>=5
         configure(selected,PP_PROFILE=str(int(profiled)))
         order=CASES[args.method] if number%2 else tuple(reversed(CASES[args.method]))
@@ -139,6 +142,24 @@ def main():
         write_table(root/"samples.tsv",samples)
     summary=summarize([s for s in samples if not s['profiled']],CASES[args.method],args.method)
     write_table(root/"summary.tsv",summary)
+    # Keep profiled observations separate; expose allocation/free outliers rather
+    # than attributing an end-to-end delay to the update kernel.
+    phases=[]
+    for case in CASES[args.method]:
+        for selected in ("baseline",args.method):
+            group=[s for s in samples if s['profiled'] and s['case_id']==case and s['method']==selected]
+            if len(group)!=2: raise ValueError("incomplete phase pair")
+            phase=dict(case=case,method=selected)
+            for key in ("kernels_ms","alloc_host_ms","free_host_ms","h2d_ms","d2h_ms","run_host_ms"):
+                values=[numeric(s[key]) for s in group]
+                phase[key+"_mean"]=statistics.mean(values)
+                phase[key+"_min"]=min(values)
+                phase[key+"_max"]=max(values)
+            phases.append(phase)
+            print(f"  Phase {case} {selected}: kernels={phase['kernels_ms_min']:.3f}..{phase['kernels_ms_max']:.3f} ms, "
+                  f"alloc={phase['alloc_host_ms_min']:.3f}..{phase['alloc_host_ms_max']:.3f}, "
+                  f"free={phase['free_host_ms_min']:.3f}..{phase['free_host_ms_max']:.3f}")
+    write_table(root/"phases.tsv",phases)
     for row in summary:
         print("{case}: {baseline_mean_s:.6f} -> {candidate_mean_s:.6f}s, "
               "baseline/candidate={baseline_over_candidate:.3f}x {timing_status}".format(**row))

@@ -8,7 +8,8 @@
 // PP_SUPPORT=tile|bbox selects sparse influence; default bbox (tile for evolution diagnostics).
 // PP_BITPLANE=auto|0|1 selects dense R1 C=2 bit planes; default auto (large/long only).
 // PP_BIT_ROWS=1|2|4, default 4. PP_BIT_LOGIC=reference|compact, default compact.
-// PP_ARCH=baseline|reduce|r1|large|all: opt-in architecture experiments.
+// PP_ARCH=baseline|reduce|r1|r1shared|large|all: opt-in architecture experiments.
+// r1shared keeps the shared tile and reuses two adjacent output rows in registers.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -473,12 +474,29 @@ __device__ unsigned update_r1_packed(const uint8_t *__restrict__ src,
     }
     __syncthreads();
     unsigned flags = 0;
-    for (int i = tid; i < R1_WORDS * TILE_H; i += 256) {
+    static_assert(R1_WORDS * TILE_H == 2 * 256, "two output words per thread");
+    [[maybe_unused]] r1_packed::CountPair pair{};
+    if constexpr (Arch & 8) {
+        const int q = (2 * (tid / R1_WORDS) + 1) * R1_PITCH + tid % R1_WORDS + 1;
+        // All loads address the already populated shared tile, including halo.
+        // Unlike the warp-only experiment, global halo loading is unchanged.
+        pair = r1_packed::count_pair<Moore>(
+            alive[q-R1_PITCH-1], alive[q-R1_PITCH], alive[q-R1_PITCH+1],
+            alive[q-1], alive[q], alive[q+1],
+            alive[q+R1_PITCH-1], alive[q+R1_PITCH], alive[q+R1_PITCH+1],
+            alive[q+2*R1_PITCH-1], alive[q+2*R1_PITCH], alive[q+2*R1_PITCH+1],
+            p.rule.count_centre);
+    }
+    for (int row = 0; row < 2; ++row) {
+        const int i = (Arch & 8) ? (2 * (tid / R1_WORDS) + row) * R1_WORDS + tid % R1_WORDS
+                                 : tid + row * 256;
         const int x = x0 + (i % R1_WORDS) * 4, y = y0 + i / R1_WORDS;
         if (x >= p.width || y >= p.height) continue;
         const int q = (i / R1_WORDS + 1) * R1_PITCH + i % R1_WORDS + 1;
         uint32_t counts;
-        if constexpr (Moore) {
+        if constexpr (Arch & 8) {
+            counts = row == 0 ? pair.first : pair.second;
+        } else if constexpr (Moore) {
             counts = r1_packed::count<true>(
                 alive[q-R1_PITCH-1], alive[q-R1_PITCH], alive[q-R1_PITCH+1],
                 alive[q-1], alive[q], alive[q+1],
@@ -748,10 +766,11 @@ void run(uint8_t *grid, const Problem &p) {
     const int arch = std::strcmp(arch_mode, "baseline") == 0 ? 0 :
                      std::strcmp(arch_mode, "reduce") == 0 ? 1 :
                      std::strcmp(arch_mode, "r1") == 0 ? 2 :
+                     std::strcmp(arch_mode, "r1shared") == 0 ? 8 :
                      std::strcmp(arch_mode, "large") == 0 ? 4 :
                      std::strcmp(arch_mode, "all") == 0 ? 7 : -1;
     if (arch < 0) {
-        std::fprintf(stderr, "hw3-1: PP_ARCH must be baseline, reduce, r1, large or all\n");
+        std::fprintf(stderr, "hw3-1: PP_ARCH must be baseline, reduce, r1, r1shared, large or all\n");
         std::exit(EXIT_FAILURE);
     }
     if (p.steps == 0 && !evolution.enabled) {
@@ -759,7 +778,7 @@ void run(uint8_t *grid, const Problem &p) {
         bitplane.reason = bitplane.automatic || bitplane.requested ? "zero_steps" : "disabled";
         bitplane.report(profile.enabled);
         if (profile.enabled)
-            std::fprintf(stderr, "[PP_ARCH] mode=%s merged=0 r1_warp=0 vn_diagonal=0\n", arch_mode);
+            std::fprintf(stderr, "[PP_ARCH] mode=%s merged=0 r1_warp=0 vn_diagonal=0 r1_shared=0\n", arch_mode);
         return;
     }
     // The default must work in the judge without an environment override.
@@ -858,6 +877,14 @@ void run(uint8_t *grid, const Problem &p) {
     auto launch_step = [&](int t) {
         auto dispatch = [&](auto arch_tag) {
             constexpr int Arch = decltype(arch_tag)::value;
+            // Canonicalize options per family: irrelevant flags must not create
+            // another identical kernel for ptxas to compile and optimize.
+            constexpr int SparseR1 = Arch & (1 | 2 | 8);
+            constexpr int SparseDirect = Arch & 1;
+            constexpr int SparseMoore = Arch & 1;
+            constexpr int SparseVN = Arch & (1 | 4);
+            constexpr int DenseR1 = Arch & (2 | 8);
+            constexpr int DenseVN = Arch & 4;
             if (sparse) {
                 const TileQueue current = sparse_work.queue(t & 1);
                 const TileQueue next = sparse_work.queue((t + 1) & 1);
@@ -869,27 +896,27 @@ void run(uint8_t *grid, const Problem &p) {
                 auto launch_sparse = [&](auto tight_tag) {
                     constexpr bool Tight = decltype(tight_tag)::value;
                     if (packed && p.rule.shape == Shape::Moore)
-                        step_sparse<false, true, true, false, Tight, Arch><<<sparse_work.workers, threads, r1_shared_bytes, stream>>>(
+                        step_sparse<false, true, true, false, Tight, SparseR1><<<sparse_work.workers, threads, r1_shared_bytes, stream>>>(
                             src, dst, p, current, next, sparse_work.stamp, t + 1,
                             sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
                     else if (packed)
-                        step_sparse<false, false, true, false, Tight, Arch><<<sparse_work.workers, threads, r1_shared_bytes, stream>>>(
+                        step_sparse<false, false, true, false, Tight, SparseR1><<<sparse_work.workers, threads, r1_shared_bytes, stream>>>(
                             src, dst, p, current, next, sparse_work.stamp, t + 1,
                             sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
                     else if (!tiled)
-                        step_sparse<false, false, false, false, Tight, Arch><<<sparse_work.workers, threads, 0, stream>>>(
+                        step_sparse<false, false, false, false, Tight, SparseDirect><<<sparse_work.workers, threads, 0, stream>>>(
                             src, dst, p, current, next, sparse_work.stamp, t + 1,
                             sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
                     else if (sliding)
-                        step_sparse<true, true, false, true, Tight, Arch><<<sparse_work.workers, threads, shared_bytes, stream>>>(
+                        step_sparse<true, true, false, true, Tight, SparseMoore><<<sparse_work.workers, threads, shared_bytes, stream>>>(
                             src, dst, p, current, next, sparse_work.stamp, t + 1,
                             sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
                     else if (p.rule.shape == Shape::Moore)
-                        step_sparse<true, true, false, false, Tight, Arch><<<sparse_work.workers, threads, shared_bytes, stream>>>(
+                        step_sparse<true, true, false, false, Tight, SparseMoore><<<sparse_work.workers, threads, shared_bytes, stream>>>(
                             src, dst, p, current, next, sparse_work.stamp, t + 1,
                             sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
                     else
-                        step_sparse<true, false, false, false, Tight, Arch><<<sparse_work.workers, threads, shared_bytes, stream>>>(
+                        step_sparse<true, false, false, false, Tight, SparseVN><<<sparse_work.workers, threads, shared_bytes, stream>>>(
                             src, dst, p, current, next, sparse_work.stamp, t + 1,
                             sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
                 };
@@ -897,21 +924,22 @@ void run(uint8_t *grid, const Problem &p) {
                 else launch_sparse(std::false_type{});
             }
             else if (packed && p.rule.shape == Shape::Moore)
-                step_r1_dense<true, Arch><<<blocks, threads, r1_shared_bytes, stream>>>(src, dst, p);
+                step_r1_dense<true, DenseR1><<<blocks, threads, r1_shared_bytes, stream>>>(src, dst, p);
             else if (packed)
-                step_r1_dense<false, Arch><<<blocks, threads, r1_shared_bytes, stream>>>(src, dst, p);
+                step_r1_dense<false, DenseR1><<<blocks, threads, r1_shared_bytes, stream>>>(src, dst, p);
             else if (!tiled) step_naive<<<blocks, threads, 0, stream>>>(src, dst, p);
             else if (sliding)
-                step_tiled<true, true, Arch><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
+                step_tiled<true, true, 0><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
             else if (p.rule.shape == Shape::Moore)
-                step_tiled<true, false, Arch><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
-            else step_tiled<false, false, Arch><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
+                step_tiled<true, false, 0><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
+            else step_tiled<false, false, DenseVN><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
         };
         switch (arch) {
             case 1: dispatch(std::integral_constant<int, 1>{}); break;
             case 2: dispatch(std::integral_constant<int, 2>{}); break;
             case 4: dispatch(std::integral_constant<int, 4>{}); break;
             case 7: dispatch(std::integral_constant<int, 7>{}); break;
+            case 8: dispatch(std::integral_constant<int, 8>{}); break;
             default: dispatch(std::integral_constant<int, 0>{}); break;
         }
         check(cudaGetLastError(), sparse ? "launch step_sparse" : packed ? "launch step_r1_dense"
@@ -1012,9 +1040,10 @@ void run(uint8_t *grid, const Problem &p) {
             graph_selected ? iterations / GRAPH_BATCH : 0,
             graph_selected ? iterations % GRAPH_BATCH : iterations, graph_build_ms);
     if (profile.enabled)
-        std::fprintf(stderr, "[PP_ARCH] mode=%s merged=%d r1_warp=%d vn_diagonal=%d\n",
+        std::fprintf(stderr, "[PP_ARCH] mode=%s merged=%d r1_warp=%d vn_diagonal=%d r1_shared=%d\n",
                      arch_mode, int((arch & 1) && sparse),
-                     int((arch & 2) && packed && !bitplane.selected), int(vn_diagonal_selected));
+                     int((arch & 2) && packed && !bitplane.selected), int(vn_diagonal_selected),
+                     int((arch & 8) && packed && !bitplane.selected));
     if (profile.enabled && inspect_sparse)
         std::fprintf(stderr,
             "[PP_SPARSE] selected=%d tiles_total=%d initial_work=%d work_sum=%llu "

@@ -33,6 +33,25 @@ PP_R1_HD uint32_t right(uint32_t centre, uint32_t next) {
     return (centre >> 8) | (next << 24);
 }
 
+// Two adjacent output rows share the two middle input rows. Keeping their
+// vertical sums in registers avoids loading those rows twice from shared memory.
+struct CountPair { uint32_t first, second; };
+template <bool Moore>
+PP_R1_HD CountPair count_pair(uint32_t al, uint32_t a, uint32_t ar,
+                              uint32_t bl, uint32_t b, uint32_t br,
+                              uint32_t cl, uint32_t c, uint32_t cr,
+                              uint32_t dl, uint32_t d, uint32_t dr, bool centre) {
+    if constexpr (Moore) {
+        const uint32_t l = bl + cl, m = b + c, r = br + cr;
+        const uint32_t top = left(a + m, al + l) + (a + m) + right(a + m, ar + r);
+        const uint32_t bottom = left(m + d, l + dl) + (m + d) + right(m + d, r + dr);
+        return {centre ? top : top - b, centre ? bottom : bottom - c};
+    } else {
+        return {a + c + left(b, bl) + right(b, br) + (centre ? b : 0u),
+                b + d + left(c, cl) + right(c, cr) + (centre ? c : 0u)};
+    }
+}
+
 template <bool Moore>
 PP_R1_HD uint32_t count(uint32_t ul, uint32_t u, uint32_t ur,
                         uint32_t ml, uint32_t m, uint32_t mr,

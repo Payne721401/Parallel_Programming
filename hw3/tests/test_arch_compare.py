@@ -23,12 +23,18 @@ class ArchitectureComparisonTests(unittest.TestCase):
             (32,"NN","tiled","0",("0","0","0")),
             (5,"NM","sliding","0",("0","0","0")),
         ):
-            record=dict(mode="all",merged=expected[0],r1_warp=expected[1],vn_diagonal=expected[2])
+            record=dict(mode="all",merged=expected[0],r1_warp=expected[1],vn_diagonal=expected[2],r1_shared="0")
             row=dict(profile_kernel=kernel,sparse_selected=sparse)
             header=["128 128",f"R{radius},C4,M0,S1..2,B1..2,{shape}","dead","200"]
             verify_arch(record,row,header,"all")
             with self.assertRaises(ValueError):
                 verify_arch(dict(record, mode="baseline"),row,header,"all")
+
+    def test_shared_pair_dispatch(self):
+        for kernel, selected in (("dense_r1","1"),("sparse_r1","1"),("dense_bits","0"),("tiled","0")):
+            record=dict(mode="r1shared",merged="0",r1_warp="0",vn_diagonal="0",r1_shared=selected)
+            row=dict(profile_kernel=kernel,sparse_selected=str(int(kernel.startswith('sparse'))))
+            verify_arch(record,row,["128 128","R1,C4,M0,S2..3,B3..3,NM"],"r1shared")
 
     def test_pairing_outliers_and_wrong_outputs(self):
         samples=[dict(case_id="10",method=m,verdict="AC",compute_s=v)
