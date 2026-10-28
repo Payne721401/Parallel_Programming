@@ -312,6 +312,26 @@ static void bitplane_checks(std::mt19937 &rng) {
     std::printf("PASS %d/%d (bit-plane boundaries, rules, parity and fallbacks; not timing)\n",tested,tested);
 }
 
+// Exercise every legal radius, including diagonal-memory fallback at R31/32.
+static void vn_reuse_checks(std::mt19937 &rng) {
+    const int states_list[] = {2,3,4,16};
+    for (int radius=1; radius<=32; ++radius)
+    for (Boundary boundary : {Boundary::Dead, Boundary::Torus})
+    for (bool centre : {false,true}) {
+        const int states=states_list[tested%4];
+        const int maxn=2*radius*(radius+1)+int(centre);
+        const int typical=maxn/4;
+        Rule r{radius,states,centre,std::max(int(centre),typical-2),typical+3,
+               std::max(1,typical-1),typical+2,Shape::VonNeumann};
+        Problem p{boundary==Boundary::Torus?2*radius+1:67,2*radius+3,r,boundary,radius<=12?3:1};
+        std::vector<uint8_t> initial(size_t(p.width)*p.height);
+        for (auto &v:initial) v=rng()%4==0?1:uint8_t(rng()%states);
+        initial.front()=uint8_t(states-1); initial.back()=1;
+        compare(p,initial);
+    }
+    std::printf("PASS %d/%d (VN R1..32, C2/3/4/16, M0/1 and both boundaries)\n",tested,tested);
+}
+
 int main(int argc, char **argv) {
     int random_cases = 64;
     unsigned seed = 20261022;
@@ -322,12 +342,13 @@ int main(int argc, char **argv) {
     const bool sliding = argc == 2 && std::strcmp(argv[1], "--sliding") == 0;
     const bool graphs = argc == 2 && std::strcmp(argv[1], "--graphs") == 0;
     const bool support = argc == 2 && std::strcmp(argv[1], "--support") == 0;
+    const bool vn_reuse = argc == 2 && std::strcmp(argv[1], "--vn-reuse") == 0;
     const bool bits = argc == 2 && std::strcmp(argv[1], "--bitplane") == 0;
     if (argc > 3) {
-        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1 | --sliding | --graphs | --support | --bitplane\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1 | --sliding | --graphs | --support | --bitplane | --vn-reuse\n", argv[0]);
         return 2;
     }
-    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1 && !sliding && !graphs && !support && !bits) random_cases = std::atoi(argv[1]);
+    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1 && !sliding && !graphs && !support && !bits && !vn_reuse) random_cases = std::atoi(argv[1]);
     if (argc >= 3) seed = unsigned(std::strtoul(argv[2], nullptr, 10));
     if (random_cases < 0 || random_cases > 1000) return 2;
     const char *kernel = std::getenv("PP_KERNEL");
@@ -337,12 +358,13 @@ int main(int argc, char **argv) {
     std::printf("kernel=%s active=%s r1=%s moore=%s seed=%u mode=%s random_cases=%d\n",
                 kernel ? kernel : "auto", active ? active : "auto", r1_mode ? r1_mode : "auto",
                 moore_mode ? moore_mode : "auto", seed,
-                bits ? "bitplane" : support ? "support" : graphs ? "graphs" : sliding ? "sliding" : dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
-                (quick || sparse || r1 || dense_r1 || sliding || graphs || support || bits) ? 0 : random_cases);
+                vn_reuse ? "vn-reuse" : bits ? "bitplane" : support ? "support" : graphs ? "graphs" : sliding ? "sliding" : dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
+                (quick || sparse || r1 || dense_r1 || sliding || graphs || support || bits || vn_reuse) ? 0 : random_cases);
     std::printf("graph=%s\n", std::getenv("PP_GRAPH") ? std::getenv("PP_GRAPH") : "0");
     std::printf("support=%s\n", std::getenv("PP_SUPPORT") ? std::getenv("PP_SUPPORT") : "default");
     check(cudaFree(nullptr));
     std::mt19937 rng(seed);
+    if (vn_reuse) { vn_reuse_checks(rng); return 0; }
     if (bits) { bitplane_checks(rng); return 0; }
     if (support) { support_checks(); return 0; }
     if (graphs) {

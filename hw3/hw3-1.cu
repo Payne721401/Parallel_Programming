@@ -8,6 +8,7 @@
 // PP_SUPPORT=tile|bbox selects sparse influence; default bbox (tile for evolution diagnostics).
 // PP_BITPLANE=auto|0|1 selects dense R1 C=2 bit planes; default auto (large/long only).
 // PP_BIT_ROWS=1|2|4, default 4. PP_BIT_LOGIC=reference|compact, default compact.
+// PP_ARCH=baseline|reduce|r1|large|all: opt-in architecture experiments.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -22,6 +23,7 @@
 #include "tile_geometry.hpp"
 #include "r1_packed.hpp"
 #include "r1_bits.hpp"
+#include "vn_diagonal.hpp"
 
 namespace {
 
@@ -131,6 +133,8 @@ __global__ void step_naive(const uint8_t *__restrict__ src,
 constexpr int TILE_W = tile_geometry::width;
 constexpr int TILE_H = tile_geometry::height;
 constexpr int TILE_WARPS = 8;
+static_assert(2 * (TILE_W + 61) * (TILE_H + 61) * sizeof(uint16_t) + 160 <= 48*1024,
+              "R<=30 diagonal tables and merged metadata must fit shared memory");
 static_assert(MAX_RADIUS <= 32, "tile influence storage assumes R<=32");
 static_assert((TILE_W + 2 * MAX_RADIUS) * (TILE_H + 2 * MAX_RADIUS) <= 65535,
               "tile summed-area table must fit uint16_t");
@@ -194,9 +198,12 @@ __device__ AliveBounds reduce_alive_bounds(AliveBounds b) {
     return b;
 }
 
+#include "arch_stats.cuh"
+#include "vn_diagonal.cuh"
+
 // Track is compiled out for dense execution. Flags report whether the input
 // tile (bit 0) and output tile (bit 1) contain any nonzero, including decay.
-template <bool Moore, bool Track, bool Sliding = false, bool Tight = false>
+template <bool Moore, bool Track, bool Sliding = false, bool Tight = false, int Arch = 0>
 __device__ unsigned update_tiled(const uint8_t *__restrict__ src,
                                  uint8_t *__restrict__ dst, const Problem &p,
                                  int x0, int y0, uint16_t *sums, AliveBounds *support = nullptr) {
@@ -237,6 +244,30 @@ __device__ unsigned update_tiled(const uint8_t *__restrict__ src,
         }
     }
     __syncthreads();
+
+    if constexpr ((Arch & 4) && !Moore) {
+        // Two uint16 tables fit 48 KiB through R=30. R31/32 use the reference.
+        if (radius <= 30) {
+            build_vn_diagonals(sums, rw, rh);
+            const uint16_t *a = sums + (rh + 1)*pitch;
+            unsigned flags = 0;
+            for (int cell = tid; cell < TILE_W*TILE_H; cell += 256) {
+                const int x = cell % TILE_W, y = cell / TILE_W;
+                const int gx = x0+x, gy = y0+y;
+                if (gx >= p.width || gy >= p.height) continue;
+                const size_t index = size_t(gy)*p.width+gx;
+                const uint8_t state = src[index];
+                const int n = vn_diagonal::count(a, sums, pitch, x, y, radius)
+                            - int(!p.rule.count_centre && state == 1);
+                const uint8_t output = next_state(p.rule, state, n);
+                dst[index] = output;
+                if constexpr (Tight) if (output == 1) local.include(x, y);
+                if constexpr (Track) flags |= unsigned(state != 0) | (unsigned(output != 0) << 1);
+            }
+            if constexpr (Track) return finish_tracking<Tight, Arch>(flags, local, support);
+            return 0;
+        }
+    }
 
     if constexpr (Sliding) {
         // Keep row prefixes read-only: in-place conversion would race with other
@@ -283,10 +314,7 @@ __device__ unsigned update_tiled(const uint8_t *__restrict__ src,
         }
         // Every thread participates, including invalid lanes of partial tiles.
         if constexpr (Track) {
-            const unsigned input_nonzero = __syncthreads_or((flags & 1) != 0);
-            const unsigned output_nonzero = __syncthreads_or((flags & 2) != 0);
-            if constexpr (Tight) *support = reduce_alive_bounds(local);
-            return input_nonzero | (output_nonzero << 1);
+            return finish_tracking<Tight, Arch>(flags, local, support);
         }
         return 0;
     }
@@ -340,25 +368,22 @@ __device__ unsigned update_tiled(const uint8_t *__restrict__ src,
         if constexpr (Track) flags |= unsigned(state != 0) | (unsigned(output != 0) << 1);
     }
     if constexpr (Track) {
-        const unsigned input_nonzero = __syncthreads_or((flags & 1) != 0);
-        const unsigned output_nonzero = __syncthreads_or((flags & 2) != 0);
-        if constexpr (Tight) *support = reduce_alive_bounds(local);
-        return input_nonzero | (output_nonzero << 1);
+        return finish_tracking<Tight, Arch>(flags, local, support);
     }
     return 0;
 }
 
-template <bool Moore, bool Sliding = false>
+template <bool Moore, bool Sliding = false, int Arch = 0>
 __global__ void step_tiled(const uint8_t *__restrict__ src,
                            uint8_t *__restrict__ dst, Problem p) {
     extern __shared__ uint16_t sums[];
-    update_tiled<Moore, false, Sliding>(src, dst, p, int(blockIdx.x) * TILE_W,
+    update_tiled<Moore, false, Sliding, false, Arch>(src, dst, p, int(blockIdx.x) * TILE_W,
                               int(blockIdx.y) * TILE_H, sums);
 }
 
 // Small-radius sparse tiles avoid the prefix-table setup. Each lane writes
 // distinct cells. Tracking uses two OR reductions, plus optional alive bounds.
-template <bool Track, bool Tight = false>
+template <bool Track, bool Tight = false, int Arch = 0>
 __device__ unsigned update_direct(const uint8_t *__restrict__ src,
                                   uint8_t *__restrict__ dst, const Problem &p,
                                   int x0, int y0, AliveBounds *support = nullptr) {
@@ -393,10 +418,7 @@ __device__ unsigned update_direct(const uint8_t *__restrict__ src,
         if constexpr (Track) flags |= unsigned(input != 0) | (unsigned(output != 0) << 1);
     }
     if constexpr (Track) {
-        const unsigned input_nonzero = __syncthreads_or((flags & 1) != 0);
-        const unsigned output_nonzero = __syncthreads_or((flags & 2) != 0);
-        if constexpr (Tight) *support = reduce_alive_bounds(local);
-        return input_nonzero | (output_nonzero << 1);
+        return finish_tracking<Tight, Arch>(flags, local, support);
     }
     return 0;
 }
@@ -430,11 +452,15 @@ __device__ uint32_t load_r1_word(const uint8_t *src, const Problem &p, int x, in
     return word;
 }
 
-template <bool Moore, bool Track, bool Tight = false>
+#include "r1_warp.cuh"
+
+template <bool Moore, bool Track, bool Tight = false, int Arch = 0>
 __device__ unsigned update_r1_packed(const uint8_t *__restrict__ src,
                                      uint8_t *__restrict__ dst, const Problem &p,
                                      int x0, int y0, uint32_t *words, AliveBounds *support = nullptr) {
     static_assert(!Tight || Track, "support requires tracking");
+    if constexpr (Arch & 2)
+        return update_r1_warp<Moore, Track, Tight, Arch>(src, dst, p, x0, y0, support);
     AliveBounds local;
     const int tid = int(threadIdx.y) * 32 + int(threadIdx.x);
     uint32_t *alive = words + R1_WORD_COUNT;
@@ -485,22 +511,19 @@ __device__ unsigned update_r1_packed(const uint8_t *__restrict__ src,
             flags |= unsigned((input & mask) != 0) | (unsigned((output & mask) != 0) << 1);
     }
     if constexpr (Track) {
-        const unsigned input_nonzero = __syncthreads_or((flags & 1) != 0);
-        const unsigned output_nonzero = __syncthreads_or((flags & 2) != 0);
-        if constexpr (Tight) *support = reduce_alive_bounds(local);
-        return input_nonzero | (output_nonzero << 1);
+        return finish_tracking<Tight, Arch>(flags, local, support);
     }
     return 0;
 }
 
-template <bool Moore>
+template <bool Moore, int Arch = 0>
 __global__ void step_r1_dense(const uint8_t *__restrict__ src,
                               uint8_t *__restrict__ dst, Problem p) {
     // One block owns one output tile. No worklist, activity reductions or atomics.
     // All threads enter the helper, including blocks with partial output tiles:
     // its cooperative halo load must finish before any thread reads shared data.
     extern __shared__ uint32_t words[];
-    update_r1_packed<Moore, false>(src, dst, p,
+    update_r1_packed<Moore, false, false, Arch>(src, dst, p,
         int(blockIdx.x) * TILE_W, int(blockIdx.y) * TILE_H, words);
 }
 
@@ -594,7 +617,7 @@ __global__ void prepare_sparse(TileQueue current, TileQueue next, int *dense,
     }
 }
 
-template <bool Tiled, bool Moore, bool Packed = false, bool Sliding = false, bool Tight = false>
+template <bool Tiled, bool Moore, bool Packed = false, bool Sliding = false, bool Tight = false, int Arch = 0>
 __global__ void step_sparse(const uint8_t *__restrict__ src,
                             uint8_t *__restrict__ dst, Problem p,
                             TileQueue current, TileQueue next, int *stamp, int epoch,
@@ -611,14 +634,14 @@ __global__ void step_sparse(const uint8_t *__restrict__ src,
         unsigned flags = 0;
         if (full) {
             // One-way dense fallback: no flag reductions or queue atomics.
-            if constexpr (Packed) update_r1_packed<Moore, false>(src, dst, p, x0, y0, scratch);
-            else if constexpr (Tiled) update_tiled<Moore, false, Sliding>(src, dst, p, x0, y0, sums);
-            else update_direct<false>(src, dst, p, x0, y0);
+            if constexpr (Packed) update_r1_packed<Moore, false, false, Arch>(src, dst, p, x0, y0, scratch);
+            else if constexpr (Tiled) update_tiled<Moore, false, Sliding, false, Arch>(src, dst, p, x0, y0, sums);
+            else update_direct<false, false, Arch>(src, dst, p, x0, y0);
         } else {
             AliveBounds support;
-            if constexpr (Packed) flags = update_r1_packed<Moore, true, Tight>(src, dst, p, x0, y0, scratch, &support);
-            else if constexpr (Tiled) flags = update_tiled<Moore, true, Sliding, Tight>(src, dst, p, x0, y0, sums, &support);
-            else flags = update_direct<true, Tight>(src, dst, p, x0, y0, &support);
+            if constexpr (Packed) flags = update_r1_packed<Moore, true, Tight, Arch>(src, dst, p, x0, y0, scratch, &support);
+            else if constexpr (Tiled) flags = update_tiled<Moore, true, Sliding, Tight, Arch>(src, dst, p, x0, y0, sums, &support);
+            else flags = update_direct<true, Tight, Arch>(src, dst, p, x0, y0, &support);
             if (threadIdx.x == 0 && threadIdx.y == 0) {
                 if constexpr (Tight) {
                     // Next work = dilation(alive output) union nonzero output
@@ -720,10 +743,23 @@ void run(uint8_t *grid, const Problem &p) {
         std::fprintf(stderr, "hw3-1: PP_EVOLVE=1 requires PP_GRAPH=0; measure graph speed separately\n");
         std::exit(EXIT_FAILURE);
     }
+    const char *arch_mode = std::getenv("PP_ARCH");
+    if (!arch_mode) arch_mode = "baseline";
+    const int arch = std::strcmp(arch_mode, "baseline") == 0 ? 0 :
+                     std::strcmp(arch_mode, "reduce") == 0 ? 1 :
+                     std::strcmp(arch_mode, "r1") == 0 ? 2 :
+                     std::strcmp(arch_mode, "large") == 0 ? 4 :
+                     std::strcmp(arch_mode, "all") == 0 ? 7 : -1;
+    if (arch < 0) {
+        std::fprintf(stderr, "hw3-1: PP_ARCH must be baseline, reduce, r1, large or all\n");
+        std::exit(EXIT_FAILURE);
+    }
     if (p.steps == 0 && !evolution.enabled) {
         profile.report("none", p); // all phase times zero; no CUDA events allocated
         bitplane.reason = bitplane.automatic || bitplane.requested ? "zero_steps" : "disabled";
         bitplane.report(profile.enabled);
+        if (profile.enabled)
+            std::fprintf(stderr, "[PP_ARCH] mode=%s merged=0 r1_warp=0 vn_diagonal=0\n", arch_mode);
         return;
     }
     // The default must work in the judge without an environment override.
@@ -801,8 +837,12 @@ void run(uint8_t *grid, const Problem &p) {
     const int tile_w = (tiled || packed) ? TILE_W : 32;
     const int tile_h = (tiled || packed) ? TILE_H : 8;
     const dim3 blocks((p.width + tile_w - 1) / tile_w, (p.height + tile_h - 1) / tile_h);
+    const size_t r1_shared_bytes = (arch & 2) ? 0 : R1_SHARED_BYTES;
+    const bool vn_diagonal_selected = (arch & 4) && tiled && p.rule.shape == Shape::VonNeumann
+                                     && p.rule.radius <= 30;
     const size_t shared_bytes = size_t(TILE_W + 2 * p.rule.radius + 1)
                               * (TILE_H + 2 * p.rule.radius + 1) * sizeof(uint16_t)
+                              * (vn_diagonal_selected ? 2 : 1)
                               + (sliding ? size_t(TILE_H + 2 * p.rule.radius) * TILE_W
                                            * sizeof(uint16_t) : 0);
     // One stream orders generations and queue publication. Dense writes every
@@ -816,54 +856,64 @@ void run(uint8_t *grid, const Problem &p) {
     double graph_build_ms = 0;
     int *device_epoch = graph_selected && sparse ? sparse_work.counts + 3 : nullptr;
     auto launch_step = [&](int t) {
-        if (sparse) {
-            const TileQueue current = sparse_work.queue(t & 1);
-            const TileQueue next = sparse_work.queue((t + 1) & 1);
-            prepare_sparse<<<1, 1, 0, stream>>>(current, next, sparse_work.counts + 2,
-                                      sparse_work.tile_count, sparse_work.stats, device_epoch);
-            check(cudaGetLastError(), "launch prepare_sparse");
-            // Separate template instantiations keep bbox reductions/registers
-            // out of the reference kernel, rather than a per-cell runtime branch.
-            auto launch_sparse = [&](auto tight_tag) {
-                constexpr bool Tight = decltype(tight_tag)::value;
-                if (packed && p.rule.shape == Shape::Moore)
-                    step_sparse<false, true, true, false, Tight><<<sparse_work.workers, threads, R1_SHARED_BYTES, stream>>>(
-                        src, dst, p, current, next, sparse_work.stamp, t + 1,
-                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
-                else if (packed)
-                    step_sparse<false, false, true, false, Tight><<<sparse_work.workers, threads, R1_SHARED_BYTES, stream>>>(
-                        src, dst, p, current, next, sparse_work.stamp, t + 1,
-                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
-                else if (!tiled)
-                    step_sparse<false, false, false, false, Tight><<<sparse_work.workers, threads, 0, stream>>>(
-                        src, dst, p, current, next, sparse_work.stamp, t + 1,
-                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
-                else if (sliding)
-                    step_sparse<true, true, false, true, Tight><<<sparse_work.workers, threads, shared_bytes, stream>>>(
-                        src, dst, p, current, next, sparse_work.stamp, t + 1,
-                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
-                else if (p.rule.shape == Shape::Moore)
-                    step_sparse<true, true, false, false, Tight><<<sparse_work.workers, threads, shared_bytes, stream>>>(
-                        src, dst, p, current, next, sparse_work.stamp, t + 1,
-                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
-                else
-                    step_sparse<true, false, false, false, Tight><<<sparse_work.workers, threads, shared_bytes, stream>>>(
-                        src, dst, p, current, next, sparse_work.stamp, t + 1,
-                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
-            };
-            if (tight_support) launch_sparse(std::true_type{});
-            else launch_sparse(std::false_type{});
+        auto dispatch = [&](auto arch_tag) {
+            constexpr int Arch = decltype(arch_tag)::value;
+            if (sparse) {
+                const TileQueue current = sparse_work.queue(t & 1);
+                const TileQueue next = sparse_work.queue((t + 1) & 1);
+                prepare_sparse<<<1, 1, 0, stream>>>(current, next, sparse_work.counts + 2,
+                                          sparse_work.tile_count, sparse_work.stats, device_epoch);
+                check(cudaGetLastError(), "launch prepare_sparse");
+                // Separate template instantiations keep bbox reductions/registers
+                // out of the reference kernel, rather than a per-cell runtime branch.
+                auto launch_sparse = [&](auto tight_tag) {
+                    constexpr bool Tight = decltype(tight_tag)::value;
+                    if (packed && p.rule.shape == Shape::Moore)
+                        step_sparse<false, true, true, false, Tight, Arch><<<sparse_work.workers, threads, r1_shared_bytes, stream>>>(
+                            src, dst, p, current, next, sparse_work.stamp, t + 1,
+                            sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+                    else if (packed)
+                        step_sparse<false, false, true, false, Tight, Arch><<<sparse_work.workers, threads, r1_shared_bytes, stream>>>(
+                            src, dst, p, current, next, sparse_work.stamp, t + 1,
+                            sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+                    else if (!tiled)
+                        step_sparse<false, false, false, false, Tight, Arch><<<sparse_work.workers, threads, 0, stream>>>(
+                            src, dst, p, current, next, sparse_work.stamp, t + 1,
+                            sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+                    else if (sliding)
+                        step_sparse<true, true, false, true, Tight, Arch><<<sparse_work.workers, threads, shared_bytes, stream>>>(
+                            src, dst, p, current, next, sparse_work.stamp, t + 1,
+                            sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+                    else if (p.rule.shape == Shape::Moore)
+                        step_sparse<true, true, false, false, Tight, Arch><<<sparse_work.workers, threads, shared_bytes, stream>>>(
+                            src, dst, p, current, next, sparse_work.stamp, t + 1,
+                            sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+                    else
+                        step_sparse<true, false, false, false, Tight, Arch><<<sparse_work.workers, threads, shared_bytes, stream>>>(
+                            src, dst, p, current, next, sparse_work.stamp, t + 1,
+                            sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+                };
+                if (tight_support) launch_sparse(std::true_type{});
+                else launch_sparse(std::false_type{});
+            }
+            else if (packed && p.rule.shape == Shape::Moore)
+                step_r1_dense<true, Arch><<<blocks, threads, r1_shared_bytes, stream>>>(src, dst, p);
+            else if (packed)
+                step_r1_dense<false, Arch><<<blocks, threads, r1_shared_bytes, stream>>>(src, dst, p);
+            else if (!tiled) step_naive<<<blocks, threads, 0, stream>>>(src, dst, p);
+            else if (sliding)
+                step_tiled<true, true, Arch><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
+            else if (p.rule.shape == Shape::Moore)
+                step_tiled<true, false, Arch><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
+            else step_tiled<false, false, Arch><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
+        };
+        switch (arch) {
+            case 1: dispatch(std::integral_constant<int, 1>{}); break;
+            case 2: dispatch(std::integral_constant<int, 2>{}); break;
+            case 4: dispatch(std::integral_constant<int, 4>{}); break;
+            case 7: dispatch(std::integral_constant<int, 7>{}); break;
+            default: dispatch(std::integral_constant<int, 0>{}); break;
         }
-        else if (packed && p.rule.shape == Shape::Moore)
-            step_r1_dense<true><<<blocks, threads, R1_SHARED_BYTES, stream>>>(src, dst, p);
-        else if (packed)
-            step_r1_dense<false><<<blocks, threads, R1_SHARED_BYTES, stream>>>(src, dst, p);
-        else if (!tiled) step_naive<<<blocks, threads, 0, stream>>>(src, dst, p);
-        else if (sliding)
-            step_tiled<true, true><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
-        else if (p.rule.shape == Shape::Moore)
-            step_tiled<true><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
-        else step_tiled<false><<<blocks, threads, shared_bytes, stream>>>(src, dst, p);
         check(cudaGetLastError(), sparse ? "launch step_sparse" : packed ? "launch step_r1_dense"
                                    : tiled ? "launch step_tiled" : "launch step_naive");
         uint8_t *old_src = src;
@@ -961,6 +1011,10 @@ void run(uint8_t *grid, const Problem &p) {
             int(graph_requested), int(graph_selected), GRAPH_BATCH,
             graph_selected ? iterations / GRAPH_BATCH : 0,
             graph_selected ? iterations % GRAPH_BATCH : iterations, graph_build_ms);
+    if (profile.enabled)
+        std::fprintf(stderr, "[PP_ARCH] mode=%s merged=%d r1_warp=%d vn_diagonal=%d\n",
+                     arch_mode, int((arch & 1) && sparse),
+                     int((arch & 2) && packed && !bitplane.selected), int(vn_diagonal_selected));
     if (profile.enabled && inspect_sparse)
         std::fprintf(stderr,
             "[PP_SPARSE] selected=%d tiles_total=%d initial_work=%d work_sum=%llu "
