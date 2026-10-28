@@ -30,7 +30,7 @@ __device__ __forceinline__ unsigned finish_tracking(unsigned flags, AliveBounds 
         __syncthreads(); // publish both flags and bounds together
         if (lane == 0 && warp == 0) {
             flags = 0;
-            b = AliveBounds{};
+            if constexpr (Tight) b = AliveBounds{};
 #pragma unroll
             for (int w = 0; w < 8; ++w) {
                 flags |= summaries[w].flags;
