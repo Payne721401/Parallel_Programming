@@ -5,10 +5,34 @@ import io
 from pathlib import Path
 import tempfile
 import unittest
-from summarize_bitplane import gate, summarize, verify, METHODS
+from summarize_bitplane import gate, summarize, verify, verify_public_dispatch, METHODS
 from run_cases import parse_profile
 
 class BitplaneTests(unittest.TestCase):
+    def test_public_automatic_and_override_policy(self):
+        cases=[
+            ('auto',16384,16384,128,1,2,False,1,1,'enabled'),
+            ('auto',16384,16384,127,1,2,False,0,0,'auto_small_or_short'),
+            ('auto',16384,16383,5000,1,2,False,0,0,'auto_small_or_short'),
+            ('auto',32768,8192,128,1,2,False,1,1,'enabled'),
+            ('auto',32768,32768,200,1,2,True,1,0,'sparse'),
+            ('auto',16384,16384,200,1,4,False,1,0,'states'),
+            ('auto',16384,16384,200,5,2,False,1,0,'not_packed_r1'),
+            ('auto',16384,16384,0,1,2,False,0,0,'zero_steps'),
+            ('1',33,19,7,1,2,False,1,1,'enabled'),
+            ('0',16384,16384,200,1,2,False,0,0,'disabled')]
+        for mode,w,h,t,r,c,sparse,requested,selected,reason in cases:
+            header=[f'{w} {h}',f'R{r},C{c},M0,S2..3,B3..3,NM','torus',str(t)]
+            record=dict(mode=mode,logic='compact',requested=str(requested),rows='4',
+                        selected=str(selected),reason=reason,pack_ms='0',evolve_ms='0',unpack_ms='0')
+            row=dict(sparse_selected='1' if sparse else '0',profile_status='ok',
+                     profile_kernel='dense_bits' if selected else 'none' if t==0 else 'dense_r1')
+            verify_public_dispatch(record,row,header,mode,4,'compact')
+            with self.assertRaises(ValueError):
+                verify_public_dispatch(dict(record,selected=str(1-selected)),row,header,mode,4,'compact')
+            with self.assertRaises(ValueError):
+                verify_public_dispatch(dict(record,mode='stale'),row,header,mode,4,'compact')
+
     def test_dispatch_and_invalid_times(self):
         good=dict(requested='1',rows='4',selected='1',reason='enabled',pack_ms='1',evolve_ms='2',unpack_ms='3')
         verify(good,1,4,1,'enabled')

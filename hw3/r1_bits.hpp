@@ -7,6 +7,12 @@
 #endif
 
 namespace r1_bits {
+// Conservative default promotion, reusing the existing large/long sparse-scan
+// envelope. Rule eligibility and observed dense/sparse selection are checked by
+// run(). This is an amortization guard, not a measured optimal crossover.
+inline bool automatic_candidate(int width, int height, int steps) {
+    return uint64_t(width)*uint64_t(height) >= (uint64_t(1)<<28) && steps >= 128;
+}
 struct Count { uint32_t b0, b1, b2, b3; };
 PP_BITS_HD void add3(uint32_t a, uint32_t b, uint32_t c, uint32_t &sum, uint32_t &carry) {
     sum = a ^ b ^ c;

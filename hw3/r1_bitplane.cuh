@@ -88,15 +88,18 @@ __global__ void step_r1_bits(const uint32_t *src, uint32_t *dst, Problem p) {
 struct BitplaneExperiment {
     bool requested = false, selected = false, timed = false;
     int rows = 4;
-    bool compact = false;
+    bool compact = true;
+    bool automatic = true;
     const char *reason = "disabled";
     cudaEvent_t events[4]{};
     float pack_ms=0, evolve_ms=0, unpack_ms=0;
-    BitplaneExperiment() {
+    explicit BitplaneExperiment(const Problem &p) {
         const char *mode = std::getenv("PP_BITPLANE");
-        requested = mode && std::strcmp(mode,"1")==0;
-        if (mode && !requested && std::strcmp(mode,"0")!=0) {
-            std::fprintf(stderr,"hw3-1: PP_BITPLANE must be 0 or 1\n"); std::exit(EXIT_FAILURE);
+        automatic = !mode || std::strcmp(mode,"auto")==0;
+        requested = automatic ? r1_bits::automatic_candidate(p.width,p.height,p.steps)
+                              : std::strcmp(mode,"1")==0;
+        if (!automatic && !requested && std::strcmp(mode,"0")!=0) {
+            std::fprintf(stderr,"hw3-1: PP_BITPLANE must be auto, 0 or 1\n"); std::exit(EXIT_FAILURE);
         }
         const char *r = std::getenv("PP_BIT_ROWS");
         if (r && std::strcmp(r,"1")==0) rows=1;
@@ -106,6 +109,7 @@ struct BitplaneExperiment {
         }
         const char *logic = std::getenv("PP_BIT_LOGIC");
         if (logic && std::strcmp(logic,"compact")==0) compact=true;
+        else if (logic && std::strcmp(logic,"reference")==0) compact=false;
         else if (logic && std::strcmp(logic,"reference")!=0) {
             std::fprintf(stderr,"hw3-1: PP_BIT_LOGIC must be reference or compact\n"); std::exit(EXIT_FAILURE);
         }
@@ -125,7 +129,8 @@ struct BitplaneExperiment {
     }
     void report(bool profile) const {
         if (profile) std::fprintf(stderr,
-            "[PP_BITPLANE] requested=%d selected=%d rows=%d logic=%s reason=%s pack_ms=%.6f evolve_ms=%.6f unpack_ms=%.6f\n",
-            int(requested),int(selected),rows,compact ? "compact" : "reference",reason,pack_ms,evolve_ms,unpack_ms);
+            "[PP_BITPLANE] requested=%d selected=%d rows=%d logic=%s mode=%s reason=%s pack_ms=%.6f evolve_ms=%.6f unpack_ms=%.6f\n",
+            int(requested),int(selected),rows,compact ? "compact" : "reference",
+            automatic ? "auto" : requested ? "1" : "0",reason,pack_ms,evolve_ms,unpack_ms);
     }
 };

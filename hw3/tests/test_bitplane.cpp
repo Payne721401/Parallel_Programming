@@ -6,6 +6,13 @@
 #include <cstdlib>
 static void require(bool ok) { if (!ok) { std::fputs("FAIL bit arithmetic\n",stderr); std::exit(1); } }
 int main() {
+    require(!r1_bits::automatic_candidate(16384,16384,127));
+    require(r1_bits::automatic_candidate(16384,16384,128));
+    require(!r1_bits::automatic_candidate(16384,16383,5000));
+    require(r1_bits::automatic_candidate(32768,8192,128));
+    require(!r1_bits::automatic_candidate(2048,2048,5000));
+    require(r1_bits::automatic_candidate(32768,32768,5000));
+    require(!r1_bits::automatic_candidate(32768,32768,0));
     std::mt19937 rng(20261027);
     unsigned long long checks=0;
     // All 512 nine-input neighbourhoods, plus independent random bit positions.

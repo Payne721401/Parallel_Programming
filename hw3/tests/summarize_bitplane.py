@@ -2,6 +2,7 @@
 """Validate dispatch and summarize symmetric byte/bits1/bits4 comparisons."""
 import csv
 import math
+import re
 from pathlib import Path
 import statistics
 import sys
@@ -20,6 +21,23 @@ def verify(record, requested, rows, selected, reason=None):
         value=float(record[key])
         if not math.isfinite(value) or value<0 or (not selected and value!=0):
             raise ValueError('invalid bit-plane interval')
+
+def verify_public_dispatch(record, row, header, mode, rows, logic):
+    """Public input contract with kernel/active overrides cleared and graph/evolve off."""
+    width,height=map(int,header[0].split()); steps=int(header[3])
+    requested=int(width*height>=2**28 and steps>=128) if mode=='auto' else int(mode)
+    radius=int(re.search(r'R(\d+)',header[1]).group(1))
+    states=int(re.search(r'C(\d+)',header[1]).group(1))
+    sparse=row['sparse_selected']=='1'
+    selected=int(requested and steps>0 and radius==1 and states==2 and not sparse)
+    if record.get('mode')!=mode or record.get('logic')!=logic:
+        raise ValueError('wrong/missing mode or comparator; rebuild binaries')
+    if steps==0: reason='zero_steps' if mode=='auto' or requested else 'disabled'
+    elif not requested: reason='auto_small_or_short' if mode=='auto' else 'disabled'
+    else: reason='not_packed_r1' if radius!=1 else 'states' if states!=2 else 'sparse' if sparse else 'enabled'
+    verify(record,requested,rows,selected,reason)
+    if row['profile_status']!='ok' or (row['profile_kernel']=='dense_bits') != bool(selected):
+        raise ValueError('inconsistent kernel dispatch')
 
 def gate(path, rows, kind, logic=None):
     text=path.read_text(encoding='utf-8')

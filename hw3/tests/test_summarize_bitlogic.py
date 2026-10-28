@@ -55,4 +55,16 @@ class BitlogicTests(unittest.TestCase):
             path.unlink()
             with self.assertRaises(OSError): summarize(root,False)
 
+    def test_outlier_taints_both_sides_of_ratio_without_deleting_sample(self):
+        with tempfile.TemporaryDirectory() as tmp,contextlib.redirect_stdout(io.StringIO()) as captured:
+            root=Path(tmp); fixture(root,False)
+            path=root/'11-reference2/results.tsv'
+            path.write_text(path.read_text().replace('0.2','10.0',1))
+            summarize(root,False)
+            with (root/'summary.tsv').open() as f: rows=list(csv.DictReader(f,delimiter='\t'))
+            self.assertEqual(rows[1]['timing_status'],'unstable_samples')
+            self.assertEqual(rows[4]['timing_status'],'unstable_samples')
+            self.assertEqual(rows[1]['max_s'],'10.0')
+            self.assertIn('WARNING:',captured.getvalue())
+
 if __name__=='__main__': unittest.main()

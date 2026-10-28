@@ -6,8 +6,8 @@
 // PP_GRAPH=0|1 enables experimental 32-generation replay; default is 0.
 // PP_EVOLVE=1 enables sampled full-grid evolution diagnostics; default is 0.
 // PP_SUPPORT=tile|bbox selects sparse influence; default bbox (tile for evolution diagnostics).
-// PP_BITPLANE=0|1 opts into dense R1 C=2 bit planes; default 0. PP_BIT_ROWS=1|2|4.
-// PP_BIT_LOGIC=reference|compact compares rule logic; default reference.
+// PP_BITPLANE=auto|0|1 selects dense R1 C=2 bit planes; default auto (large/long only).
+// PP_BIT_ROWS=1|2|4, default 4. PP_BIT_LOGIC=reference|compact, default compact.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -697,7 +697,7 @@ struct SparseWorkspace {
 void run(uint8_t *grid, const Problem &p) {
     PhaseProfile profile;
     EvolutionProfile evolution;
-    BitplaneExperiment bitplane;
+    BitplaneExperiment bitplane(p);
     const char *support_mode = std::getenv("PP_SUPPORT");
     const bool tight_support = support_mode ? std::strcmp(support_mode, "bbox") == 0 : !evolution.enabled;
     if (support_mode && !tight_support && std::strcmp(support_mode, "tile") != 0) {
@@ -722,7 +722,7 @@ void run(uint8_t *grid, const Problem &p) {
     }
     if (p.steps == 0 && !evolution.enabled) {
         profile.report("none", p); // all phase times zero; no CUDA events allocated
-        bitplane.reason = bitplane.requested ? "zero_steps" : "disabled";
+        bitplane.reason = bitplane.automatic || bitplane.requested ? "zero_steps" : "disabled";
         bitplane.report(profile.enabled);
         return;
     }
@@ -788,7 +788,7 @@ void run(uint8_t *grid, const Problem &p) {
     check(cudaMemcpy(src, grid, bytes, cudaMemcpyHostToDevice), "copy initial grid");
     profile.mark(1);
     const bool sparse = inspect_sparse && sparse_work.initialize(src, dst, p, force_sparse);
-    bitplane.reason = !bitplane.requested ? "disabled" : evolution.enabled ? "evolution" :
+    bitplane.reason = !bitplane.requested ? (bitplane.automatic ? "auto_small_or_short" : "disabled") : evolution.enabled ? "evolution" :
         graph_requested ? "graph" : !packed ? "not_packed_r1" : p.rule.states != 2 ? "states" :
         sparse ? "sparse" : "enabled";
     bitplane.selected = std::strcmp(bitplane.reason,"enabled")==0;

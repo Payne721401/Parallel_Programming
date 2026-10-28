@@ -48,15 +48,20 @@ def summarize(root, profiled):
     output=[]
     for case in CASES:
         means={m:statistics.mean(float(r['compute_s']) for r in samples[case,m]) for m in CONFIGS}
+        noisy={m:max(float(r['compute_s']) for r in samples[case,m]) /
+                 min(float(r['compute_s']) for r in samples[case,m]) > 1.20 for m in CONFIGS}
         for method in CONFIGS:
             group=samples[case,method]; values=[float(r['compute_s']) for r in group]
             result=dict(case=case,logic=method[:-1],rows=int(method[-1]),mean_s=means[method],
                         min_s=min(values),max_s=max(values),
                         reference4_over_method=means['reference4']/means[method],
-                        same_rows_reference_over_method=means['reference'+method[-1]]/means[method])
+                        same_rows_reference_over_method=means['reference'+method[-1]]/means[method],
+                        timing_status='unstable_samples' if noisy[method] or noisy['reference4'] or noisy['reference'+method[-1]] else 'two_samples')
             if profiled:
                 for key in PHASES: result[key]=statistics.mean(float(r[key]) for r in group)
             output.append(result)
+            if result['timing_status']=='unstable_samples':
+                print('WARNING: sample range exceeds 20% in this configuration or its reference; retain values but do not attribute the ratio to kernel speedup.')
             print(f"{case} {method}: {means[method]:.6f}s [{min(values):.6f}, {max(values):.6f}], "
                   f"reference4/method={result['reference4_over_method']:.3f}x, "
                   f"same-rows reference/method={result['same_rows_reference_over_method']:.3f}x")
