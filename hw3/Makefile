@@ -9,23 +9,24 @@ CUDA_NVCC = /work/HPC_software/LMOD/nvidia/packages/cuda-12.4/bin/nvcc
 GXX       = /work/HPC_software/LMOD/gcc/12.5.0/bin/g++
 NVCC     ?= $(if $(wildcard $(CUDA_NVCC)),$(CUDA_NVCC),nvcc)
 NVCCFLAGS = -std=c++17 -O3 -arch=sm_90
+GLOBAL_HEADERS = r1_multistate.hpp r1_multistate.cuh r1_sparse_bits.cuh rolling_filters.hpp rolling_filters.cuh
 ifneq ($(wildcard $(GXX)),)
 NVCCFLAGS += -ccbin $(GXX) -Xcompiler -static-libstdc++,-static-libgcc
 endif
 
-hw3-1: main.cu hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp r1_bits.hpp r1_bitplane.cuh evolution_diag.cuh arch_stats.cuh r1_warp.cuh vn_diagonal.hpp vn_diagonal.cuh
+hw3-1: main.cu hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp r1_bits.hpp r1_bitplane.cuh evolution_diag.cuh arch_stats.cuh r1_warp.cuh vn_diagonal.hpp vn_diagonal.cuh $(GLOBAL_HEADERS)
 	$(NVCC) $(NVCCFLAGS) main.cu hw3-1.cu -o $@
 
 hw3-1-seq: main.cu original_version/hw3-1.cu ca.hpp
 	$(NVCC) $(NVCCFLAGS) -I. main.cu original_version/hw3-1.cu -o $@
 
-tests/test_hw3-1: tests/test_hw3-1.cu hw3-1.cu original_version/hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp r1_bits.hpp r1_bitplane.cuh evolution_diag.cuh arch_stats.cuh r1_warp.cuh vn_diagonal.hpp vn_diagonal.cuh
+tests/test_hw3-1: tests/test_hw3-1.cu hw3-1.cu original_version/hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp r1_bits.hpp r1_bitplane.cuh evolution_diag.cuh arch_stats.cuh r1_warp.cuh vn_diagonal.hpp vn_diagonal.cuh $(GLOBAL_HEADERS)
 	$(NVCC) $(NVCCFLAGS) -I. tests/test_hw3-1.cu hw3-1.cu -o $@
 
-tests/trace_hw3-1: tests/trace_main.cu main.cu hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp r1_bits.hpp r1_bitplane.cuh evolution_diag.cuh arch_stats.cuh r1_warp.cuh vn_diagonal.hpp vn_diagonal.cuh
+tests/trace_hw3-1: tests/trace_main.cu main.cu hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp r1_bits.hpp r1_bitplane.cuh evolution_diag.cuh arch_stats.cuh r1_warp.cuh vn_diagonal.hpp vn_diagonal.cuh $(GLOBAL_HEADERS)
 	$(NVCC) $(NVCCFLAGS) -I. tests/trace_main.cu hw3-1.cu -o $@
 
-tests/test_evolution: tests/test_evolution.cu hw3-1.cu original_version/hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp r1_bits.hpp r1_bitplane.cuh evolution_diag.cuh arch_stats.cuh r1_warp.cuh vn_diagonal.hpp vn_diagonal.cuh
+tests/test_evolution: tests/test_evolution.cu hw3-1.cu original_version/hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp r1_bits.hpp r1_bitplane.cuh evolution_diag.cuh arch_stats.cuh r1_warp.cuh vn_diagonal.hpp vn_diagonal.cuh $(GLOBAL_HEADERS)
 	$(NVCC) $(NVCCFLAGS) -I. tests/test_evolution.cu hw3-1.cu -o $@
 
 # Compile only, safe on the login node. No GPU work; normal judge flags plus reporting.

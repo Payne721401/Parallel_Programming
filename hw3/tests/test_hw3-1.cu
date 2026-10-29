@@ -116,7 +116,7 @@ static void support_checks() {
     for (Shape shape : {Shape::Moore,Shape::VonNeumann})
     for (int pattern=0; pattern<3; ++pattern) {
         const int maxn=shape==Shape::Moore ? (2*radius+1)*(2*radius+1)-1 : 2*radius*(radius+1);
-        Rule r{radius,16,pattern==1,0,maxn+int(pattern==1),1,1,shape};
+        Rule r{radius,16,pattern==1,int(pattern==1),maxn+int(pattern==1),1,1,shape};
         Problem p{321,161,r,boundary,pattern==2 ? 17 : 4};
         std::vector<uint8_t> initial(size_t(p.width)*p.height,0);
         if (pattern==0) initial[15*p.width+31]=1; // interior support
@@ -332,6 +332,85 @@ static void vn_reuse_checks(std::mt19937 &rng) {
     std::printf("PASS %d/%d (VN R1..32, C2/3/4/16, M0/1 and both boundaries)\n",tested,tested);
 }
 
+static void multistate_checks(std::mt19937 &rng) {
+    for (int width : {3,31,32,33,65,68,129,1025})
+    for (int states : {3,4,5,8,9,16})
+    for (Boundary boundary : {Boundary::Dead,Boundary::Torus})
+    for (Shape shape : {Shape::Moore,Shape::VonNeumann})
+    for (bool centre : {false,true}) {
+        const int maximum = (shape == Shape::Moore ? 8 : 4) + int(centre);
+        const int lo = int(centre) + int(rng() % unsigned(maximum-int(centre)+1));
+        const int birth = 1 + int(rng() % unsigned(maximum));
+        Rule r{1,states,centre,lo,lo+int(rng()%unsigned(maximum-lo+1)),
+               birth,birth+int(rng()%unsigned(maximum-birth+1)),shape};
+        const int steps[] = {0,1,2,7,17,33};
+        Problem p{width,width==3 ? 3 : 19,r,boundary,steps[tested%6]};
+        std::vector<uint8_t> initial(size_t(p.width)*p.height);
+        for (auto &s : initial) s = uint8_t(rng()%states);
+        initial.front() = 1; initial.back() = uint8_t(states-1);
+        compare(p,initial);
+    }
+    std::printf("PASS %d/%d (multistate bit-plane rules, boundaries, tails and parity)\n",tested,tested);
+}
+
+static void rolling_checks(std::mt19937 &rng) {
+    const int state_counts[] = {2,3,4,16};
+    for (int radius=1; radius<=32; ++radius)
+    for (Boundary boundary : {Boundary::Dead,Boundary::Torus})
+    for (Shape shape : {Shape::Moore,Shape::VonNeumann}) {
+        const bool centre = (tested & 1) != 0;
+        const int states = state_counts[(radius+tested/2)%4];
+        const int maximum = (shape==Shape::Moore ? (2*radius+1)*(2*radius+1)-1
+                           : 2*radius*(radius+1)) + int(centre);
+        const int lo = maximum/4;
+        Rule r{radius,states,centre,std::max(int(centre),lo-1),lo+3,
+               std::max(1,lo),std::min(maximum,lo+2),shape};
+        Problem p{boundary==Boundary::Torus ? 2*radius+1 : radius%4==0 ? 131 : 67,
+                  radius<=4 ? 67 : 2*radius+3,r,boundary,radius<=5 ? 3 : 1};
+        std::vector<uint8_t> initial(size_t(p.width)*p.height);
+        for (auto &s : initial) s = rng()%3==0 ? 1 : uint8_t(rng()%states);
+        initial.front()=1; initial.back()=uint8_t(states-1);
+        compare(p,initial);
+    }
+    std::printf("PASS %d/%d (rolling Moore/VN R1..32, extended halos and partial tiles)\n",tested,tested);
+}
+
+static void sparse_bit_checks(std::mt19937 &rng) {
+    for (int width : {3,31,33,65,129,321,641,1025})
+    for (int states : {2,3,4,16})
+    for (Boundary boundary : {Boundary::Dead,Boundary::Torus})
+    for (Shape shape : {Shape::Moore,Shape::VonNeumann}) {
+        const bool centre = (tested/2)&1;
+        const int maximum = (shape==Shape::Moore ? 8 : 4)+int(centre);
+        Rule r{1,states,centre,int(centre),maximum,2,2,shape};
+        const int steps[] = {0,1,2,9,17,65};
+        Problem p{width,width<129 ? 35 : width>=641 ? 321 : 161,r,boundary,steps[tested%6]};
+        std::vector<uint8_t> initial(size_t(p.width)*p.height,0);
+        for (int y=0;y<p.height;++y)
+        for (int x=0;x<p.width;++x)
+            if ((x<4 || x>=p.width-4 || (x>=62 && x<=66)) &&
+                (y<4 || y>=p.height-4 || (y>=30 && y<=34)))
+                initial[size_t(y)*p.width+x]=uint8_t(rng()%states);
+        compare(p,initial);
+    }
+    for (Boundary boundary : {Boundary::Dead,Boundary::Torus})
+    for (int pattern=0;pattern<4;++pattern) {
+        Problem p{321,161,Rule{1,2,false,2,3,3,3,Shape::Moore},boundary,17};
+        std::vector<uint8_t> initial(size_t(p.width)*p.height,0);
+        if (pattern==1) {
+            p.rule.survive_lo=p.rule.survive_hi=p.rule.birth_lo=p.rule.birth_hi=8;
+            initial.back()=1; p.steps=7;
+        } else if (pattern==2) {
+            p.rule.states=16; initial[0]=2; initial[63]=15; initial.back()=7;
+        } else if (pattern==3) {
+            p.rule=Rule{1,2,false,0,8,1,8,Shape::Moore}; p.steps=70;
+            for (int x=0;x<p.width;++x) initial[31*p.width+x]=1;
+        }
+        compare(p,initial);
+    }
+    std::printf("PASS %d/%d (sparse bits, decay, stale cleanup, motion and dense growth)\n",tested,tested);
+}
+
 int main(int argc, char **argv) {
     int random_cases = 64;
     unsigned seed = 20261022;
@@ -344,11 +423,14 @@ int main(int argc, char **argv) {
     const bool support = argc == 2 && std::strcmp(argv[1], "--support") == 0;
     const bool vn_reuse = argc == 2 && std::strcmp(argv[1], "--vn-reuse") == 0;
     const bool bits = argc == 2 && std::strcmp(argv[1], "--bitplane") == 0;
+    const bool multistate = argc == 2 && std::strcmp(argv[1], "--multistate") == 0;
+    const bool rolling = argc == 2 && std::strcmp(argv[1], "--rolling") == 0;
+    const bool sparse_bits = argc == 2 && std::strcmp(argv[1], "--sparse-bits") == 0;
     if (argc > 3) {
-        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1 | --sliding | --graphs | --support | --bitplane | --vn-reuse\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1 | --sliding | --graphs | --support | --bitplane | --vn-reuse | --multistate | --rolling | --sparse-bits\n", argv[0]);
         return 2;
     }
-    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1 && !sliding && !graphs && !support && !bits && !vn_reuse) random_cases = std::atoi(argv[1]);
+    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1 && !sliding && !graphs && !support && !bits && !vn_reuse && !multistate && !rolling && !sparse_bits) random_cases = std::atoi(argv[1]);
     if (argc >= 3) seed = unsigned(std::strtoul(argv[2], nullptr, 10));
     if (random_cases < 0 || random_cases > 1000) return 2;
     const char *kernel = std::getenv("PP_KERNEL");
@@ -358,12 +440,15 @@ int main(int argc, char **argv) {
     std::printf("kernel=%s active=%s r1=%s moore=%s seed=%u mode=%s random_cases=%d\n",
                 kernel ? kernel : "auto", active ? active : "auto", r1_mode ? r1_mode : "auto",
                 moore_mode ? moore_mode : "auto", seed,
-                vn_reuse ? "vn-reuse" : bits ? "bitplane" : support ? "support" : graphs ? "graphs" : sliding ? "sliding" : dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
-                (quick || sparse || r1 || dense_r1 || sliding || graphs || support || bits || vn_reuse) ? 0 : random_cases);
+                multistate ? "multistate" : rolling ? "rolling" : sparse_bits ? "sparse-bits" : vn_reuse ? "vn-reuse" : bits ? "bitplane" : support ? "support" : graphs ? "graphs" : sliding ? "sliding" : dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
+                (quick || sparse || r1 || dense_r1 || sliding || graphs || support || bits || vn_reuse || multistate || rolling || sparse_bits) ? 0 : random_cases);
     std::printf("graph=%s\n", std::getenv("PP_GRAPH") ? std::getenv("PP_GRAPH") : "0");
     std::printf("support=%s\n", std::getenv("PP_SUPPORT") ? std::getenv("PP_SUPPORT") : "default");
     check(cudaFree(nullptr));
     std::mt19937 rng(seed);
+    if (multistate) { multistate_checks(rng); return 0; }
+    if (rolling) { rolling_checks(rng); return 0; }
+    if (sparse_bits) { sparse_bit_checks(rng); return 0; }
     if (vn_reuse) { vn_reuse_checks(rng); return 0; }
     if (bits) { bitplane_checks(rng); return 0; }
     if (support) { support_checks(); return 0; }

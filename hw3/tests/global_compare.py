@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""Frozen-source, two-binary correctness gates and same-allocation ABBA.
+
+Build on the login node; compare only inside an existing Slurm allocation.
+Unprofiled Compute samples and separate profile observations are never pooled.
+"""
+import argparse
+import csv
+import hashlib
+import io
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import tarfile
+import time
+
+from run_cases import PROFILE_TIMES, run_cases
+
+
+BASELINE_REVISION = "1352bf8"
+FEATURES = {"multistate": ("PP_MULTISTATE",), "rolling": ("PP_ROLLING",),
+            "sparse-bits": ("PP_SPARSE_BITS",),
+            "combined": ("PP_MULTISTATE", "PP_ROLLING", "PP_SPARSE_BITS")}
+GROUPS = {"target": tuple(f"{i:02d}" for i in range(4, 13)),
+          "large": ("04", "05", "06", "07"), "sparse": ("08", "09", "10"),
+          "multistate": ("08", "10", "12"), "sparse-bits": ("08", "10")}
+SOURCE_SUFFIXES = {".cu", ".cuh", ".hpp", ".h"}
+GATE_COUNTS = {"--quick": 22, "--multistate": 384, "--rolling": 128,
+               "--sparse-bits": 136, "--sparse": 30, "--support": 28}
+
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def same_fixed_source(left, right):
+    # Git checkouts and Windows-to-Linux bundles may change only CRLF/LF.
+    # Keep raw source hashes in the manifest; this guard compares fixed content.
+    return left.read_bytes().replace(b"\r\n", b"\n") == right.read_bytes().replace(b"\r\n", b"\n")
+
+
+def write_table(path, rows):
+    if not rows:
+        return
+    columns = list(dict.fromkeys(key for row in rows for key in row))
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns, delimiter="\t")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def number(value, positive=False):
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0 or (positive and parsed == 0):
+        raise ValueError("invalid duration: " + str(value))
+    return parsed
+
+
+def case_selection(explicit, group):
+    selected = []
+    if explicit is not None:
+        for item in explicit.split(","):
+            match = re.fullmatch(r"\s*(\d{1,2})(?:-(\d{1,2}))?\s*", item)
+            if not match:
+                raise ValueError("invalid --cases item: " + item)
+            first, last = int(match[1]), int(match[2] or match[1])
+            if not 1 <= first <= last <= 12:
+                raise ValueError("case IDs must be in 01..12 and ranges ascending")
+            selected.extend(f"{case:02d}" for case in range(first, last + 1))
+    else:
+        selected.extend(GROUPS[group])
+    # A cheap unchanged-family guard is included even for a bounded subgroup.
+    return tuple(dict.fromkeys([*selected, "11"]))
+
+
+def configure(method, candidate, profiled=False, **overrides):
+    for key in list(os.environ):
+        if key.startswith("PP_"):
+            del os.environ[key]
+    os.environ.update(PP_ARCH="baseline", PP_GRAPH="0", PP_EVOLVE="0",
+                      PP_PROFILE=str(int(profiled)), PP_SUPPORT="bbox",
+                      PP_BITPLANE="auto", PP_BIT_LOGIC="compact", PP_BIT_ROWS="4",
+                      PP_MULTISTATE="0", PP_ROLLING="0", PP_SPARSE_BITS="0")
+    if candidate:
+        os.environ.update({key: "1" for key in FEATURES[method]})
+    os.environ.update(overrides)
+    return {key: os.environ[key] for key in sorted(os.environ) if key.startswith("PP_")}
+
+
+def profile_fields(text):
+    lines = [line for line in text.splitlines() if line.startswith("[PP_PROFILE] ")]
+    if len(lines) != 1:
+        raise ValueError("expected exactly one PP_PROFILE record")
+    tokens = [token.split("=", 1) for token in lines[0].split()[1:]]
+    fields = dict(tokens)
+    if len(fields) != len(tokens):
+        raise ValueError("duplicate profile field")
+    if not fields.get("kernel"):
+        raise ValueError("missing profile kernel")
+    return {"profile_status": "ok", "profile_kernel": fields["kernel"],
+            **{key: number(fields[key]) for key in PROFILE_TIMES}}
+
+
+def validate_gate(text, expected=None):
+    matches = re.findall(r"^PASS (\d+)/(\d+)(?:\s|$)", text, re.M)
+    if len(matches) != 1 or int(matches[0][0]) <= 0 or matches[0][0] != matches[0][1]:
+        raise ValueError("missing or incomplete CPU reference gate")
+    count = int(matches[0][0])
+    if expected is not None and count != expected:
+        raise ValueError(f"wrong CPU gate case count: {count}, expected {expected}")
+    return count
+
+
+def verify_global(text, configured, kernel):
+    lines = [line for line in text.splitlines() if line.startswith("[PP_GLOBAL] ")]
+    if len(lines) != 1:
+        raise ValueError("candidate requires exactly one PP_GLOBAL dispatch record")
+    tokens = [token.split("=", 1) for token in lines[0].split()[1:]]
+    fields = dict(tokens)
+    expected = {}
+    for feature, selected in (("multistate", kernel == "dense_multistate"),
+                              ("rolling", kernel in ("rolling", "sparse_rolling")),
+                              ("sparse_bits", kernel == "sparse_bits")):
+        requested = configured["PP_"+feature.upper()]
+        expected[feature+"_requested"] = requested
+        expected[feature+"_selected"] = str(int(selected))
+        if selected and requested != "1":
+            raise ValueError("unrequested global feature selected: " + feature)
+    if fields != expected or len(tokens) != len(expected):
+        raise ValueError("wrong global dispatch: " + str(fields) + "; expected " + str(expected))
+    return {"global_"+key: value for key, value in fields.items()}
+
+
+def verify_gate_dispatch(text, configured, count, feature=None):
+    profiles = [line for line in text.splitlines() if line.startswith("[PP_PROFILE] ")]
+    dispatch = [line for line in text.splitlines() if line.startswith("[PP_GLOBAL] ")]
+    if len(profiles) != count or len(dispatch) != count:
+        raise ValueError("CPU gate dispatch/profile record counts differ from case count")
+    selected = {name+"_selected_cases": 0 for name in ("multistate", "rolling", "sparse_bits")}
+    for profile, record in zip(profiles, dispatch):
+        kernel = profile_fields(profile)["profile_kernel"]
+        fields = verify_global(record, configured, kernel)
+        for name in selected:
+            selected[name] += int(fields["global_"+name.replace("_cases", "")])
+    if feature and selected[feature+"_selected_cases"] == 0:
+        raise ValueError("CPU gate never selected requested feature: " + feature)
+    return selected
+
+
+def summarize(samples, cases, blocks):
+    expected = 2 * blocks
+    rows = []
+    for case in cases:
+        values = {}
+        for method in ("baseline", "candidate"):
+            group = [sample for sample in samples if sample["case_id"] == case
+                     and sample["method"] == method and not int(sample["profiled"])]
+            if len(group) != expected:
+                raise ValueError(f"incomplete ABBA: {case} {method}: {len(group)}/{expected}")
+            if any(sample["verdict"] not in ("AC", "TLE") for sample in group):
+                raise ValueError("unverified output in timing comparison")
+            values[method] = [number(sample["compute_s"], positive=True) for sample in group]
+        baseline, candidate = values["baseline"], values["candidate"]
+        before, after = statistics.mean(baseline), statistics.mean(candidate)
+        rows.append(dict(case=case, samples_per_method=expected, baseline_mean_s=before,
+                         candidate_mean_s=after, delta_candidate_minus_baseline_s=after-before,
+                         baseline_median_s=statistics.median(baseline),
+                         candidate_median_s=statistics.median(candidate),
+                         baseline_min_s=min(baseline), baseline_max_s=max(baseline),
+                         candidate_min_s=min(candidate), candidate_max_s=max(candidate),
+                         baseline_over_candidate=before/after,
+                         candidate_under_100ms_all_samples=int(max(candidate) < .1),
+                         timing_status="unstable_samples" if
+                         max(baseline)/min(baseline) > 1.2 or max(candidate)/min(candidate) > 1.2
+                         else "range_within_20pct"))
+    return rows
+
+
+def phase_summary(samples, cases, blocks):
+    rows = []
+    for case in cases:
+        for method in ("baseline", "candidate"):
+            group = [sample for sample in samples if sample["case_id"] == case
+                     and sample["method"] == method and int(sample["profiled"])]
+            if len(group) != 2 * blocks or any(sample["profile_status"] != "ok" for sample in group):
+                raise ValueError("incomplete separate profile observations")
+            row = dict(case=case, method=method, observations=len(group),
+                       kernels=";".join(sorted({sample["profile_kernel"] for sample in group})))
+            for key in PROFILE_TIMES:
+                values = [number(sample[key]) for sample in group]
+                row.update({key+"_mean": statistics.mean(values), key+"_min": min(values),
+                            key+"_max": max(values)})
+            rows.append(row)
+    return rows
+
+
+def capture(argv, path, timeout=30, cwd=None):
+    with path.open("w", encoding="utf-8") as stream:
+        result = subprocess.run(argv, cwd=cwd, stdout=stream, stderr=subprocess.STDOUT,
+                                timeout=timeout, check=False)
+    if result.returncode:
+        raise ValueError("command failed; inspect " + str(path))
+
+
+def git_bytes(*args):
+    return subprocess.check_output(["git", *args], timeout=30,
+                                   cwd=Path(__file__).resolve().parents[2])
+
+
+def record_git(folder):
+    for name, argv in (("revision.log", ["rev-parse", "HEAD"]),
+                       ("status.log", ["status", "--short", "--untracked-files=all", "--", "hw3"]),
+                       ("working-diff.log", ["diff", "HEAD", "--", "hw3"])):
+        (folder/name).write_bytes(git_bytes(*argv))
+
+
+def source_files(root):
+    return sorted(path for path in root.rglob("*") if path.is_file()
+                  and path.suffix in SOURCE_SUFFIXES)
+
+
+def prepare_build(args):
+    folder = args.build_dir.resolve()
+    folder.mkdir(parents=True, exist_ok=False)
+    record_git(folder)
+    baseline_revision = git_bytes("rev-parse", args.baseline_revision+"^{commit}").decode().strip()
+    tree = git_bytes("archive", baseline_revision, "hw3")
+    baseline_root = folder/"baseline-source"
+    baseline_root.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(tree)) as archive:
+        members = archive.getmembers()
+        for member in members:
+            path = Path(member.name)
+            if path.is_absolute() or ".." in path.parts or member.issym() or member.islnk():
+                raise ValueError("unsafe baseline archive member: " + member.name)
+        archive.extractall(baseline_root)
+    baseline_source = baseline_root/"hw3"
+    candidate_source = folder/"candidate-source"/"hw3"
+    candidate_source.mkdir(parents=True)
+    current = Path.cwd()
+    # Freeze working files, including new/untracked production headers. No binaries,
+    # cases, tmp trees, unrelated directories, or ignored historical copies.
+    inputs = list(current.glob("*"))
+    for child in ("tests", "original_version"):
+        if (current/child).is_dir():
+            inputs.extend((current/child).rglob("*"))
+    for path in inputs:
+        if path.is_file() and path.suffix in SOURCE_SUFFIXES:
+            destination = candidate_source/path.relative_to(current)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, destination)
+    for fixed in ("main.cu", "ca.hpp"):
+        if not same_fixed_source(candidate_source/fixed, baseline_source/fixed):
+            raise ValueError("fixed file differs from baseline: " + fixed)
+    nvcc = args.nvcc or ("/work/HPC_software/LMOD/nvidia/packages/cuda-12.4/bin/nvcc"
+                        if Path("/work/HPC_software/LMOD/nvidia/packages/cuda-12.4/bin/nvcc").is_file()
+                        else "nvcc")
+    flags = ["-std=c++17", "-O3", "-arch=sm_90"]
+    # Match the repository Makefile's Nano5 compiler/runtime selection for BOTH builds.
+    host_compiler = Path("/work/HPC_software/LMOD/gcc/12.5.0/bin/g++")
+    if host_compiler.is_file():
+        flags += ["-ccbin", str(host_compiler), "-Xcompiler", "-static-libstdc++,-static-libgcc"]
+    capture([nvcc, "--version"], folder/"compiler-version.log", timeout=15)
+    manifest = dict(baseline_revision=baseline_revision,
+                    candidate_revision=(folder/"revision.log").read_text().strip(),
+                    source_hashes={}, binaries={}, compile_commands=[])
+    for name, source in (("baseline", baseline_source), ("candidate", candidate_source)):
+        for path in source_files(source):
+            manifest["source_hashes"][str(path.relative_to(folder))] = sha256(path)
+        binary = folder/(name+"-hw3-1")
+        argv = [nvcc, *flags, "main.cu", "hw3-1.cu", "-o", str(binary)]
+        manifest["compile_commands"].append(dict(cwd=str(source), argv=argv))
+        capture(argv, folder/(name+"-compile.log"), timeout=300, cwd=source)
+        manifest["binaries"][name] = dict(path=binary.name, sha256=sha256(binary))
+    gate = folder/"candidate-test_hw3-1"
+    argv = [nvcc, *flags, "-I.", "tests/test_hw3-1.cu", "hw3-1.cu", "-o", str(gate)]
+    manifest["compile_commands"].append(dict(cwd=str(candidate_source), argv=argv))
+    capture(argv, folder/"gate-compile.log", timeout=300, cwd=candidate_source)
+    manifest["binaries"]["gate"] = dict(path=gate.name, sha256=sha256(gate))
+    for relative, digest in manifest["source_hashes"].items():
+        if sha256(folder/relative) != digest:
+            raise ValueError("source changed while compiling: " + relative)
+    (folder/"manifest.json").write_text(json.dumps(manifest, indent=2)+"\n", encoding="utf-8")
+    (folder/"BUILT").write_text("Both source snapshots and candidate reference gate compiled.\n")
+    print("Frozen build: " + str(folder), flush=True)
+    print("No GPU was allocated or used. Start compare through srun/sbatch.", flush=True)
+
+
+def verify_manifest(folder):
+    if not (folder/"BUILT").is_file():
+        raise ValueError("incomplete build; missing BUILT")
+    manifest = json.loads((folder/"manifest.json").read_text(encoding="utf-8"))
+    binaries = {}
+    for name, item in manifest["binaries"].items():
+        path = folder/item["path"]
+        if sha256(path) != item["sha256"]:
+            raise ValueError("binary changed since frozen build: " + str(path))
+        binaries[name] = path.resolve()
+    for relative, digest in manifest["source_hashes"].items():
+        if sha256(folder/relative) != digest:
+            raise ValueError("source snapshot changed since build: " + relative)
+    return manifest, binaries
+
+
+def safe_environment():
+    names = ("CUDA_MODULE_LOADING", "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "OMP_NUM_THREADS",
+             "SLURM_JOB_ID", "SLURM_JOB_NODELIST", "SLURM_CPUS_PER_TASK", "SLURM_JOB_GPUS",
+             "SLURM_TIME_LIMIT", "SLURM_JOB_PARTITION", "LD_LIBRARY_PATH")
+    return {key: os.environ.get(key, "unset") for key in names}
+
+
+def compare(args):
+    if not os.environ.get("SLURM_JOB_ID"):
+        raise ValueError("compare requires an existing srun/sbatch allocation")
+    if not math.isfinite(args.budget_seconds) or not 0 < args.budget_seconds <= 540:
+        raise ValueError("--budget-seconds must be positive and at most 540 (9 minutes)")
+    if not math.isfinite(args.wall_timeout) or not 0 < args.wall_timeout <= 30:
+        raise ValueError("--wall-timeout must be positive and at most 30")
+    if not shutil.which(args.checker):
+        raise ValueError("official checker missing: " + args.checker)
+    deadline = time.monotonic()+args.budget_seconds
+    folder = args.outdir.resolve()
+    folder.mkdir(parents=True, exist_ok=False)
+    (folder/"started").write_text("single-allocation, frozen two-binary comparison\n")
+    manifest, binaries = verify_manifest(args.build_dir.resolve())
+    shutil.copyfile(args.build_dir/"manifest.json", folder/"build-manifest.json")
+    for name in ("revision.log", "status.log", "working-diff.log"):
+        shutil.copyfile(args.build_dir/name, folder/("build-"+name))
+    shutil.copyfile(args.build_dir/"compiler-version.log", folder/"build-compiler-version.log")
+    record_git(folder)
+    (folder/"environment.json").write_text(json.dumps(safe_environment(), indent=2)+"\n")
+    capture(["nvidia-smi", "--query-gpu=name,uuid,driver_version,pci.bus_id", "--format=csv"],
+            folder/"device.log", timeout=15)
+    capture(["nvidia-smi", "-q", "-d", "PERFORMANCE,CLOCK,POWER"], folder/"device-state-start.log", timeout=15)
+    cases = case_selection(args.cases, args.group)
+    case_rows = []
+    for case in cases:
+        path = Path("cases")/(case+".txt")
+        golden = path.with_suffix(".golden.txt")
+        if not golden.is_file():
+            golden = path.with_suffix(".out")
+        header = [line.split("#", 1)[0].strip() for line in path.read_text().splitlines()]
+        header = [line for line in header if line]
+        if len(header) < 4 or not golden.is_file():
+            raise ValueError("missing input header or golden for case " + case)
+        case_rows.append(dict(case=case, dimensions=header[0], rule=header[1], boundary=header[2],
+                              steps=header[3], input_sha256=sha256(path), golden_sha256=sha256(golden)))
+    write_table(folder/"case-inputs.tsv", case_rows)
+    paths = [Path(__file__).resolve(), Path(__file__).with_name("run_global_compare.sh"),
+             Path(__file__).with_name("run_cases.py"), *binaries.values()]
+    (folder/"sha256.log").write_text("\n".join(sha256(path)+"  "+str(path) for path in paths)+"\n")
+    configuration = dict(method=args.method, cases=cases, unprofiled_blocks=args.blocks,
+                         separate_profile_blocks=args.profile_blocks, guard_case="11",
+                         budget_seconds=args.budget_seconds, baseline_revision=manifest["baseline_revision"])
+    (folder/"configuration.json").write_text(json.dumps(configuration, indent=2)+"\n")
+    print("Baseline: " + manifest["baseline_revision"], flush=True)
+    print("Candidate build HEAD: " + manifest["candidate_revision"], flush=True)
+    print("Cases: " + ",".join(cases) + "; 11 is the unchanged-family guard", flush=True)
+    def remaining(required=0):
+        value = deadline-time.monotonic()
+        if value <= required:
+            raise ValueError("comparison budget exhausted; partial logs retained, no COMPLETE")
+        return value
+    gate_specs = [(False, "--quick", {}), (True, "--quick", {})]
+    if args.method in ("multistate", "combined"):
+        gate_specs.append((True, "--multistate", {"PP_ACTIVE": "0"}))
+    if args.method in ("rolling", "combined"):
+        gate_specs.extend([(True, "--rolling", {"PP_ACTIVE": "0"}),
+                           (True, "--rolling", {"PP_ACTIVE": "1"})])
+    if args.method in ("sparse-bits", "combined"):
+        gate_specs.extend([(True, "--sparse-bits", {"PP_ACTIVE": "1"}),
+                           (True, "--sparse-bits", {"PP_ACTIVE": "1", "PP_SUPPORT": "tile"})])
+    if args.method in ("rolling", "sparse-bits", "combined"):
+        gate_specs.extend([(True, "--sparse", {"PP_ACTIVE": "1"}),
+                           (True, "--support", {"PP_ACTIVE": "1"})])
+    if args.method in ("rolling", "combined"):
+        gate_specs.append((True, "--sparse", {"PP_ACTIVE": "1", "PP_ARCH": "reduce"}))
+    environments = []
+    gates = []
+    for index, (enabled, option, overrides) in enumerate(gate_specs):
+        configured = configure(args.method, enabled, True, **overrides)
+        environments.append(dict(kind="gate", index=index, option=option,
+                                 method="candidate" if enabled else "disabled", env=configured))
+        (folder/"effective-environments.json").write_text(json.dumps(environments, indent=2)+"\n")
+        log = folder/f"gate-{index:02d}-{option[2:]}.log"
+        capture([str(binaries["gate"]), option], log, timeout=min(120, remaining(1)))
+        text = log.read_text(encoding="utf-8")
+        count = validate_gate(text, GATE_COUNTS[option])
+        required_feature = {"--multistate": "multistate", "--rolling": "rolling",
+                            "--sparse-bits": "sparse_bits"}.get(option)
+        selected = verify_gate_dispatch(text, configured, count, required_feature)
+        gates.append(dict(gate=index, feature_enabled=int(enabled), option=option, passed=count,
+                          active=configured.get("PP_ACTIVE", "auto"), support=configured["PP_SUPPORT"],
+                          arch=configured["PP_ARCH"], **selected, log=log.name))
+        write_table(folder/"gates.tsv", gates)
+        print(f"Gate {index} {option}: PASS {count}/{count}; enabled={enabled}", flush=True)
+    samples = []
+    round_number = 0
+    for profiled, blocks in ((False, args.blocks), (True, args.profile_blocks)):
+        for block in range(1, blocks+1):
+            for slot, method in enumerate(("baseline", "candidate", "candidate", "baseline"), 1):
+                round_number += 1
+                configured = configure(args.method, method == "candidate", profiled)
+                environments.append(dict(kind="round", index=round_number, method=method, env=configured))
+                (folder/"effective-environments.json").write_text(json.dumps(environments, indent=2)+"\n")
+                order = cases if round_number % 2 else tuple(reversed(cases))
+                round_folder = folder/f"round-{round_number:02d}-{method}-profile{int(profiled)}"
+                round_folder.mkdir()
+                print(f"Round {round_number}: {method}, PP_PROFILE={int(profiled)}, block={block}, slot={slot}", flush=True)
+                for position, case in enumerate(order):
+                    remaining(args.wall_timeout+1)
+                    case_folder = round_folder/case
+                    status = run_cases(argparse.Namespace(inputs=[f"cases/{case}.txt"], binary=str(binaries[method]),
+                                       checker=args.checker, wall_timeout=args.wall_timeout,
+                                       limit=None, outdir=str(case_folder)))
+                    with (case_folder/"results.tsv").open(encoding="utf-8", newline="") as stream:
+                        results = list(csv.DictReader(stream, delimiter="\t"))
+                    if len(results) != 1:
+                        raise ValueError("incomplete case result: " + str(case_folder))
+                    row = results[0]
+                    raw = (case_folder/f"00-{case}.log").read_text(encoding="utf-8", errors="replace")
+                    if profiled:
+                        row.update(profile_fields(raw))
+                        if method == "candidate":
+                            row.update(verify_global(raw, configured, row["profile_kernel"]))
+                    elif row["profile_status"] != "absent":
+                        raise ValueError("instrumentation in unprofiled timing round")
+                    sample = dict(round=round_number, block=block, slot=slot, position=position,
+                                  method=method, profiled=int(profiled), case_id=case,
+                                  raw_log=str((case_folder/f"00-{case}.log").relative_to(folder)), **row)
+                    samples.append(sample)
+                    write_table(folder/"samples.tsv", samples)
+                    # Correct TLEs remain measurements. WA/RE/timeout remains in the
+                    # raw table, but stops this experiment instead of entering ratios.
+                    if status not in (0, 1) or row["verdict"] not in ("AC", "TLE"):
+                        raise ValueError("unverified public output: " + str(case_folder))
+                    number(row["compute_s"], positive=True)
+    summary = summarize(samples, cases, args.blocks)
+    write_table(folder/"summary.tsv", summary)
+    write_table(folder/"phases.tsv", phase_summary(samples, cases, args.profile_blocks))
+    verify_manifest(args.build_dir.resolve())
+    for row in summary:
+        print("{case}: {baseline_mean_s:.6f} -> {candidate_mean_s:.6f}s; "
+              "A/B={baseline_over_candidate:.3f}x; {timing_status}".format(**row), flush=True)
+    total_before = sum(row["baseline_mean_s"] for row in summary)
+    total_after = sum(row["candidate_mean_s"] for row in summary)
+    print(f"Selected-case mean totals (includes 11 guard): {total_before:.6f} -> {total_after:.6f}s", flush=True)
+    print("All samples retained; profile observations excluded from speedup and totals. No default promotion.", flush=True)
+    (folder/"COMPLETE").write_text("All requested gates, unprofiled ABBA, separate profiles, and checksum checks completed.\n")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    build = subparsers.add_parser("build", help="compile frozen baseline/candidate; no GPU work")
+    build.add_argument("--build-dir", type=Path, required=True)
+    build.add_argument("--baseline-revision", default=BASELINE_REVISION)
+    build.add_argument("--nvcc")
+    run = subparsers.add_parser("compare", help="run only inside existing Slurm allocation")
+    run.add_argument("--build-dir", type=Path, required=True)
+    run.add_argument("--outdir", type=Path, required=True)
+    run.add_argument("--method", choices=FEATURES, default="combined")
+    selection = run.add_mutually_exclusive_group()
+    selection.add_argument("--group", choices=GROUPS, default="target")
+    selection.add_argument("--cases", help="comma-separated case IDs/ranges; 11 guard always included")
+    run.add_argument("--blocks", type=int, choices=range(1, 4), default=1)
+    run.add_argument("--profile-blocks", type=int, choices=range(1, 3), default=1)
+    run.add_argument("--wall-timeout", type=float, default=20)
+    run.add_argument("--budget-seconds", type=float, default=420)
+    run.add_argument("--checker", default="hw3-1-check")
+    args = parser.parse_args(argv)
+    os.chdir(Path(__file__).resolve().parent.parent)
+    if args.command == "build":
+        prepare_build(args)
+    else:
+        compare(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError, tarfile.TarError) as error:
+        print("global comparison failed: " + str(error), file=sys.stderr)
+        sys.exit(1)

@@ -10,6 +10,7 @@
 // PP_BIT_ROWS=1|2|4, default 4. PP_BIT_LOGIC=reference|compact, default compact.
 // PP_ARCH=baseline|reduce|r1|r1shared|large|all: opt-in architecture experiments.
 // r1shared keeps the shared tile and reuses two adjacent output rows in registers.
+// PP_MULTISTATE=1, PP_SPARSE_BITS=1 and PP_ROLLING=1 enable new opt-in kernels.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -25,6 +26,8 @@
 #include "r1_packed.hpp"
 #include "r1_bits.hpp"
 #include "vn_diagonal.hpp"
+#include "r1_multistate.hpp"
+#include "rolling_filters.hpp"
 
 namespace {
 
@@ -34,6 +37,27 @@ void check(cudaError_t error, const char *operation) {
         std::exit(EXIT_FAILURE);
     }
 }
+
+struct GlobalExperiments {
+    bool multistate_requested, rolling_requested, sparse_bits_requested;
+    bool multistate_selected = false, rolling_selected = false, sparse_bits_selected = false;
+    static bool flag(const char *name) {
+        const char *value = std::getenv(name);
+        if (!value || std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") == 0) return true;
+        std::fprintf(stderr, "hw3-1: %s must be 0 or 1\n", name);
+        std::exit(EXIT_FAILURE);
+    }
+    GlobalExperiments() : multistate_requested(flag("PP_MULTISTATE")),
+        rolling_requested(flag("PP_ROLLING")), sparse_bits_requested(flag("PP_SPARSE_BITS")) {}
+    void report(bool profile) const {
+        if (profile) std::fprintf(stderr,
+            "[PP_GLOBAL] multistate_requested=%d multistate_selected=%d "
+            "rolling_requested=%d rolling_selected=%d sparse_bits_requested=%d sparse_bits_selected=%d\n",
+            int(multistate_requested), int(multistate_selected), int(rolling_requested),
+            int(rolling_selected), int(sparse_bits_requested), int(sparse_bits_selected));
+    }
+};
 
 // Diagnostic only: no events, clock reads, or extra synchronization when off.
 // Four stream markers bracket H2D, the entire kernel chain, and D2H.
@@ -201,6 +225,7 @@ __device__ AliveBounds reduce_alive_bounds(AliveBounds b) {
 
 #include "arch_stats.cuh"
 #include "vn_diagonal.cuh"
+#include "rolling_filters.cuh"
 
 // Track is compiled out for dense execution. Flags report whether the input
 // tile (bit 0) and output tile (bit 1) contain any nonzero, including decay.
@@ -546,6 +571,7 @@ __global__ void step_r1_dense(const uint8_t *__restrict__ src,
 }
 
 #include "r1_bitplane.cuh"
+#include "r1_multistate.cuh"
 
 struct TileQueue {
     int *ids;
@@ -635,7 +661,7 @@ __global__ void prepare_sparse(TileQueue current, TileQueue next, int *dense,
     }
 }
 
-template <bool Tiled, bool Moore, bool Packed = false, bool Sliding = false, bool Tight = false, int Arch = 0>
+template <bool Tiled, bool Moore, bool Packed = false, bool Sliding = false, bool Tight = false, int Arch = 0, bool Rolling = false>
 __global__ void step_sparse(const uint8_t *__restrict__ src,
                             uint8_t *__restrict__ dst, Problem p,
                             TileQueue current, TileQueue next, int *stamp, int epoch,
@@ -652,12 +678,14 @@ __global__ void step_sparse(const uint8_t *__restrict__ src,
         unsigned flags = 0;
         if (full) {
             // One-way dense fallback: no flag reductions or queue atomics.
-            if constexpr (Packed) update_r1_packed<Moore, false, false, Arch>(src, dst, p, x0, y0, scratch);
+            if constexpr (Rolling) update_rolling<Moore, false, false, Arch>(src, dst, p, x0, y0, reinterpret_cast<uint8_t *>(scratch));
+            else if constexpr (Packed) update_r1_packed<Moore, false, false, Arch>(src, dst, p, x0, y0, scratch);
             else if constexpr (Tiled) update_tiled<Moore, false, Sliding, false, Arch>(src, dst, p, x0, y0, sums);
             else update_direct<false, false, Arch>(src, dst, p, x0, y0);
         } else {
             AliveBounds support;
-            if constexpr (Packed) flags = update_r1_packed<Moore, true, Tight, Arch>(src, dst, p, x0, y0, scratch, &support);
+            if constexpr (Rolling) flags = update_rolling<Moore, true, Tight, Arch>(src, dst, p, x0, y0, reinterpret_cast<uint8_t *>(scratch), &support);
+            else if constexpr (Packed) flags = update_r1_packed<Moore, true, Tight, Arch>(src, dst, p, x0, y0, scratch, &support);
             else if constexpr (Tiled) flags = update_tiled<Moore, true, Sliding, Tight, Arch>(src, dst, p, x0, y0, sums, &support);
             else flags = update_direct<true, Tight, Arch>(src, dst, p, x0, y0, &support);
             if (threadIdx.x == 0 && threadIdx.y == 0) {
@@ -731,6 +759,7 @@ struct SparseWorkspace {
     }
 };
 
+#include "r1_sparse_bits.cuh"
 #include "evolution_diag.cuh"
 
 } // namespace
@@ -739,6 +768,7 @@ void run(uint8_t *grid, const Problem &p) {
     PhaseProfile profile;
     EvolutionProfile evolution;
     BitplaneExperiment bitplane(p);
+    GlobalExperiments global;
     const char *support_mode = std::getenv("PP_SUPPORT");
     const bool tight_support = support_mode ? std::strcmp(support_mode, "bbox") == 0 : !evolution.enabled;
     if (support_mode && !tight_support && std::strcmp(support_mode, "tile") != 0) {
@@ -777,6 +807,7 @@ void run(uint8_t *grid, const Problem &p) {
         profile.report("none", p); // all phase times zero; no CUDA events allocated
         bitplane.reason = bitplane.automatic || bitplane.requested ? "zero_steps" : "disabled";
         bitplane.report(profile.enabled);
+        global.report(profile.enabled);
         if (profile.enabled)
             std::fprintf(stderr, "[PP_ARCH] mode=%s merged=0 r1_warp=0 vn_diagonal=0 r1_shared=0\n", arch_mode);
         return;
@@ -819,8 +850,11 @@ void run(uint8_t *grid, const Problem &p) {
     const size_t bit_words = size_t((p.width+31)/32)*p.height;
     // Tiny unaligned rows may use more bytes when padded to 32 bits (e.g. W=3).
     // Reuse the existing two allocations; pack/evolve/unpack never alias in one launch.
-    const size_t allocation_bytes = bit_eligible && bit_words*sizeof(uint32_t) > bytes
+    const bool packed_experiment_eligible = packed && !graph_requested && !evolution.enabled
+        && (global.multistate_requested || global.sparse_bits_requested);
+    size_t allocation_bytes = bit_eligible && bit_words*sizeof(uint32_t) > bytes
                                   ? bit_words*sizeof(uint32_t) : bytes;
+    if (packed_experiment_eligible) allocation_bytes = r1_multistate::allocation_bytes(p);
     const char *active = std::getenv("PP_ACTIVE");
     const bool adaptive = !active || std::strcmp(active, "auto") == 0;
     const bool force_sparse = active && std::strcmp(active, "1") == 0;
@@ -843,6 +877,11 @@ void run(uint8_t *grid, const Problem &p) {
     check(cudaMemcpy(src, grid, bytes, cudaMemcpyHostToDevice), "copy initial grid");
     profile.mark(1);
     const bool sparse = inspect_sparse && sparse_work.initialize(src, dst, p, force_sparse);
+    global.multistate_selected = global.multistate_requested && packed_experiment_eligible
+        && !sparse && p.rule.states > 2;
+    global.sparse_bits_selected = global.sparse_bits_requested && packed_experiment_eligible && sparse;
+    global.rolling_selected = global.rolling_requested && p.rule.radius >= 2
+        && (automatic || forced_tiled) && !graph_requested && !evolution.enabled;
     bitplane.reason = !bitplane.requested ? (bitplane.automatic ? "auto_small_or_short" : "disabled") : evolution.enabled ? "evolution" :
         graph_requested ? "graph" : !packed ? "not_packed_r1" : p.rule.states != 2 ? "states" :
         sparse ? "sparse" : "enabled";
@@ -856,8 +895,16 @@ void run(uint8_t *grid, const Problem &p) {
     const int tile_w = (tiled || packed) ? TILE_W : 32;
     const int tile_h = (tiled || packed) ? TILE_H : 8;
     const dim3 blocks((p.width + tile_w - 1) / tile_w, (p.height + tile_h - 1) / tile_h);
+    const dim3 rolling_blocks((p.width + rolling_filters::dense_width - 1) / rolling_filters::dense_width,
+                              (p.height + rolling_filters::dense_height - 1) / rolling_filters::dense_height);
+    const bool moore = p.rule.shape == Shape::Moore;
+    const size_t rolling_shared = sparse ? rolling_filters::shared_bytes<TILE_W, TILE_H>(p.rule.radius, moore)
+        : rolling_filters::shared_bytes<rolling_filters::dense_width, rolling_filters::dense_height>(p.rule.radius, moore);
+    if (global.rolling_selected && !sparse && !moore && rolling_shared > 48 * 1024)
+        check(cudaFuncSetAttribute(step_rolling<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   int(rolling_shared)), "configure rolling shared memory");
     const size_t r1_shared_bytes = (arch & 2) ? 0 : R1_SHARED_BYTES;
-    const bool vn_diagonal_selected = (arch & 4) && tiled && p.rule.shape == Shape::VonNeumann
+    const bool vn_diagonal_selected = !global.rolling_selected && (arch & 4) && tiled && p.rule.shape == Shape::VonNeumann
                                      && p.rule.radius <= 30;
     const size_t shared_bytes = size_t(TILE_W + 2 * p.rule.radius + 1)
                               * (TILE_H + 2 * p.rule.radius + 1) * sizeof(uint16_t)
@@ -895,7 +942,15 @@ void run(uint8_t *grid, const Problem &p) {
                 // out of the reference kernel, rather than a per-cell runtime branch.
                 auto launch_sparse = [&](auto tight_tag) {
                     constexpr bool Tight = decltype(tight_tag)::value;
-                    if (packed && p.rule.shape == Shape::Moore)
+                    if (global.rolling_selected && moore)
+                        step_sparse<false, true, false, false, Tight, SparseMoore, true><<<sparse_work.workers, threads, rolling_shared, stream>>>(
+                            src, dst, p, current, next, sparse_work.stamp, t + 1,
+                            sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+                    else if (global.rolling_selected)
+                        step_sparse<false, false, false, false, Tight, SparseMoore, true><<<sparse_work.workers, threads, rolling_shared, stream>>>(
+                            src, dst, p, current, next, sparse_work.stamp, t + 1,
+                            sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
+                    else if (packed && p.rule.shape == Shape::Moore)
                         step_sparse<false, true, true, false, Tight, SparseR1><<<sparse_work.workers, threads, r1_shared_bytes, stream>>>(
                             src, dst, p, current, next, sparse_work.stamp, t + 1,
                             sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
@@ -923,6 +978,10 @@ void run(uint8_t *grid, const Problem &p) {
                 if (tight_support) launch_sparse(std::true_type{});
                 else launch_sparse(std::false_type{});
             }
+            else if (global.rolling_selected && moore)
+                step_rolling<true><<<rolling_blocks, threads, rolling_shared, stream>>>(src, dst, p);
+            else if (global.rolling_selected)
+                step_rolling<false><<<rolling_blocks, threads, rolling_shared, stream>>>(src, dst, p);
             else if (packed && p.rule.shape == Shape::Moore)
                 step_r1_dense<true, DenseR1><<<blocks, threads, r1_shared_bytes, stream>>>(src, dst, p);
             else if (packed)
@@ -951,7 +1010,34 @@ void run(uint8_t *grid, const Problem &p) {
             evolution.sample(t+1, src, dst, p, sparse ? sparse_work.counts+((t+1)&1) : nullptr,
                              sparse ? sparse_work.counts+2 : nullptr);
     };
-    if (bitplane.selected) {
+    if (global.multistate_selected || global.sparse_bits_selected) {
+        auto swap_buffers = [&]() { uint8_t *old = src; src = dst; dst = old; };
+        check(r1_multistate_gpu::pack(src, reinterpret_cast<uint32_t *>(dst), p), "launch multistate pack");
+        swap_buffers();
+        if (global.sparse_bits_selected)
+            check(cudaMemsetAsync(dst, 0, bit_words * r1_multistate::plane_count(p.rule.states) * sizeof(uint32_t)),
+                  "clear sparse bit-plane destination");
+        for (int t = 0; t < iterations; ++t) {
+            const auto *input = reinterpret_cast<const uint32_t *>(src);
+            auto *output = reinterpret_cast<uint32_t *>(dst);
+            if (global.sparse_bits_selected) {
+                const TileQueue current = sparse_work.queue(t & 1), next = sparse_work.queue((t + 1) & 1);
+                prepare_sparse<<<1, 1>>>(current, next, sparse_work.counts + 2,
+                                        sparse_work.tile_count, sparse_work.stats, nullptr);
+                check(cudaGetLastError(), "launch bit-plane sparse prepare");
+                if (tight_support)
+                    r1_sparse_bits_gpu::launch<true>(input, output, p, current, next, sparse_work.stamp, t + 1,
+                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, sparse_work.workers);
+                else
+                    r1_sparse_bits_gpu::launch<false>(input, output, p, current, next, sparse_work.stamp, t + 1,
+                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, sparse_work.workers);
+                check(cudaGetLastError(), "launch sparse bit-plane step");
+            } else check(r1_multistate_gpu::step(input, output, p), "launch dense multistate step");
+            swap_buffers();
+        }
+        check(r1_multistate_gpu::unpack(reinterpret_cast<const uint32_t *>(src), dst, p), "launch multistate unpack");
+        swap_buffers();
+    } else if (bitplane.selected) {
         auto swap_buffers = [&]() { uint8_t *old=src; src=dst; dst=old; };
         const unsigned conversion_blocks = unsigned((bit_words+7)/8 < 8192 ? (bit_words+7)/8 : 8192);
         bitplane.mark(0);
@@ -1030,9 +1116,12 @@ void run(uint8_t *grid, const Problem &p) {
     check(cudaFree(src), "free source");
     sparse_work.release();
     if (profile.enabled) profile.free_host_ms = PhaseProfile::elapsed_ms(free_start);
-    profile.report(sparse ? (packed ? "sparse_r1" : sliding ? "sparse_sliding" : tiled ? "sparse_tiled" : "sparse_naive")
+    profile.report(global.sparse_bits_selected ? "sparse_bits" : global.multistate_selected ? "dense_multistate"
+                         : global.rolling_selected ? (sparse ? "sparse_rolling" : "rolling")
+                         : sparse ? (packed ? "sparse_r1" : sliding ? "sparse_sliding" : tiled ? "sparse_tiled" : "sparse_naive")
                          : (bitplane.selected ? "dense_bits" : packed ? "dense_r1" : sliding ? "sliding" : tiled ? "tiled" : "naive"), p);
     bitplane.report(profile.enabled);
+    global.report(profile.enabled);
     if (profile.enabled)
         std::fprintf(stderr,
             "[PP_GRAPH] requested=%d selected=%d batch=%d replays=%d tail=%d build_host_ms=%.6f\n",
@@ -1041,9 +1130,9 @@ void run(uint8_t *grid, const Problem &p) {
             graph_selected ? iterations % GRAPH_BATCH : iterations, graph_build_ms);
     if (profile.enabled)
         std::fprintf(stderr, "[PP_ARCH] mode=%s merged=%d r1_warp=%d vn_diagonal=%d r1_shared=%d\n",
-                     arch_mode, int((arch & 1) && sparse),
-                     int((arch & 2) && packed && !bitplane.selected), int(vn_diagonal_selected),
-                     int((arch & 8) && packed && !bitplane.selected));
+                     arch_mode, int((arch & 1) && sparse && !global.sparse_bits_selected),
+                     int((arch & 2) && packed && !bitplane.selected && !global.multistate_selected && !global.sparse_bits_selected), int(vn_diagonal_selected),
+                     int((arch & 8) && packed && !bitplane.selected && !global.multistate_selected && !global.sparse_bits_selected));
     if (profile.enabled && inspect_sparse)
         std::fprintf(stderr,
             "[PP_SPARSE] selected=%d tiles_total=%d initial_work=%d work_sum=%llu "
