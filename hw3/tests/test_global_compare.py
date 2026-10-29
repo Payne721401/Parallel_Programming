@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 from global_compare import (GATE_COUNTS, case_selection, compare, configure, phase_summary, profile_fields,
                             sha256, summarize, validate_gate, verify_global, verify_manifest)
-from global_compare import gate_plan, same_fixed_source, verify_gate_dispatch, verify_sparse_next
+from global_compare import (ORIGINAL_BASELINE_REVISION, comparison_binaries, gate_plan, require_original_baseline,
+                            same_fixed_source, verify_gate_dispatch, verify_sparse_next)
 from run_cases import PROFILE_TIMES, parse_profile
 
 
@@ -23,6 +24,17 @@ def timing_samples():
 
 
 class GlobalComparisonTests(unittest.TestCase):
+    def test_regression_control_requires_exact_original_baseline_revision(self):
+        manifest = dict(baseline_revision=ORIGINAL_BASELINE_REVISION, candidate_revision="current")
+        before = copy.deepcopy(manifest)
+        require_original_baseline(manifest)
+        self.assertEqual(manifest, before)
+        for revision in ("3b88c9dccc89cb0060fbcb90991fa07a19ed7a33", "1352bf8", None, "", "current"):
+            with self.subTest(revision=revision), self.assertRaisesRegex(ValueError, "requires frozen baseline"):
+                require_original_baseline(dict(baseline_revision=revision))
+        with self.assertRaisesRegex(ValueError, "missing"):
+            require_original_baseline({})
+
     def test_fixed_source_guard_accepts_crlf_only_and_rejects_content_changes(self):
         with tempfile.TemporaryDirectory() as temp:
             left, right = Path(temp)/"left.cu", Path(temp)/"right.cu"
@@ -48,6 +60,34 @@ class GlobalComparisonTests(unittest.TestCase):
             self.assertEqual(env["PP_MULTISTATE"], "0")
             self.assertEqual(env["PP_ROLLING"], "0")
             self.assertEqual(env["PP_SPARSE_BITS"], "0")
+
+    def test_disabled_method_clears_all_new_features_and_keeps_only_quick_gates(self):
+        features = ("PP_MULTISTATE", "PP_ROLLING", "PP_SPARSE_BITS", "PP_SPARSE_WARP",
+                    "PP_SPARSE_WIDE", "PP_SPARSE_OUTPUT")
+        with patch.dict(os.environ, {name: "1" for name in features}):
+            env = configure("disabled", True)
+            self.assertTrue(all(env[name] == "0" for name in features))
+            self.assertEqual([item["option"] for item in gate_plan("disabled")],
+                             ["--quick", "--quick"])
+
+    def test_baseline_binary_alias_preserves_frozen_manifest_and_records_real_source(self):
+        manifest = dict(baseline_revision="old", candidate_revision="new", binaries={
+            name: dict(sha256=name+"-hash") for name in ("baseline", "candidate", "gate")})
+        binaries = {name: Path(name) for name in manifest["binaries"]}
+        original_manifest, original_binaries = copy.deepcopy(manifest), dict(binaries)
+        selected, evidence = comparison_binaries(manifest, binaries, "candidate")
+        self.assertEqual(selected["baseline"], selected["candidate"])
+        self.assertEqual(evidence["baseline"], evidence["candidate"])
+        self.assertEqual(evidence["baseline"]["source_revision"], "new")
+        self.assertEqual(evidence["baseline"]["source_snapshot"], "candidate-source/hw3")
+        self.assertEqual(evidence["baseline"]["binary_sha256"], "candidate-hash")
+        self.assertEqual(manifest, original_manifest)
+        self.assertEqual(binaries, original_binaries)
+        normal, old_evidence = comparison_binaries(manifest, binaries)
+        self.assertEqual(normal, binaries)
+        self.assertEqual(old_evidence["baseline"]["source_revision"], "old")
+        with self.assertRaises(ValueError):
+            comparison_binaries(manifest, binaries, "gate")
 
     def test_next_methods_compare_against_combined_without_leaking_new_flags(self):
         with patch.dict(os.environ, PP_SPARSE_WARP="1", PP_SPARSE_WIDE="1", PP_SPARSE_OUTPUT="1"):
@@ -247,7 +287,8 @@ class GlobalComparisonTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 verify_manifest(folder)
 
-    def run_fake_comparison(self, folder, wrong_output=False, method="combined", baseline_method="disabled"):
+    def run_fake_comparison(self, folder, wrong_output=False, method="combined", baseline_method="disabled",
+                            baseline_binary="baseline"):
         build = folder/"build"
         build.mkdir()
         (build/"BUILT").write_text("done")
@@ -309,7 +350,9 @@ class GlobalComparisonTests(unittest.TestCase):
             elapsed = .01 if path.stem == "11" else .04 if candidate else .3
             verdict = "WA" if wrong_output else "TLE" if elapsed > .2 else "AC"
             kernel = "dense_bits" if path.stem == "11" else (
-                "sparse_warp" if candidate and os.environ["PP_SPARSE_WARP"] == "1" else "rolling")
+                "sparse_warp" if candidate and os.environ["PP_SPARSE_WARP"] == "1" else
+                "rolling" if os.environ["PP_ROLLING"] == "1" else
+                "dense_multistate" if os.environ["PP_MULTISTATE"] == "1" else "naive")
             row = dict(case=str(path), verdict=verdict, compute_s=".99" if profiled else elapsed,
                        wall_s=1, limit_s=.2, profile_status="invalid" if profiled else "absent",
                        profile_kernel="", **{key: "" for key in PROFILE_TIMES})
@@ -322,6 +365,7 @@ class GlobalComparisonTests(unittest.TestCase):
             (output/f"00-{path.stem}.check.log").write_text(verdict)
             return int(verdict != "AC")
         args = argparse.Namespace(build_dir=build, outdir=folder/"results", method=method, baseline_method=baseline_method, cases="04",
+                                  baseline_binary=baseline_binary,
                                   group="target", blocks=1, profile_blocks=1, budget_seconds=420,
                                   wall_timeout=20, checker="fake-checker")
         previous = Path.cwd()
@@ -393,6 +437,42 @@ class GlobalComparisonTests(unittest.TestCase):
             console = (Path(temp)/"captured-console.log").read_text()
             self.assertEqual(console.count("[PP_SPARSE_NEXT]"), 4)
             self.assertIn("Case 04: [PP_SPARSE_NEXT]", console)
+
+    def test_disabled_pipeline_runs_current_binary_without_new_features(self):
+        with tempfile.TemporaryDirectory() as temp:
+            results = self.run_fake_comparison(Path(temp), method="disabled")
+            self.assertTrue((results/"COMPLETE").is_file())
+            envs = json.loads((results/"effective-environments.json").read_text())
+            for item in envs:
+                self.assertTrue(all(item["env"][name] == "0" for name in
+                                    ("PP_MULTISTATE", "PP_ROLLING", "PP_SPARSE_BITS", "PP_SPARSE_WARP",
+                                     "PP_SPARSE_WIDE", "PP_SPARSE_OUTPUT")))
+            configuration = json.loads((results/"configuration.json").read_text())
+            self.assertEqual(configuration["baseline_revision"], "old")
+            self.assertEqual(configuration["binary_provenance"]["candidate"]["source_revision"], "new")
+
+    def test_same_binary_pipeline_attributes_flags_without_claiming_old_baseline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            results = self.run_fake_comparison(Path(temp), method="multistate", baseline_binary="candidate")
+            self.assertTrue((results/"COMPLETE").is_file())
+            configuration = json.loads((results/"configuration.json").read_text())
+            self.assertEqual(configuration["baseline_revision"], "new")
+            self.assertEqual(configuration["frozen_baseline_revision"], "old")
+            evidence = configuration["binary_provenance"]
+            self.assertEqual(evidence["baseline"], evidence["candidate"])
+            envs = json.loads((results/"effective-environments.json").read_text())
+            rounds = [item for item in envs if item["kind"] == "round"]
+            for item in rounds:
+                self.assertEqual(item["binary_provenance"], evidence["candidate"])
+                self.assertEqual(item["env"]["PP_MULTISTATE"], str(int(item["method"] == "candidate")))
+            with (results/"samples.tsv").open(newline="") as stream:
+                samples = list(csv.DictReader(stream, delimiter="\t"))
+            self.assertEqual({row["frozen_binary"] for row in samples}, {"candidate"})
+            self.assertEqual({row["source_revision"] for row in samples}, {"new"})
+            self.assertEqual(len({row["binary_sha256"] for row in samples}), 1)
+            console = (Path(temp)/"captured-console.log").read_text()
+            self.assertIn("Baseline: new (frozen candidate binary)", console)
+            self.assertNotIn("Baseline: old", console)
 
 
 if __name__ == "__main__":

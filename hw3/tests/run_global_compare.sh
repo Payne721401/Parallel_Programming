@@ -21,7 +21,8 @@ case "$mode" in
     echo 'Build without GPU: bash tests/run_global_compare.sh build --build-dir tmp/global-build-v1' >&2
     echo 'Next build (no GPU): bash tests/run_global_compare.sh build --baseline-revision 3b88c9d --build-dir tmp/global-build-v2' >&2
     echo 'Inside Slurm: bash tests/run_global_compare.sh compare --build-dir tmp/global-build-v2 --method sparse-next --baseline-method combined --group sparse' >&2
-    echo 'Other methods: combined|multistate|rolling|sparse-bits|sparse-warp|sparse-wide|sparse-output; use --cases 01-12 for all cases.' >&2
+    echo 'Other methods: disabled|combined|multistate|rolling|sparse-bits|sparse-warp|sparse-wide|sparse-output; use --cases 01-12 for all cases.' >&2
+    echo 'Use --baseline-binary candidate to compare flags in the exact same frozen candidate binary.' >&2
     exit 2
     ;;
 esac

@@ -24,7 +24,8 @@ from run_cases import PROFILE_TIMES, run_cases
 
 
 BASELINE_REVISION = "1352bf8"
-FEATURES = {"multistate": ("PP_MULTISTATE",), "rolling": ("PP_ROLLING",),
+ORIGINAL_BASELINE_REVISION = "1352bf87dad753b317915a17b436be2fce329804"
+FEATURES = {"disabled": (), "multistate": ("PP_MULTISTATE",), "rolling": ("PP_ROLLING",),
             "sparse-bits": ("PP_SPARSE_BITS",),
             "combined": ("PP_MULTISTATE", "PP_ROLLING", "PP_SPARSE_BITS")}
 OLD_FEATURES = FEATURES["combined"]
@@ -391,11 +392,13 @@ def prepare_build(args):
         binary = folder/(name+"-hw3-1")
         argv = [nvcc, *flags, "main.cu", "hw3-1.cu", "-o", str(binary)]
         manifest["compile_commands"].append(dict(cwd=str(source), argv=argv))
+        print(f"Compiling {name}; output: {folder/(name+'-compile.log')}", flush=True)
         capture(argv, folder/(name+"-compile.log"), timeout=300, cwd=source)
         manifest["binaries"][name] = dict(path=binary.name, sha256=sha256(binary))
     gate = folder/"candidate-test_hw3-1"
     argv = [nvcc, *flags, "-I.", "tests/test_hw3-1.cu", "hw3-1.cu", "-o", str(gate)]
     manifest["compile_commands"].append(dict(cwd=str(candidate_source), argv=argv))
+    print(f"Compiling candidate reference gate; output: {folder/'gate-compile.log'}", flush=True)
     capture(argv, folder/"gate-compile.log", timeout=300, cwd=candidate_source)
     manifest["binaries"]["gate"] = dict(path=gate.name, sha256=sha256(gate))
     for relative, digest in manifest["source_hashes"].items():
@@ -430,6 +433,29 @@ def safe_environment():
     return {key: os.environ.get(key, "unset") for key in names}
 
 
+def comparison_binaries(manifest, binaries, baseline_binary="baseline"):
+    """Select comparison roles without changing the frozen build or its hashes."""
+    if baseline_binary not in ("baseline", "candidate"):
+        raise ValueError("baseline binary must be baseline or candidate")
+    selected = dict(binaries)
+    selected["baseline"] = binaries[baseline_binary]
+    provenance = {}
+    for role, frozen_name in (("baseline", baseline_binary), ("candidate", "candidate")):
+        provenance[role] = dict(frozen_binary=frozen_name,
+                                source_revision=manifest[frozen_name+"_revision"],
+                                source_snapshot=frozen_name+"-source/hw3",
+                                binary_path=str(binaries[frozen_name]),
+                                binary_sha256=manifest["binaries"][frozen_name]["sha256"])
+    return selected, provenance
+
+
+def require_original_baseline(manifest):
+    actual = manifest.get("baseline_revision", "missing")
+    if actual != ORIGINAL_BASELINE_REVISION:
+        raise ValueError("regression control requires frozen baseline " + ORIGINAL_BASELINE_REVISION
+                         + "; build contains " + str(actual) + ". Create a new build with --baseline-revision 1352bf8.")
+
+
 def compare(args):
     if not os.environ.get("SLURM_JOB_ID"):
         raise ValueError("compare requires an existing srun/sbatch allocation")
@@ -444,7 +470,12 @@ def compare(args):
     folder = args.outdir.resolve()
     folder.mkdir(parents=True, exist_ok=False)
     (folder/"started").write_text("single-allocation, frozen two-binary comparison\n")
-    manifest, binaries = verify_manifest(args.build_dir.resolve())
+    manifest, frozen_binaries = verify_manifest(args.build_dir.resolve())
+    baseline_binary = getattr(args, "baseline_binary", "baseline")
+    binaries, provenance = comparison_binaries(manifest, frozen_binaries, baseline_binary)
+    gate_provenance = dict(frozen_binary="gate", source_revision=manifest["candidate_revision"],
+                           source_snapshot="candidate-source/hw3", binary_path=str(frozen_binaries["gate"]),
+                           binary_sha256=manifest["binaries"]["gate"]["sha256"])
     shutil.copyfile(args.build_dir/"manifest.json", folder/"build-manifest.json")
     for name in ("revision.log", "status.log", "working-diff.log"):
         shutil.copyfile(args.build_dir/name, folder/("build-"+name))
@@ -469,15 +500,22 @@ def compare(args):
                               steps=header[3], input_sha256=sha256(path), golden_sha256=sha256(golden)))
     write_table(folder/"case-inputs.tsv", case_rows)
     paths = [Path(__file__).resolve(), Path(__file__).with_name("run_global_compare.sh"),
-             Path(__file__).with_name("run_cases.py"), *binaries.values()]
+             Path(__file__).with_name("run_cases.py"), *frozen_binaries.values()]
     (folder/"sha256.log").write_text("\n".join(sha256(path)+"  "+str(path) for path in paths)+"\n")
     configuration = dict(method=args.method, baseline_method=baseline_method, cases=cases, unprofiled_blocks=args.blocks,
                          separate_profile_blocks=args.profile_blocks, guard_case="11",
-                         budget_seconds=args.budget_seconds, baseline_revision=manifest["baseline_revision"])
+                         budget_seconds=args.budget_seconds, baseline_binary=baseline_binary,
+                         baseline_revision=provenance["baseline"]["source_revision"],
+                         frozen_baseline_revision=manifest["baseline_revision"], binary_provenance=provenance,
+                         gate_binary_provenance=gate_provenance)
     (folder/"configuration.json").write_text(json.dumps(configuration, indent=2)+"\n")
-    print("Baseline: " + manifest["baseline_revision"], flush=True)
+    print("Baseline: " + provenance["baseline"]["source_revision"]
+          + " (frozen " + baseline_binary + " binary)", flush=True)
     print("Baseline flags: " + baseline_method + "; candidate flags: " + args.method, flush=True)
     print("Candidate build HEAD: " + manifest["candidate_revision"], flush=True)
+    for role in ("baseline", "candidate"):
+        print(f"{role.title()} binary SHA256: {provenance[role]['binary_sha256']}", flush=True)
+    print("Reference gates use the frozen candidate-source test binary.", flush=True)
     print("Cases: " + ",".join(cases) + "; 11 is the unchanged-family guard", flush=True)
     def remaining(required=0):
         value = deadline-time.monotonic()
@@ -491,7 +529,7 @@ def compare(args):
         gate_baseline = baseline_method if spec["role"] == "baseline" else "disabled"
         configured = configure(args.method, enabled, True, baseline_method=gate_baseline, **spec["overrides"])
         environments.append(dict(kind="gate", index=index, option=option,
-                                 method=spec["role"], env=configured))
+                                 method=spec["role"], env=configured, binary_provenance=gate_provenance))
         (folder/"effective-environments.json").write_text(json.dumps(environments, indent=2)+"\n")
         log = folder/f"gate-{index:02d}-{option[2:]}.log"
         capture([str(binaries["gate"]), option], log, timeout=min(120, remaining(1)))
@@ -511,7 +549,8 @@ def compare(args):
                 round_number += 1
                 configured = configure(args.method, method == "candidate", profiled,
                                        baseline_method=baseline_method)
-                environments.append(dict(kind="round", index=round_number, method=method, env=configured))
+                environments.append(dict(kind="round", index=round_number, method=method, env=configured,
+                                         binary_provenance=provenance[method]))
                 (folder/"effective-environments.json").write_text(json.dumps(environments, indent=2)+"\n")
                 order = cases if round_number % 2 else tuple(reversed(cases))
                 round_folder = folder/f"round-{round_number:02d}-{method}-profile{int(profiled)}"
@@ -531,7 +570,7 @@ def compare(args):
                     raw = (case_folder/f"00-{case}.log").read_text(encoding="utf-8", errors="replace")
                     if profiled:
                         row.update(profile_fields(raw))
-                        if method == "candidate" or baseline_method != "disabled":
+                        if method == "candidate" or baseline_method != "disabled" or baseline_binary == "candidate":
                             row.update(verify_global(raw, configured, row["profile_kernel"]))
                             row.update(verify_sparse_next(raw, configured, row["profile_kernel"],
                                                           row.get("profile_cells")))
@@ -543,6 +582,9 @@ def compare(args):
                         raise ValueError("instrumentation in unprofiled timing round")
                     sample = dict(round=round_number, block=block, slot=slot, position=position,
                                   method=method, profiled=int(profiled), case_id=case,
+                                  frozen_binary=provenance[method]["frozen_binary"],
+                                  source_revision=provenance[method]["source_revision"],
+                                  binary_sha256=provenance[method]["binary_sha256"],
                                   raw_log=str((case_folder/f"00-{case}.log").relative_to(folder)), **row)
                     samples.append(sample)
                     write_table(folder/"samples.tsv", samples)
@@ -577,7 +619,9 @@ def main(argv=None):
     run.add_argument("--outdir", type=Path, required=True)
     run.add_argument("--method", choices=FEATURES, default="combined")
     run.add_argument("--baseline-method", choices=BASELINE_METHODS, default="disabled",
-                     help="feature flags for the frozen baseline binary; defaults to all disabled")
+                     help="feature flags for the baseline role; defaults to all disabled")
+    run.add_argument("--baseline-binary", choices=("baseline", "candidate"), default="baseline",
+                     help="use candidate to isolate flags in the exact same frozen binary")
     selection = run.add_mutually_exclusive_group()
     selection.add_argument("--group", choices=GROUPS, default="target")
     selection.add_argument("--cases", help="comma-separated case IDs/ranges; 11 guard always included")
