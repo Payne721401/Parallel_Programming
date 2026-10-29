@@ -15,8 +15,8 @@ while (($#)); do
     --help|-h)
       echo 'Inside Slurm: bash tests/run_regression_control.sh --build-dir tmp/regression-build-v1'
       echo 'Optional: --cases 01-04,08,10-12 (default); case 11 is always included.'
-      echo 'A/B: original binary vs current binary, new flags disabled.'
-      echo 'B/C: exact same current binary, disabled vs multistate only.'
+      echo 'A/B: original binary vs frozen candidate binary, new flags disabled.'
+      echo 'B/C: exact same candidate binary, disabled vs multistate only.'
       exit 0 ;;
     *) echo "Unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -36,6 +36,7 @@ try:
 except (OSError, ValueError, KeyError) as error:
     raise SystemExit("Regression preflight failed: " + str(error))
 print("Original baseline verified: " + manifest["baseline_revision"], flush=True)
+print("Frozen candidate variant: " + manifest.get("candidate_variant", "working"), flush=True)
 PY
 command -v timeout >/dev/null || { echo 'GNU timeout is required for the total wall-time cap.' >&2; exit 2; }
 logdir="tmp/regression-control-${SLURM_JOB_ID}-$(date +%Y%m%d-%H%M%S)-$$"
@@ -58,8 +59,8 @@ run_phase() {
       --method "$method" --baseline-method disabled --baseline-binary "$baseline_binary" \
       --cases "$cases" --blocks 2 --profile-blocks 1 --budget-seconds "$compare_budget"
 }
-run_phase 'A/B: frozen original binary vs current binary; all six new flags disabled.' disabled baseline
-run_phase 'B/C: same frozen current binary; disabled vs multistate only.' multistate candidate
+run_phase 'A/B: frozen original binary vs frozen candidate binary; all six new flags disabled.' disabled baseline
+run_phase 'B/C: same frozen candidate binary; disabled vs multistate only.' multistate candidate
 ((SECONDS < 420)) || { echo 'Total 420-second budget exhausted; no COMPLETE.' >&2; exit 1; }
 printf 'Both comparisons completed in the same allocation.\n' > "$logdir/COMPLETE"
 echo "COMPLETE: $logdir/COMPLETE"

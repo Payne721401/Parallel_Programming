@@ -6,6 +6,7 @@ Unprofiled Compute samples and separate profile observations are never pooled.
 """
 import argparse
 import csv
+import difflib
 import hashlib
 import io
 import json
@@ -41,6 +42,7 @@ GROUPS = {"target": tuple(f"{i:02d}" for i in range(4, 13)),
           "large": ("04", "05", "06", "07"), "sparse": ("08", "09", "10"),
           "multistate": ("08", "10", "12"), "sparse-bits": ("08", "10")}
 SOURCE_SUFFIXES = {".cu", ".cuh", ".hpp", ".h"}
+CANDIDATE_VARIANTS = ("working", "original-multistate")
 GATE_COUNTS = {"--quick": 22, "--multistate": 384, "--rolling": 128,
                "--sparse-bits": 136, "--sparse": 30, "--support": 28,
                "--sparse-warp": 32, "--sparse-wide": 200, "--sparse-pageable": 30}
@@ -341,6 +343,38 @@ def source_files(root):
                   and path.suffix in SOURCE_SUFFIXES)
 
 
+def prepare_candidate_variant(variant, folder, baseline_source, candidate_source, baseline_revision):
+    if variant not in CANDIDATE_VARIANTS:
+        raise ValueError("unknown candidate variant: " + variant)
+    if variant == "working":
+        return dict(candidate_variant=variant), {}
+    require_original_baseline(dict(baseline_revision=baseline_revision))
+    from lean_multistate_source import transform_original_multistate, TRANSFORMER_VERSION
+    original = (baseline_source/"hw3-1.cu").read_bytes()
+    transformed = transform_original_multistate(original)
+    for name in ("r1_multistate.hpp", "r1_multistate.cuh"):
+        if not (candidate_source/name).is_file():
+            raise ValueError("missing multistate header: " + name)
+    # Keep every original production dependency, including r1_bits and architecture
+    # kernels. Only the two multistate headers and current test gate are additions.
+    for path in baseline_source.iterdir():
+        if path.is_file() and path.suffix in SOURCE_SUFFIXES:
+            shutil.copyfile(path, candidate_source/path.name)
+    (candidate_source/"hw3-1.cu").write_bytes(transformed)
+    transformer = Path(__file__).with_name("lean_multistate_source.py")
+    frozen_transformer = folder/"source-transformer.py"
+    shutil.copyfile(transformer, frozen_transformer)
+    source_diff = folder/"candidate-source.patch"
+    source_diff.write_text("".join(difflib.unified_diff(
+        original.decode().splitlines(keepends=True), transformed.decode().splitlines(keepends=True),
+        fromfile="1352bf8/hw3-1.cu", tofile="original-multistate/hw3-1.cu")), encoding="utf-8")
+    metadata = dict(candidate_variant=variant, candidate_base_revision=baseline_revision,
+                    source_transformer_version=TRANSFORMER_VERSION,
+                    source_transformer_path=frozen_transformer.name,
+                    source_transformer_sha256=sha256(frozen_transformer))
+    return metadata, {path.name: sha256(path) for path in (frozen_transformer, source_diff)}
+
+
 def prepare_build(args):
     folder = args.build_dir.resolve()
     folder.mkdir(parents=True, exist_ok=False)
@@ -374,6 +408,10 @@ def prepare_build(args):
     for fixed in ("main.cu", "ca.hpp"):
         if not same_fixed_source(candidate_source/fixed, baseline_source/fixed):
             raise ValueError("fixed file differs from baseline: " + fixed)
+    variant = getattr(args, "candidate_variant", "working")
+    variant_metadata, extra_hashes = prepare_candidate_variant(
+        variant, folder, baseline_source, candidate_source, baseline_revision)
+    print("Candidate variant: " + variant, flush=True)
     nvcc = args.nvcc or ("/work/HPC_software/LMOD/nvidia/packages/cuda-12.4/bin/nvcc"
                         if Path("/work/HPC_software/LMOD/nvidia/packages/cuda-12.4/bin/nvcc").is_file()
                         else "nvcc")
@@ -385,7 +423,7 @@ def prepare_build(args):
     capture([nvcc, "--version"], folder/"compiler-version.log", timeout=15)
     manifest = dict(baseline_revision=baseline_revision,
                     candidate_revision=(folder/"revision.log").read_text().strip(),
-                    source_hashes={}, binaries={}, compile_commands=[])
+                    source_hashes=extra_hashes, binaries={}, compile_commands=[], **variant_metadata)
     for name, source in (("baseline", baseline_source), ("candidate", candidate_source)):
         for path in source_files(source):
             manifest["source_hashes"][str(path.relative_to(folder))] = sha256(path)
@@ -444,6 +482,10 @@ def comparison_binaries(manifest, binaries, baseline_binary="baseline"):
         provenance[role] = dict(frozen_binary=frozen_name,
                                 source_revision=manifest[frozen_name+"_revision"],
                                 source_snapshot=frozen_name+"-source/hw3",
+                                source_variant=(manifest.get("candidate_variant", "working")
+                                                if frozen_name == "candidate" else "original"),
+                                base_revision=(manifest.get("candidate_base_revision", manifest["candidate_revision"])
+                                               if frozen_name == "candidate" else manifest["baseline_revision"]),
                                 binary_path=str(binaries[frozen_name]),
                                 binary_sha256=manifest["binaries"][frozen_name]["sha256"])
     return selected, provenance
@@ -454,6 +496,13 @@ def require_original_baseline(manifest):
     if actual != ORIGINAL_BASELINE_REVISION:
         raise ValueError("regression control requires frozen baseline " + ORIGINAL_BASELINE_REVISION
                          + "; build contains " + str(actual) + ". Create a new build with --baseline-revision 1352bf8.")
+
+
+def verify_variant_methods(manifest, method, baseline_method):
+    if manifest.get("candidate_variant", "working") != "original-multistate":
+        return
+    if method not in ("disabled", "multistate") or baseline_method != "disabled":
+        raise ValueError("original-multistate control supports only disabled/multistate with a disabled baseline")
 
 
 def compare(args):
@@ -472,8 +521,11 @@ def compare(args):
     (folder/"started").write_text("single-allocation, frozen two-binary comparison\n")
     manifest, frozen_binaries = verify_manifest(args.build_dir.resolve())
     baseline_binary = getattr(args, "baseline_binary", "baseline")
+    verify_variant_methods(manifest, args.method, baseline_method)
     binaries, provenance = comparison_binaries(manifest, frozen_binaries, baseline_binary)
     gate_provenance = dict(frozen_binary="gate", source_revision=manifest["candidate_revision"],
+                           source_variant=manifest.get("candidate_variant", "working"),
+                           base_revision=manifest.get("candidate_base_revision", manifest["candidate_revision"]),
                            source_snapshot="candidate-source/hw3", binary_path=str(frozen_binaries["gate"]),
                            binary_sha256=manifest["binaries"]["gate"]["sha256"])
     shutil.copyfile(args.build_dir/"manifest.json", folder/"build-manifest.json")
@@ -513,6 +565,8 @@ def compare(args):
           + " (frozen " + baseline_binary + " binary)", flush=True)
     print("Baseline flags: " + baseline_method + "; candidate flags: " + args.method, flush=True)
     print("Candidate build HEAD: " + manifest["candidate_revision"], flush=True)
+    print("Candidate source variant: " + manifest.get("candidate_variant", "working")
+          + "; base: " + manifest.get("candidate_base_revision", manifest["candidate_revision"]), flush=True)
     for role in ("baseline", "candidate"):
         print(f"{role.title()} binary SHA256: {provenance[role]['binary_sha256']}", flush=True)
     print("Reference gates use the frozen candidate-source test binary.", flush=True)
@@ -613,6 +667,8 @@ def main(argv=None):
     build = subparsers.add_parser("build", help="compile frozen baseline/candidate; no GPU work")
     build.add_argument("--build-dir", type=Path, required=True)
     build.add_argument("--baseline-revision", default=BASELINE_REVISION)
+    build.add_argument("--candidate-variant", choices=CANDIDATE_VARIANTS, default="working",
+                       help="original-multistate generates exact1352 plus dense multistate; keeps working production untouched")
     build.add_argument("--nvcc")
     run = subparsers.add_parser("compare", help="run only inside existing Slurm allocation")
     run.add_argument("--build-dir", type=Path, required=True)
