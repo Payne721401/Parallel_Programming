@@ -60,6 +60,17 @@ def same_fixed_source(left, right):
     return left.read_bytes().replace(b"\r\n", b"\n") == right.read_bytes().replace(b"\r\n", b"\n")
 
 
+def compile_flags(mode, host_compiler_exists):
+    """Keep judge builds free of optional cluster compiler/runtime overrides."""
+    if mode not in ("judge", "cluster"):
+        raise ValueError("unknown compiler mode: " + str(mode))
+    flags = ["-std=c++17", "-O3", "-arch=sm_90"]
+    if mode == "cluster" and host_compiler_exists:
+        flags += ["-ccbin", "/work/HPC_software/LMOD/gcc/12.5.0/bin/g++",
+                  "-Xcompiler", "-static-libstdc++,-static-libgcc"]
+    return flags
+
+
 def write_table(path, rows):
     if not rows:
         return
@@ -470,15 +481,15 @@ def prepare_build(args):
     nvcc = args.nvcc or ("/work/HPC_software/LMOD/nvidia/packages/cuda-12.4/bin/nvcc"
                         if Path("/work/HPC_software/LMOD/nvidia/packages/cuda-12.4/bin/nvcc").is_file()
                         else "nvcc")
-    flags = ["-std=c++17", "-O3", "-arch=sm_90"]
-    # Match the repository Makefile's Nano5 compiler/runtime selection for BOTH builds.
+    compiler_mode = getattr(args, "compiler_mode", "judge")
     host_compiler = Path("/work/HPC_software/LMOD/gcc/12.5.0/bin/g++")
-    if host_compiler.is_file():
-        flags += ["-ccbin", str(host_compiler), "-Xcompiler", "-static-libstdc++,-static-libgcc"]
+    flags = compile_flags(compiler_mode, host_compiler.is_file())
+    print("Compiler mode: " + compiler_mode, flush=True)
     capture([nvcc, "--version"], folder/"compiler-version.log", timeout=15)
     manifest = dict(baseline_revision=baseline_revision,
                     candidate_revision=(folder/"revision.log").read_text().strip(),
-                    source_hashes=extra_hashes, binaries={}, compile_commands=[], **variant_metadata)
+                    source_hashes=extra_hashes, binaries={}, compile_commands=[],
+                    compiler_mode=compiler_mode, **variant_metadata)
     for name, source in (("baseline", baseline_source), ("candidate", candidate_source)):
         for path in source_files(source):
             manifest["source_hashes"][str(path.relative_to(folder))] = sha256(path)
@@ -738,6 +749,8 @@ def main(argv=None):
     build.add_argument("--candidate-variant", choices=CANDIDATE_VARIANTS, default="working",
                        help="original-multistate generates exact1352 plus dense multistate; keeps working production untouched")
     build.add_argument("--nvcc")
+    build.add_argument("--compiler-mode", choices=("judge", "cluster"), default="judge",
+                       help="judge uses the official flags; cluster opts into GCC/static-runtime overrides")
     run = subparsers.add_parser("compare", help="run only inside existing Slurm allocation")
     run.add_argument("--build-dir", type=Path, required=True)
     run.add_argument("--outdir", type=Path, required=True)

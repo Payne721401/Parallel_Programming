@@ -2,17 +2,20 @@
 # main.cu, with exactly these flags. The judge does not read this Makefile; it compiles your
 # hw3-1.cu itself, against its own copy of main.cu and ca.hpp.
 #
-# On Nano5 it names CUDA 12.4 and gcc 12.5 by path, as the judge does, so it needs no module
-# loaded and builds the same on the login node and on a GPU node; elsewhere it takes the nvcc
-# on PATH and its default host compiler.
+# On Nano5 it names CUDA 12.4 by path. The observed judge uses nvcc's default
+# host compiler and runtime; COMPILER_MODE=cluster restores the older explicit
+# GCC/static-runtime experiment. Elsewhere it takes nvcc on PATH.
 CUDA_NVCC = /work/HPC_software/LMOD/nvidia/packages/cuda-12.4/bin/nvcc
 GXX       = /work/HPC_software/LMOD/gcc/12.5.0/bin/g++
 NVCC     ?= $(if $(wildcard $(CUDA_NVCC)),$(CUDA_NVCC),nvcc)
 NVCCFLAGS = -std=c++17 -O3 -arch=sm_90
+COMPILER_MODE ?= judge
 SPARSE_NEXT_HEADERS = r1_sparse_wide.hpp r1_sparse_wide.cuh sparse_moore_warp.hpp sparse_moore_warp.cuh sparse_output.hpp sparse_output.cuh
 GLOBAL_HEADERS = r1_multistate.hpp r1_multistate.cuh r1_sparse_bits.cuh rolling_filters.hpp rolling_filters.cuh device_arena.hpp device_storage.cuh $(SPARSE_NEXT_HEADERS)
+ifeq ($(COMPILER_MODE),cluster)
 ifneq ($(wildcard $(GXX)),)
 NVCCFLAGS += -ccbin $(GXX) -Xcompiler -static-libstdc++,-static-libgcc
+endif
 endif
 
 hw3-1: main.cu hw3-1.cu ca.hpp tile_geometry.hpp r1_packed.hpp r1_bits.hpp r1_bitplane.cuh evolution_diag.cuh arch_stats.cuh r1_warp.cuh vn_diagonal.hpp vn_diagonal.cuh $(GLOBAL_HEADERS)
