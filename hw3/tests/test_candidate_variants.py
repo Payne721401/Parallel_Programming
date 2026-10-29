@@ -75,6 +75,46 @@ class CandidateVariantTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'supports only'):
                 verify_variant_methods(manifest, method, baseline)
         verify_variant_methods({}, 'combined', 'combined')
+        arena = dict(candidate_variant='original-multistate-arena')
+        verify_variant_methods(arena, 'multistate-arena', 'multistate', 'candidate')
+        with self.assertRaisesRegex(ValueError, '--baseline-binary candidate'):
+            verify_variant_methods(arena, 'multistate-arena', 'multistate')
+        with self.assertRaisesRegex(ValueError, '--baseline-method multistate'):
+            verify_variant_methods(arena, 'multistate-arena', 'disabled', 'candidate')
+        with self.assertRaisesRegex(ValueError, 'only supports'):
+            verify_variant_methods(arena, 'sparse-next', 'multistate')
+
+    def test_arena_variant_freezes_both_transforms_and_preserves_host_headers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            baseline, candidate, scripts = (folder/name for name in ('baseline', 'candidate', 'scripts'))
+            for path in (baseline, candidate, scripts):
+                path.mkdir()
+            (baseline/'hw3-1.cu').write_bytes(b'original\n')
+            for name in ('r1_multistate.hpp', 'r1_multistate.cuh', 'device_arena.hpp', 'device_storage.cuh'):
+                (candidate/name).write_text('current '+name+'\n')
+            for name in ('lean_multistate_source.py', 'arena_source.py'):
+                (scripts/name).write_text('fixture '+name+'\n')
+            calls = []
+            def multistate(source):
+                calls.append(('multistate', source))
+                return source+b'multistate\n'
+            def arena(source):
+                calls.append(('arena', source))
+                return source+b'arena\n'
+            modules = dict(lean_multistate_source=SimpleNamespace(transform_original_multistate=multistate, TRANSFORMER_VERSION=1),
+                           arena_source=SimpleNamespace(transform_multistate_arena=arena, TRANSFORMER_VERSION=1))
+            with patch.dict(sys.modules, modules), patch('global_compare.__file__', str(scripts/'global_compare.py')):
+                metadata, hashes = prepare_candidate_variant('original-multistate-arena', folder, baseline,
+                                                             candidate, ORIGINAL_BASELINE_REVISION)
+            self.assertEqual(calls, [('multistate', b'original\n'), ('arena', b'original\nmultistate\n')])
+            self.assertEqual((candidate/'hw3-1.cu').read_bytes(), b'original\nmultistate\narena\n')
+            self.assertEqual(metadata['candidate_variant'], 'original-multistate-arena')
+            self.assertEqual(metadata['arena_source_transformer_version'], 1)
+            self.assertEqual(set(hashes), {'source-transformer.py', 'arena-source-transformer.py', 'candidate-source.patch'})
+            self.assertTrue(all(sha256(folder/name) == digest for name, digest in hashes.items()))
+            self.assertIn('+arena', (folder/'candidate-source.patch').read_text())
+            self.assertIn('current', (candidate/'device_storage.cuh').read_text())
 
 
 if __name__ == '__main__':

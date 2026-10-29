@@ -10,7 +10,7 @@ GXX       = /work/HPC_software/LMOD/gcc/12.5.0/bin/g++
 NVCC     ?= $(if $(wildcard $(CUDA_NVCC)),$(CUDA_NVCC),nvcc)
 NVCCFLAGS = -std=c++17 -O3 -arch=sm_90
 SPARSE_NEXT_HEADERS = r1_sparse_wide.hpp r1_sparse_wide.cuh sparse_moore_warp.hpp sparse_moore_warp.cuh sparse_output.hpp sparse_output.cuh
-GLOBAL_HEADERS = r1_multistate.hpp r1_multistate.cuh r1_sparse_bits.cuh rolling_filters.hpp rolling_filters.cuh $(SPARSE_NEXT_HEADERS)
+GLOBAL_HEADERS = r1_multistate.hpp r1_multistate.cuh r1_sparse_bits.cuh rolling_filters.hpp rolling_filters.cuh device_arena.hpp device_storage.cuh $(SPARSE_NEXT_HEADERS)
 ifneq ($(wildcard $(GXX)),)
 NVCCFLAGS += -ccbin $(GXX) -Xcompiler -static-libstdc++,-static-libgcc
 endif

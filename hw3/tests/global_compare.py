@@ -27,6 +27,7 @@ from run_cases import PROFILE_TIMES, run_cases
 BASELINE_REVISION = "1352bf8"
 ORIGINAL_BASELINE_REVISION = "1352bf87dad753b317915a17b436be2fce329804"
 FEATURES = {"disabled": (), "multistate": ("PP_MULTISTATE",), "rolling": ("PP_ROLLING",),
+            "multistate-arena": ("PP_MULTISTATE", "PP_ARENA"),
             "sparse-bits": ("PP_SPARSE_BITS",),
             "combined": ("PP_MULTISTATE", "PP_ROLLING", "PP_SPARSE_BITS")}
 OLD_FEATURES = FEATURES["combined"]
@@ -42,10 +43,11 @@ GROUPS = {"target": tuple(f"{i:02d}" for i in range(4, 13)),
           "large": ("04", "05", "06", "07"), "sparse": ("08", "09", "10"),
           "multistate": ("08", "10", "12"), "sparse-bits": ("08", "10")}
 SOURCE_SUFFIXES = {".cu", ".cuh", ".hpp", ".h"}
-CANDIDATE_VARIANTS = ("working", "original-multistate")
+CANDIDATE_VARIANTS = ("working", "original-multistate", "original-multistate-arena")
 GATE_COUNTS = {"--quick": 22, "--multistate": 384, "--rolling": 128,
                "--sparse-bits": 136, "--sparse": 30, "--support": 28,
-               "--sparse-warp": 32, "--sparse-wide": 200, "--sparse-pageable": 30}
+               "--sparse-warp": 32, "--sparse-wide": 200, "--sparse-pageable": 30,
+               "--bitplane": 452, "--graphs": 38}
 
 
 def sha256(path):
@@ -100,7 +102,7 @@ def configure(method, candidate, profiled=False, baseline_method="disabled", **o
                       PP_PROFILE=str(int(profiled)), PP_SUPPORT="bbox",
                       PP_BITPLANE="auto", PP_BIT_LOGIC="compact", PP_BIT_ROWS="4",
                       PP_MULTISTATE="0", PP_ROLLING="0", PP_SPARSE_BITS="0",
-                      PP_SPARSE_WARP="0", PP_SPARSE_WIDE="0", PP_SPARSE_OUTPUT="0")
+                      PP_SPARSE_WARP="0", PP_SPARSE_WIDE="0", PP_SPARSE_OUTPUT="0", PP_ARENA="0")
     selected = method if candidate else baseline_method
     if selected != "disabled":
         os.environ.update({key: "1" for key in FEATURES[selected]})
@@ -210,16 +212,44 @@ def verify_sparse_next(text, configured, kernel, cells=None):
     return {"sparse_next_"+key: value for key, value in fields.items()}
 
 
+def verify_memory(text, configured, kernel):
+    lines = [line for line in text.splitlines() if line.startswith("[PP_MEMORY] ")]
+    requested = configured.get("PP_ARENA", "0")
+    if not lines and requested == "0":
+        return {"memory_arena_selected": "0"}
+    if len(lines) != 1:
+        raise ValueError("expected exactly one PP_MEMORY record")
+    tokens = [token.split("=", 1) for token in lines[0].split()[1:]]
+    fields = dict(tokens)
+    keys = {"arena_requested", "arena_selected", "arena_bytes", "storage_allocations", "storage_frees"}
+    if set(fields) != keys or len(tokens) != len(keys):
+        raise ValueError("invalid memory ownership fields")
+    selected = str(int(requested == "1" and kernel != "none"))
+    if fields["arena_requested"] != requested or fields["arena_selected"] != selected:
+        raise ValueError("memory arena dispatch disagrees with requested flags/kernel")
+    arena_bytes = unsigned_integer(fields["arena_bytes"])
+    allocations, releases = (unsigned_integer(fields[key]) for key in ("storage_allocations", "storage_frees"))
+    if selected == "1":
+        if not arena_bytes or arena_bytes % 256 or allocations != 1 or releases != 1:
+            raise ValueError("arena must have one owner allocation and release with aligned capacity")
+    elif arena_bytes or allocations != releases or allocations not in ((0,) if kernel == "none" else (2, 8)):
+        raise ValueError("invalid legacy/zero-step storage ownership")
+    return {"memory_"+key: value for key, value in fields.items()}
+
+
 def verify_gate_dispatch(text, configured, count, feature=None, zero_feature=None):
     profiles = [line for line in text.splitlines() if line.startswith("[PP_PROFILE] ")]
     dispatch = [line for line in text.splitlines() if line.startswith("[PP_GLOBAL] ")]
     next_dispatch = [line for line in text.splitlines() if line.startswith("[PP_SPARSE_NEXT] ")]
+    memory_dispatch = [line for line in text.splitlines() if line.startswith("[PP_MEMORY] ")]
     if len(profiles) != count or len(dispatch) != count:
         raise ValueError("CPU gate dispatch/profile record counts differ from case count")
     if next_dispatch and len(next_dispatch) != count:
         raise ValueError("CPU gate sparse-next record count differs from case count")
+    if (memory_dispatch or configured.get("PP_ARENA") == "1") and len(memory_dispatch) != count:
+        raise ValueError("CPU gate memory record count differs from case count")
     selected = {name+"_selected_cases": 0 for name in
-                ("multistate", "rolling", "sparse_bits", "sparse_warp", "sparse_wide", "sparse_output")}
+                ("multistate", "rolling", "sparse_bits", "sparse_warp", "sparse_wide", "sparse_output", "arena")}
     for index, (profile, record) in enumerate(zip(profiles, dispatch)):
         parsed = profile_fields(profile)
         kernel = parsed["profile_kernel"]
@@ -228,6 +258,8 @@ def verify_gate_dispatch(text, configured, count, feature=None, zero_feature=Non
             selected[name] += int(fields["global_"+name.replace("_cases", "")])
         fields = verify_sparse_next(next_dispatch[index] if next_dispatch else "", configured,
                                     kernel, parsed.get("profile_cells"))
+        memory = verify_memory(memory_dispatch[index] if memory_dispatch else "", configured, kernel)
+        selected["arena_selected_cases"] += int(memory["memory_arena_selected"])
         for name in ("warp", "wide", "output"):
             selected["sparse_"+name+"_selected_cases"] += int(fields["sparse_next_"+name+"_selected"])
     if feature and selected[feature+"_selected_cases"] == 0:
@@ -245,8 +277,13 @@ def gate_plan(method, baseline_method="disabled"):
     if baseline_method != "disabled":
         add("--quick", "baseline")
     add("--quick")
-    if method in ("multistate", "combined"):
+    if method in ("multistate", "multistate-arena", "combined"):
         add("--multistate", required="multistate", PP_ACTIVE="0")
+    if method == "multistate-arena":
+        add("--sparse", required="arena", PP_ACTIVE="1")
+        add("--bitplane", required="arena", PP_ACTIVE="0", PP_BITPLANE="1")
+        add("--graphs", required="arena", PP_ACTIVE="0", PP_GRAPH="1")
+        add("--graphs", required="arena", PP_ACTIVE="1", PP_GRAPH="1")
     if method in ("rolling", "combined"):
         add("--rolling", required="rolling", PP_ACTIVE="0")
         add("--rolling", required="rolling", PP_ACTIVE="1")
@@ -372,7 +409,25 @@ def prepare_candidate_variant(variant, folder, baseline_source, candidate_source
                     source_transformer_version=TRANSFORMER_VERSION,
                     source_transformer_path=frozen_transformer.name,
                     source_transformer_sha256=sha256(frozen_transformer))
-    return metadata, {path.name: sha256(path) for path in (frozen_transformer, source_diff)}
+    hashes = {path.name: sha256(path) for path in (frozen_transformer, source_diff)}
+    if variant == "original-multistate-arena":
+        from arena_source import transform_multistate_arena, TRANSFORMER_VERSION as ARENA_VERSION
+        for name in ("device_arena.hpp", "device_storage.cuh"):
+            if not (candidate_source/name).is_file():
+                raise ValueError("missing arena header: " + name)
+        transformed = transform_multistate_arena(transformed)
+        (candidate_source/"hw3-1.cu").write_bytes(transformed)
+        arena_transformer = folder/"arena-source-transformer.py"
+        shutil.copyfile(Path(__file__).with_name("arena_source.py"), arena_transformer)
+        hashes[arena_transformer.name] = sha256(arena_transformer)
+        source_diff.write_text("".join(difflib.unified_diff(
+            original.decode().splitlines(keepends=True), transformed.decode().splitlines(keepends=True),
+            fromfile="1352bf8/hw3-1.cu", tofile="original-multistate-arena/hw3-1.cu")), encoding="utf-8")
+        hashes[source_diff.name] = sha256(source_diff)
+        metadata.update(arena_source_transformer_version=ARENA_VERSION,
+                        arena_source_transformer_path=arena_transformer.name,
+                        arena_source_transformer_sha256=hashes[arena_transformer.name])
+    return metadata, hashes
 
 
 def prepare_build(args):
@@ -498,8 +553,17 @@ def require_original_baseline(manifest):
                          + "; build contains " + str(actual) + ". Create a new build with --baseline-revision 1352bf8.")
 
 
-def verify_variant_methods(manifest, method, baseline_method):
-    if manifest.get("candidate_variant", "working") != "original-multistate":
+def verify_variant_methods(manifest, method, baseline_method, baseline_binary="baseline"):
+    variant = manifest.get("candidate_variant", "working")
+    if variant == "original-multistate-arena":
+        if method not in ("disabled", "multistate", "multistate-arena") or baseline_method not in ("disabled", "multistate"):
+            raise ValueError("original-multistate-arena only supports multistate/arena controls")
+        if baseline_method == "multistate" and baseline_binary != "candidate":
+            raise ValueError("arena control requires --baseline-binary candidate for a multistate baseline")
+        if method == "multistate-arena" and baseline_method != "multistate":
+            raise ValueError("arena control requires --baseline-method multistate to keep generation kernels identical")
+        return
+    if variant != "original-multistate":
         return
     if method not in ("disabled", "multistate") or baseline_method != "disabled":
         raise ValueError("original-multistate control supports only disabled/multistate with a disabled baseline")
@@ -521,7 +585,7 @@ def compare(args):
     (folder/"started").write_text("single-allocation, frozen two-binary comparison\n")
     manifest, frozen_binaries = verify_manifest(args.build_dir.resolve())
     baseline_binary = getattr(args, "baseline_binary", "baseline")
-    verify_variant_methods(manifest, args.method, baseline_method)
+    verify_variant_methods(manifest, args.method, baseline_method, baseline_binary)
     binaries, provenance = comparison_binaries(manifest, frozen_binaries, baseline_binary)
     gate_provenance = dict(frozen_binary="gate", source_revision=manifest["candidate_revision"],
                            source_variant=manifest.get("candidate_variant", "working"),
@@ -628,11 +692,15 @@ def compare(args):
                             row.update(verify_global(raw, configured, row["profile_kernel"]))
                             row.update(verify_sparse_next(raw, configured, row["profile_kernel"],
                                                           row.get("profile_cells")))
+                            row.update(verify_memory(raw, configured, row["profile_kernel"]))
+                            memory_record = next((line for line in raw.splitlines() if line.startswith("[PP_MEMORY] ")), None)
+                            if memory_record:
+                                print(f"  Case {case}: {memory_record}", flush=True)
                             if method == "candidate" and any(configured[key] == "1" for key in NEXT_FEATURES):
                                 dispatch = next(line for line in raw.splitlines()
                                                 if line.startswith("[PP_SPARSE_NEXT] "))
                                 print(f"  Case {case}: {dispatch}", flush=True)
-                    elif row["profile_status"] != "absent":
+                    elif row["profile_status"] != "absent" or "[PP_MEMORY]" in raw:
                         raise ValueError("instrumentation in unprofiled timing round")
                     sample = dict(round=round_number, block=block, slot=slot, position=position,
                                   method=method, profiled=int(profiled), case_id=case,

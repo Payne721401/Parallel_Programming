@@ -12,6 +12,7 @@
 // r1shared keeps the shared tile and reuses two adjacent output rows in registers.
 // PP_MULTISTATE=1, PP_SPARSE_BITS=1 and PP_ROLLING=1 enable new opt-in kernels.
 // PP_SPARSE_WARP=1, PP_SPARSE_WIDE=1, PP_SPARSE_OUTPUT=1: opt-in sparse follow-ups.
+// PP_ARENA=1 combines run grids/queue storage into one owned device allocation.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -32,6 +33,7 @@
 #include "r1_sparse_wide.hpp"
 #include "sparse_moore_warp.hpp"
 #include "sparse_output.hpp"
+#include "device_arena.hpp"
 
 namespace {
 
@@ -782,6 +784,7 @@ struct SparseWorkspace {
     }
 };
 
+#include "device_storage.cuh"
 #include "r1_sparse_bits.cuh"
 #include "r1_sparse_wide.cuh"
 #include "sparse_moore_warp.cuh"
@@ -796,6 +799,7 @@ void run(uint8_t *grid, const Problem &p) {
     BitplaneExperiment bitplane(p);
     GlobalExperiments global;
     SparseExperiments next_sparse;
+    RunStorage storage;
     const char *support_mode = std::getenv("PP_SUPPORT");
     const bool tight_support = support_mode ? std::strcmp(support_mode, "bbox") == 0 : !evolution.enabled;
     if (support_mode && !tight_support && std::strcmp(support_mode, "tile") != 0) {
@@ -837,6 +841,7 @@ void run(uint8_t *grid, const Problem &p) {
         global.report(profile.enabled);
         if (next_sparse.output_requested) next_sparse.output_reason = "zero_steps";
         next_sparse.report(profile.enabled);
+        storage.report(profile.enabled);
         if (profile.enabled)
             std::fprintf(stderr, "[PP_ARCH] mode=%s merged=0 r1_warp=0 vn_diagonal=0 r1_shared=0\n", arch_mode);
         return;
@@ -901,11 +906,24 @@ void run(uint8_t *grid, const Problem &p) {
     SparseWorkspace &sparse_work = wide_eligible ? static_cast<SparseWorkspace &>(wide_work) : narrow_work;
     uint8_t *src = nullptr, *dst = nullptr;
     const auto alloc_start = profile.enabled ? PhaseProfile::Clock::now() : PhaseProfile::Clock::time_point{};
-    check(cudaMalloc(&src, allocation_bytes), "allocate source");
-    check(cudaMalloc(&dst, allocation_bytes), "allocate destination");
-    if (inspect_sparse) {
-        if (wide_eligible) wide_work.allocate(p, profile.enabled);
-        else narrow_work.allocate(p, profile.enabled);
+    if (storage.requested) {
+        const int workspace_width = wide_eligible ? r1_sparse_wide::width : TILE_W;
+        const int workspace_height = wide_eligible ? r1_sparse_wide::height : TILE_H;
+        const size_t workspace_tiles = inspect_sparse
+            ? size_t((p.width + workspace_width - 1) / workspace_width)
+                * size_t((p.height + workspace_height - 1) / workspace_height) : 0;
+        storage.allocate(allocation_bytes, inspect_sparse, workspace_tiles, profile.enabled);
+        src = storage.pointer<uint8_t>(storage.layout.src);
+        dst = storage.pointer<uint8_t>(storage.layout.dst);
+        if (inspect_sparse) storage.bind_sparse(sparse_work, p, workspace_width, workspace_height);
+    } else {
+        check(cudaMalloc(&src, allocation_bytes), "allocate source");
+        check(cudaMalloc(&dst, allocation_bytes), "allocate destination");
+        if (inspect_sparse) {
+            if (wide_eligible) wide_work.allocate(p, profile.enabled);
+            else narrow_work.allocate(p, profile.enabled);
+        }
+        storage.allocation_calls = 2 + (inspect_sparse ? 5 + int(profile.enabled) : 0);
     }
     if (profile.enabled) profile.alloc_host_ms = PhaseProfile::elapsed_ms(alloc_start);
     profile.prepare();
@@ -1187,9 +1205,16 @@ void run(uint8_t *grid, const Problem &p) {
     if (executable) check(cudaGraphExecDestroy(executable), "destroy executable graph");
     if (graph) check(cudaGraphDestroy(graph), "destroy generation graph");
     if (stream) check(cudaStreamDestroy(stream), "destroy graph stream");
-    check(cudaFree(dst), "free destination");
-    check(cudaFree(src), "free source");
-    sparse_work.release();
+    if (storage.selected) {
+        // Grid and workspace pointers are borrowed slices, including after swaps.
+        // Graphs, diagnostics and final host output are finished before the owner.
+        storage.release();
+    } else {
+        check(cudaFree(dst), "free destination");
+        check(cudaFree(src), "free source");
+        sparse_work.release();
+        storage.release_calls = storage.allocation_calls;
+    }
     if (profile.enabled) profile.free_host_ms = PhaseProfile::elapsed_ms(free_start);
     profile.report(next_sparse.wide_selected ? "sparse_wide" : next_sparse.warp_selected ? "sparse_warp"
                          : global.sparse_bits_selected ? "sparse_bits" : global.multistate_selected ? "dense_multistate"
@@ -1199,6 +1224,7 @@ void run(uint8_t *grid, const Problem &p) {
     bitplane.report(profile.enabled);
     global.report(profile.enabled);
     next_sparse.report(profile.enabled);
+    storage.report(profile.enabled);
     if (profile.enabled)
         std::fprintf(stderr,
             "[PP_GRAPH] requested=%d selected=%d batch=%d replays=%d tail=%d build_host_ms=%.6f\n",

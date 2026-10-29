@@ -24,6 +24,7 @@ case "$mode" in
     echo 'Other methods: disabled|combined|multistate|rolling|sparse-bits|sparse-warp|sparse-wide|sparse-output; use --cases 01-12 for all cases.' >&2
     echo 'Use --baseline-binary candidate to compare flags in the exact same frozen candidate binary.' >&2
     echo 'Lean control build: add --candidate-variant original-multistate --baseline-revision 1352bf8.' >&2
+    echo 'Arena control: original-multistate-arena build, --method multistate-arena --baseline-method multistate --baseline-binary candidate.' >&2
     exit 2
     ;;
 esac

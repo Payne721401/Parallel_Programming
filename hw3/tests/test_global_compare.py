@@ -13,7 +13,7 @@ from unittest.mock import patch
 from global_compare import (GATE_COUNTS, case_selection, compare, configure, phase_summary, profile_fields,
                             sha256, summarize, validate_gate, verify_global, verify_manifest)
 from global_compare import (ORIGINAL_BASELINE_REVISION, comparison_binaries, gate_plan, require_original_baseline,
-                            same_fixed_source, verify_gate_dispatch, verify_sparse_next)
+                            same_fixed_source, verify_gate_dispatch, verify_sparse_next, verify_memory)
 from run_cases import PROFILE_TIMES, parse_profile
 
 
@@ -69,6 +69,35 @@ class GlobalComparisonTests(unittest.TestCase):
             self.assertTrue(all(env[name] == "0" for name in features))
             self.assertEqual([item["option"] for item in gate_plan("disabled")],
                              ["--quick", "--quick"])
+
+    def test_arena_method_keeps_kernels_and_exercises_storage_lifetimes(self):
+        with patch.dict(os.environ):
+            before = configure("multistate-arena", False, baseline_method="multistate")
+            after = configure("multistate-arena", True, baseline_method="multistate")
+            self.assertEqual({key for key in before if before[key] != after[key]}, {"PP_ARENA"})
+            self.assertEqual((before["PP_MULTISTATE"], after["PP_MULTISTATE"]), ("1", "1"))
+            plan = gate_plan("multistate-arena", "multistate")
+            self.assertIn("--multistate", [item["option"] for item in plan])
+            self.assertIn("--bitplane", [item["option"] for item in plan])
+            graphs = [item for item in plan if item["option"] == "--graphs"]
+            self.assertEqual({item["overrides"]["PP_ACTIVE"] for item in graphs}, {"0", "1"})
+            self.assertTrue(all(item["overrides"]["PP_GRAPH"] == "1" for item in graphs))
+
+    def test_arena_dispatch_requires_one_aligned_owner_and_rejects_missing_or_double_release(self):
+        with patch.dict(os.environ):
+            env = configure("multistate-arena", True, True)
+            record = "[PP_MEMORY] arena_requested=1 arena_selected=1 arena_bytes=2048 storage_allocations=1 storage_frees=1"
+            self.assertEqual(verify_memory(record, env, "dense_multistate")["memory_arena_selected"], "1")
+            for invalid in ("", record+"\n"+record, record.replace("storage_frees=1", "storage_frees=2"),
+                            record.replace("arena_bytes=2048", "arena_bytes=2049"),
+                            record.replace("arena_selected=1", "arena_selected=0")):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    verify_memory(invalid, env, "dense_multistate")
+            zero = record.replace("arena_selected=1", "arena_selected=0").replace("arena_bytes=2048", "arena_bytes=0")
+            zero = zero.replace("storage_allocations=1", "storage_allocations=0").replace("storage_frees=1", "storage_frees=0")
+            self.assertEqual(verify_memory(zero, env, "none")["memory_arena_selected"], "0")
+            disabled = configure("multistate", True, True)
+            self.assertEqual(verify_memory("", disabled, "dense_multistate")["memory_arena_selected"], "0")
 
     def test_baseline_binary_alias_preserves_frozen_manifest_and_records_real_source(self):
         manifest = dict(baseline_revision="old", candidate_revision="new", binaries={
@@ -321,6 +350,10 @@ class GlobalComparisonTests(unittest.TestCase):
                 result += f" output_reason={reason} clear_bytes={64 if output_selected else 0} "
                 result += f"scatter_bytes={128 if output_selected else 0} "
                 result += "tile_w=256 tile_h=16\n" if kernel == "sparse_wide" else "tile_w=64 tile_h=32\n"
+            arena = os.environ.get("PP_ARENA", "0")
+            count = 1 if arena == "1" else 2
+            result += f"[PP_MEMORY] arena_requested={arena} arena_selected={arena} arena_bytes={2048 if arena == '1' else 0} "
+            result += f"storage_allocations={count} storage_frees={count}\n"
             return result
         def fake_capture(argv, log, **unused):
             count = GATE_COUNTS.get(argv[1], 0)
@@ -473,6 +506,21 @@ class GlobalComparisonTests(unittest.TestCase):
             console = (Path(temp)/"captured-console.log").read_text()
             self.assertIn("Baseline: new (frozen candidate binary)", console)
             self.assertNotIn("Baseline: old", console)
+
+    def test_arena_pipeline_changes_only_allocator_in_exact_same_binary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            results = self.run_fake_comparison(Path(temp), method="multistate-arena", baseline_method="multistate",
+                                               baseline_binary="candidate")
+            self.assertTrue((results/"COMPLETE").is_file())
+            envs = json.loads((results/"effective-environments.json").read_text())
+            rounds = [item for item in envs if item["kind"] == "round"]
+            for item in rounds:
+                self.assertEqual(item["env"]["PP_MULTISTATE"], "1")
+                self.assertEqual(item["env"]["PP_ARENA"], str(int(item["method"] == "candidate")))
+            with (results/"samples.tsv").open(newline="") as stream:
+                profiled = [row for row in csv.DictReader(stream, delimiter="\t") if row["profiled"] == "1"]
+            self.assertEqual({row["memory_arena_selected"] for row in profiled if row["method"] == "candidate"}, {"1"})
+            self.assertEqual({row["memory_arena_selected"] for row in profiled if row["method"] == "baseline"}, {"0"})
 
 
 if __name__ == "__main__":
