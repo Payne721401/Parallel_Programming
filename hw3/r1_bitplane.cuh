@@ -102,16 +102,12 @@ struct BitplaneExperiment {
             std::fprintf(stderr,"hw3-1: PP_BITPLANE must be auto, 0 or 1\n"); std::exit(EXIT_FAILURE);
         }
         const char *r = std::getenv("PP_BIT_ROWS");
-        if (r && std::strcmp(r,"1")==0) rows=1;
-        else if (r && std::strcmp(r,"2")==0) rows=2;
-        else if (r && std::strcmp(r,"4")!=0) {
-            std::fprintf(stderr,"hw3-1: PP_BIT_ROWS must be 1, 2 or 4\n"); std::exit(EXIT_FAILURE);
+        if (r && std::strcmp(r,"4")!=0) {
+            std::fprintf(stderr,"hw3-1: only PP_BIT_ROWS=4 remains in this build; unset PP_BIT_ROWS\n"); std::exit(EXIT_FAILURE);
         }
         const char *logic = std::getenv("PP_BIT_LOGIC");
-        if (logic && std::strcmp(logic,"compact")==0) compact=true;
-        else if (logic && std::strcmp(logic,"reference")==0) compact=false;
-        else if (logic && std::strcmp(logic,"reference")!=0) {
-            std::fprintf(stderr,"hw3-1: PP_BIT_LOGIC must be reference or compact\n"); std::exit(EXIT_FAILURE);
+        if (logic && std::strcmp(logic,"compact")!=0) {
+            std::fprintf(stderr,"hw3-1: only PP_BIT_LOGIC=compact remains in this build; unset PP_BIT_LOGIC\n"); std::exit(EXIT_FAILURE);
         }
     }
     void prepare(bool profile) {

@@ -20,9 +20,14 @@ class DefaultDispatchTests(unittest.TestCase):
         end = live.index("static EagerModuleLoading eager_module_loading;", start)
         startup = live[start:end + len("static EagerModuleLoading eager_module_loading;")]
         classes = []
-        for name in ("GlobalExperiments", "SparseExperiments"):
+        for name in ("GlobalExperiments",):
             begin = live.index("struct " + name + " {")
             classes.append(live[begin:live.index("\n};", begin) + 4])
+        begin = live.index("void reject_retired_experiments() {")
+        retired = live[begin:live.index("\n}", begin) + 2]
+        bits = (root / "r1_bitplane.cuh").read_text(encoding="utf-8")
+        begin = bits.index("struct BitplaneExperiment {")
+        classes.append(bits[begin:bits.index("\n};", begin) + 4])
         cls.temp = tempfile.TemporaryDirectory(prefix="hw3-live-defaults-")
         cls.addClassCleanup(cls.temp.cleanup)
         folder = Path(cls.temp.name)
@@ -36,6 +41,14 @@ class DefaultDispatchTests(unittest.TestCase):
 #include <cstring>
 #include "ca.hpp"
 #include "tile_geometry.hpp"
+#include "r1_bits.hpp"
+using cudaEvent_t = void*;
+void check(int, const char*);
+int cudaEventCreate(cudaEvent_t*);
+int cudaEventRecord(cudaEvent_t, int);
+int cudaEventSynchronize(cudaEvent_t);
+int cudaEventElapsedTime(float*, cudaEvent_t, cudaEvent_t);
+int cudaEventDestroy(cudaEvent_t);
 #ifdef _WIN32
 static int host_setenv(const char *name, const char *value, int overwrite) {
     if (!overwrite && std::getenv(name)) return 0;
@@ -43,7 +56,7 @@ static int host_setenv(const char *name, const char *value, int overwrite) {
 }
 #define setenv host_setenv
 #endif
-''' + startup + "\n" + "\n".join(classes) + r'''
+''' + startup + "\n" + "\n".join(classes) + "\n" + retired + r'''
 int main(int argc, char **argv) {
     if (argc != 6) return 2;
     Problem p{};
@@ -51,18 +64,20 @@ int main(int argc, char **argv) {
     p.steps = std::atoi(argv[3]); p.rule.radius = std::atoi(argv[4]);
     p.rule.states = std::atoi(argv[5]);
     GlobalExperiments global(p);
-    SparseExperiments followup;
+    reject_retired_experiments();
+    BitplaneExperiment bitplane(p);
     const char *loading = std::getenv("CUDA_MODULE_LOADING");
-    std::printf("%s %d %d %d %d %d %d\n", loading ? loading : "unset",
+    std::printf("%s %d %d %d %d %d\n", loading ? loading : "unset",
         int(global.multistate_requested), int(global.rolling_requested),
-        int(global.sparse_bits_requested), int(followup.warp_requested),
-        int(followup.wide_requested), int(followup.output_requested));
+        int(global.sparse_bits_requested), bitplane.rows, int(bitplane.compact));
 }
 ''', encoding="utf-8")
         cls.binary = folder / ("defaults.exe" if os.name == "nt" else "defaults")
-        subprocess.run([compiler, "-std=c++17", "-O2", "-static-libstdc++", "-static-libgcc",
-                        "-I", str(root), str(source), "-o", str(cls.binary)],
-                       check=True, capture_output=True, text=True, timeout=30)
+        result = subprocess.run([compiler, "-std=c++17", "-O2", "-static-libstdc++", "-static-libgcc",
+                                 "-I", str(root), str(source), "-o", str(cls.binary)],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise RuntimeError(result.stdout + result.stderr)
 
     def policy(self, problem, overrides=None):
         env = {key: value for key, value in os.environ.items()
@@ -76,7 +91,7 @@ int main(int argc, char **argv) {
         self.assertEqual(result.returncode, 0, result.stderr)
         values = result.stdout.split()
         self.assertEqual(values[0], loading)
-        self.assertEqual(tuple(map(int, values[1:])), (*expected, 0, 0, 0))
+        self.assertEqual(tuple(map(int, values[1:])), (*expected, 4, 1))
 
     def test_small_or_short_r1_retains_original_defaults(self):
         for states in (2, 3, 4, 8, 16):
@@ -121,6 +136,20 @@ int main(int argc, char **argv) {
         self.assert_policy((65, 65, 7, 1, 4), (0, 0, 0))
         self.assert_policy((65, 65, 7, 1, 4), (0, 0, 0),
                            {"CUDA_MODULE_LOADING": "LAZY"}, loading="LAZY")
+
+    def test_retired_overrides_are_rejected_instead_of_silently_running_baseline(self):
+        for flag in ("PP_GRAPH", "PP_ARENA", "PP_SPARSE_WARP", "PP_SPARSE_WIDE",
+                     "PP_SPARSE_OUTPUT", "PP_ARCH", "PP_BIT_ROWS", "PP_BIT_LOGIC"):
+            value = {"PP_ARCH": "r1shared", "PP_BIT_ROWS": "2",
+                     "PP_BIT_LOGIC": "reference"}.get(flag, "1")
+            with self.subTest(flag=flag):
+                result = self.policy((65, 65, 7, 1, 4), {flag: value})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(flag, result.stderr)
+        defaults = {flag: "0" for flag in ("PP_GRAPH", "PP_ARENA", "PP_SPARSE_WARP",
+                                           "PP_SPARSE_WIDE", "PP_SPARSE_OUTPUT")}
+        defaults.update(PP_ARCH="baseline", PP_BIT_ROWS="4", PP_BIT_LOGIC="compact")
+        self.assert_policy((65, 65, 7, 1, 4), (0, 0, 0), defaults)
 
 
 if __name__ == "__main__":
