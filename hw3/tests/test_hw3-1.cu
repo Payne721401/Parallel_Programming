@@ -22,11 +22,14 @@ static void check(cudaError_t e) {
 }
 
 static int tested = 0;
+static bool pageable_actual = false;
 static void compare(const Problem &p, const std::vector<uint8_t> &initial) {
     std::vector<uint8_t> expected = initial;
     run_reference(expected.data(), p);
     uint8_t *actual = nullptr;
-    check(cudaMallocHost(&actual, initial.size()));
+    std::vector<uint8_t> pageable;
+    if (pageable_actual) { pageable.resize(initial.size()); actual = pageable.data(); }
+    else check(cudaMallocHost(&actual, initial.size()));
     std::copy(initial.begin(), initial.end(), actual);
     run(actual, p);
     check(cudaDeviceSynchronize());
@@ -44,7 +47,7 @@ static void compare(const Problem &p, const std::vector<uint8_t> &initial) {
             std::exit(1);
         }
     }
-    check(cudaFreeHost(actual));
+    if (!pageable_actual) check(cudaFreeHost(actual));
     ++tested;
 }
 
@@ -375,7 +378,7 @@ static void rolling_checks(std::mt19937 &rng) {
     std::printf("PASS %d/%d (rolling Moore/VN R1..32, extended halos and partial tiles)\n",tested,tested);
 }
 
-static void sparse_bit_checks(std::mt19937 &rng) {
+static void sparse_bit_checks(std::mt19937 &rng, bool report = true) {
     for (int width : {3,31,33,65,129,321,641,1025})
     for (int states : {2,3,4,16})
     for (Boundary boundary : {Boundary::Dead,Boundary::Torus})
@@ -408,7 +411,55 @@ static void sparse_bit_checks(std::mt19937 &rng) {
         }
         compare(p,initial);
     }
-    std::printf("PASS %d/%d (sparse bits, decay, stale cleanup, motion and dense growth)\n",tested,tested);
+    if (report) std::printf("PASS %d/%d (sparse bits, decay, stale cleanup, motion and dense growth)\n",tested,tested);
+}
+
+static void sparse_wide_checks(std::mt19937 &rng) {
+    sparse_bit_checks(rng, false); // Existing 136 rule/boundary/cleanup cases.
+    for (int width : {255,256,257,511,512,513,1024,1025})
+    for (int states : {2,3,4,16})
+    for (Boundary boundary : {Boundary::Dead,Boundary::Torus}) {
+        const bool centre = states == 3 || states == 16;
+        const Shape shape = (width & 1) ? Shape::Moore : Shape::VonNeumann;
+        const int maximum = (shape == Shape::Moore ? 8 : 4) + int(centre);
+        const int counts[] = {0,1,2,17,33};
+        Problem p{width,width>=1024 ? 193 : 97,
+            Rule{1,states,centre,int(centre),maximum,2,2,shape},
+            boundary,counts[tested%5]};
+        std::vector<uint8_t> initial(size_t(p.width)*p.height,0);
+        const int origin = width > 256 ? 255 : width-2;
+        for (int y=13;y<=18;++y)
+        for (int dx=-2;dx<=2;++dx) {
+            const int x=origin+dx;
+            if (x>=0 && x<p.width) initial[size_t(y)*p.width+x]=uint8_t(rng()%states);
+        }
+        initial.front()=1;
+        initial.back()=uint8_t(states-1);
+        compare(p,initial); // 256-word boundary, 16-row strips, seams and tails.
+    }
+    std::printf("PASS %d/%d (wide sparse bits, partial 256x16 tiles and cleanup)\n",tested,tested);
+}
+
+static void sparse_warp_checks(std::mt19937 &rng) {
+    for (int radius : {2,5})
+    for (int states : {2,16})
+    for (Boundary boundary : {Boundary::Dead,Boundary::Torus})
+    for (bool centre : {false,true})
+    for (int pattern=0;pattern<2;++pattern) {
+        const int maximum=(2*radius+1)*(2*radius+1)-1+int(centre);
+        Problem p{pattern ? 2*radius+1 : 129,pattern ? 2*radius+3 : 97,
+            Rule{radius,states,centre,int(centre),maximum,2,3,Shape::Moore},
+            boundary,pattern ? 2 : 17};
+        std::vector<uint8_t> initial(size_t(p.width)*p.height,0);
+        if (pattern) {
+            for (auto &state : initial) state=uint8_t(rng()%states);
+        } else {
+            for (int y=14;y<=17;++y)
+            for (int x=61;x<=65;++x) initial[size_t(y)*p.width+x]=uint8_t(rng()%states);
+        }
+        compare(p,initial); // Split at row16; propagation, decay, dense fallback.
+    }
+    std::printf("PASS %d/%d (sparse Moore warp strips, partial tiles and fallback)\n",tested,tested);
 }
 
 int main(int argc, char **argv) {
@@ -426,11 +477,14 @@ int main(int argc, char **argv) {
     const bool multistate = argc == 2 && std::strcmp(argv[1], "--multistate") == 0;
     const bool rolling = argc == 2 && std::strcmp(argv[1], "--rolling") == 0;
     const bool sparse_bits = argc == 2 && std::strcmp(argv[1], "--sparse-bits") == 0;
+    const bool sparse_warp = argc == 2 && std::strcmp(argv[1], "--sparse-warp") == 0;
+    const bool sparse_wide = argc == 2 && std::strcmp(argv[1], "--sparse-wide") == 0;
+    const bool sparse_pageable = argc == 2 && std::strcmp(argv[1], "--sparse-pageable") == 0;
     if (argc > 3) {
-        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1 | --sliding | --graphs | --support | --bitplane | --vn-reuse | --multistate | --rolling | --sparse-bits\n", argv[0]);
+        std::fprintf(stderr, "usage: %s [random_cases:0..1000] [seed] | --quick | --sparse | --r1 | --dense-r1 | --sliding | --graphs | --support | --bitplane | --vn-reuse | --multistate | --rolling | --sparse-bits | --sparse-warp | --sparse-wide | --sparse-pageable\n", argv[0]);
         return 2;
     }
-    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1 && !sliding && !graphs && !support && !bits && !vn_reuse && !multistate && !rolling && !sparse_bits) random_cases = std::atoi(argv[1]);
+    if (argc >= 2 && !quick && !sparse && !r1 && !dense_r1 && !sliding && !graphs && !support && !bits && !vn_reuse && !multistate && !rolling && !sparse_bits && !sparse_warp && !sparse_wide && !sparse_pageable) random_cases = std::atoi(argv[1]);
     if (argc >= 3) seed = unsigned(std::strtoul(argv[2], nullptr, 10));
     if (random_cases < 0 || random_cases > 1000) return 2;
     const char *kernel = std::getenv("PP_KERNEL");
@@ -440,12 +494,15 @@ int main(int argc, char **argv) {
     std::printf("kernel=%s active=%s r1=%s moore=%s seed=%u mode=%s random_cases=%d\n",
                 kernel ? kernel : "auto", active ? active : "auto", r1_mode ? r1_mode : "auto",
                 moore_mode ? moore_mode : "auto", seed,
-                multistate ? "multistate" : rolling ? "rolling" : sparse_bits ? "sparse-bits" : vn_reuse ? "vn-reuse" : bits ? "bitplane" : support ? "support" : graphs ? "graphs" : sliding ? "sliding" : dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
-                (quick || sparse || r1 || dense_r1 || sliding || graphs || support || bits || vn_reuse || multistate || rolling || sparse_bits) ? 0 : random_cases);
+                sparse_warp ? "sparse-warp" : sparse_wide ? "sparse-wide" : sparse_pageable ? "sparse-pageable" : multistate ? "multistate" : rolling ? "rolling" : sparse_bits ? "sparse-bits" : vn_reuse ? "vn-reuse" : bits ? "bitplane" : support ? "support" : graphs ? "graphs" : sliding ? "sliding" : dense_r1 ? "dense-r1" : r1 ? "r1" : sparse ? "sparse" : quick ? "quick" : "full",
+                (quick || sparse || r1 || dense_r1 || sliding || graphs || support || bits || vn_reuse || multistate || rolling || sparse_bits || sparse_warp || sparse_wide || sparse_pageable) ? 0 : random_cases);
     std::printf("graph=%s\n", std::getenv("PP_GRAPH") ? std::getenv("PP_GRAPH") : "0");
     std::printf("support=%s\n", std::getenv("PP_SUPPORT") ? std::getenv("PP_SUPPORT") : "default");
     check(cudaFree(nullptr));
     std::mt19937 rng(seed);
+    if (sparse_warp) { sparse_warp_checks(rng); return 0; }
+    if (sparse_wide) { sparse_wide_checks(rng); return 0; }
+    if (sparse_pageable) { pageable_actual=true; sparse_checks(rng); return 0; }
     if (multistate) { multistate_checks(rng); return 0; }
     if (rolling) { rolling_checks(rng); return 0; }
     if (sparse_bits) { sparse_bit_checks(rng); return 0; }

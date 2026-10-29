@@ -27,12 +27,22 @@ BASELINE_REVISION = "1352bf8"
 FEATURES = {"multistate": ("PP_MULTISTATE",), "rolling": ("PP_ROLLING",),
             "sparse-bits": ("PP_SPARSE_BITS",),
             "combined": ("PP_MULTISTATE", "PP_ROLLING", "PP_SPARSE_BITS")}
+OLD_FEATURES = FEATURES["combined"]
+NEXT_FEATURES = ("PP_SPARSE_WARP", "PP_SPARSE_WIDE", "PP_SPARSE_OUTPUT")
+FEATURES.update({"sparse-warp": (*OLD_FEATURES, NEXT_FEATURES[0]),
+                 "sparse-wide": (*OLD_FEATURES, NEXT_FEATURES[1]),
+                 "sparse-output": (*OLD_FEATURES, NEXT_FEATURES[2]),
+                 "sparse-next": (*OLD_FEATURES, *NEXT_FEATURES)})
+BASELINE_METHODS = ("disabled", "multistate", "rolling", "sparse-bits", "combined")
+OUTPUT_REASONS = {"enabled", "disabled", "not_sparse", "pointer_attributes", "not_pinned_host",
+                  "not_mapped", "invalid_sparse_metadata", "dense_fallback", "zero_steps"}
 GROUPS = {"target": tuple(f"{i:02d}" for i in range(4, 13)),
           "large": ("04", "05", "06", "07"), "sparse": ("08", "09", "10"),
           "multistate": ("08", "10", "12"), "sparse-bits": ("08", "10")}
 SOURCE_SUFFIXES = {".cu", ".cuh", ".hpp", ".h"}
 GATE_COUNTS = {"--quick": 22, "--multistate": 384, "--rolling": 128,
-               "--sparse-bits": 136, "--sparse": 30, "--support": 28}
+               "--sparse-bits": 136, "--sparse": 30, "--support": 28,
+               "--sparse-warp": 32, "--sparse-wide": 200, "--sparse-pageable": 30}
 
 
 def sha256(path):
@@ -79,16 +89,18 @@ def case_selection(explicit, group):
     return tuple(dict.fromkeys([*selected, "11"]))
 
 
-def configure(method, candidate, profiled=False, **overrides):
+def configure(method, candidate, profiled=False, baseline_method="disabled", **overrides):
     for key in list(os.environ):
         if key.startswith("PP_"):
             del os.environ[key]
     os.environ.update(PP_ARCH="baseline", PP_GRAPH="0", PP_EVOLVE="0",
                       PP_PROFILE=str(int(profiled)), PP_SUPPORT="bbox",
                       PP_BITPLANE="auto", PP_BIT_LOGIC="compact", PP_BIT_ROWS="4",
-                      PP_MULTISTATE="0", PP_ROLLING="0", PP_SPARSE_BITS="0")
-    if candidate:
-        os.environ.update({key: "1" for key in FEATURES[method]})
+                      PP_MULTISTATE="0", PP_ROLLING="0", PP_SPARSE_BITS="0",
+                      PP_SPARSE_WARP="0", PP_SPARSE_WIDE="0", PP_SPARSE_OUTPUT="0")
+    selected = method if candidate else baseline_method
+    if selected != "disabled":
+        os.environ.update({key: "1" for key in FEATURES[selected]})
     os.environ.update(overrides)
     return {key: os.environ[key] for key in sorted(os.environ) if key.startswith("PP_")}
 
@@ -103,8 +115,17 @@ def profile_fields(text):
         raise ValueError("duplicate profile field")
     if not fields.get("kernel"):
         raise ValueError("missing profile kernel")
-    return {"profile_status": "ok", "profile_kernel": fields["kernel"],
-            **{key: number(fields[key]) for key in PROFILE_TIMES}}
+    result = {"profile_status": "ok", "profile_kernel": fields["kernel"],
+              **{key: number(fields[key]) for key in PROFILE_TIMES}}
+    if "cells" in fields:
+        result["profile_cells"] = unsigned_integer(fields["cells"], positive=True)
+    return result
+
+
+def unsigned_integer(value, positive=False):
+    if not re.fullmatch(r"\d+", str(value)) or (positive and int(value) == 0):
+        raise ValueError("invalid unsigned integer: " + str(value))
+    return int(value)
 
 
 def validate_gate(text, expected=None):
@@ -137,20 +158,114 @@ def verify_global(text, configured, kernel):
     return {"global_"+key: value for key, value in fields.items()}
 
 
-def verify_gate_dispatch(text, configured, count, feature=None):
+def verify_sparse_next(text, configured, kernel, cells=None):
+    lines = [line for line in text.splitlines() if line.startswith("[PP_SPARSE_NEXT] ")]
+    requested = {name: configured.get("PP_SPARSE_"+name.upper(), "0")
+                 for name in ("warp", "wide", "output")}
+    required = any(value == "1" for value in requested.values()) or kernel in ("sparse_warp", "sparse_wide")
+    # Older binaries lack this record. Existing methods remain usable without
+    # it; requesting a new feature always requires a complete dispatch record.
+    if not lines and not required:
+        return {"sparse_next_"+name+"_selected": "0" for name in requested}
+    if len(lines) != 1:
+        raise ValueError("expected exactly one PP_SPARSE_NEXT dispatch record")
+    tokens = [token.split("=", 1) for token in lines[0].split()[1:]]
+    fields = dict(tokens)
+    expected_keys = {name+suffix for name in requested for suffix in ("_requested", "_selected")}
+    expected_keys.update(("output_reason", "clear_bytes", "scatter_bytes", "tile_w", "tile_h"))
+    if set(fields) != expected_keys or len(tokens) != len(expected_keys):
+        raise ValueError("wrong sparse-next fields: " + str(fields))
+    for name, value in requested.items():
+        if fields[name+"_requested"] != value or fields[name+"_selected"] not in ("0", "1"):
+            raise ValueError("wrong sparse-next requested/selected flags: " + name)
+        if fields[name+"_selected"] == "1" and value != "1":
+            raise ValueError("unrequested sparse-next feature selected: " + name)
+    for name in ("warp", "wide"):
+        if fields[name+"_selected"] != str(int(kernel == "sparse_"+name)):
+            raise ValueError("sparse-next selection disagrees with profile kernel: " + name)
+    selected = fields["output_selected"] == "1"
+    reason = fields["output_reason"]
+    if reason not in OUTPUT_REASONS or selected != (reason == "enabled"):
+        raise ValueError("invalid sparse output reason/selection: " + reason)
+    if requested["output"] == "0" and reason not in ("disabled", "zero_steps"):
+        raise ValueError("disabled sparse output has an active fallback reason")
+    if requested["output"] == "1" and reason == "disabled":
+        raise ValueError("requested sparse output reported disabled")
+    if selected and not kernel.startswith("sparse_"):
+        raise ValueError("sparse output selected for a non-sparse kernel")
+    if cells is None:
+        raise ValueError("sparse-next dispatch requires a profile cell count")
+    cells = unsigned_integer(cells, positive=True)
+    for name in ("clear_bytes", "scatter_bytes"):
+        value = unsigned_integer(fields[name])
+        if value > cells or (not selected and value != 0):
+            raise ValueError("invalid sparse output byte count: " + name)
+    geometry = (unsigned_integer(fields["tile_w"], positive=True),
+                unsigned_integer(fields["tile_h"], positive=True))
+    if geometry != ((256, 16) if kernel == "sparse_wide" else (64, 32)):
+        raise ValueError("sparse-next tile geometry disagrees with selected kernel")
+    return {"sparse_next_"+key: value for key, value in fields.items()}
+
+
+def verify_gate_dispatch(text, configured, count, feature=None, zero_feature=None):
     profiles = [line for line in text.splitlines() if line.startswith("[PP_PROFILE] ")]
     dispatch = [line for line in text.splitlines() if line.startswith("[PP_GLOBAL] ")]
+    next_dispatch = [line for line in text.splitlines() if line.startswith("[PP_SPARSE_NEXT] ")]
     if len(profiles) != count or len(dispatch) != count:
         raise ValueError("CPU gate dispatch/profile record counts differ from case count")
-    selected = {name+"_selected_cases": 0 for name in ("multistate", "rolling", "sparse_bits")}
-    for profile, record in zip(profiles, dispatch):
-        kernel = profile_fields(profile)["profile_kernel"]
+    if next_dispatch and len(next_dispatch) != count:
+        raise ValueError("CPU gate sparse-next record count differs from case count")
+    selected = {name+"_selected_cases": 0 for name in
+                ("multistate", "rolling", "sparse_bits", "sparse_warp", "sparse_wide", "sparse_output")}
+    for index, (profile, record) in enumerate(zip(profiles, dispatch)):
+        parsed = profile_fields(profile)
+        kernel = parsed["profile_kernel"]
         fields = verify_global(record, configured, kernel)
-        for name in selected:
+        for name in ("multistate_selected_cases", "rolling_selected_cases", "sparse_bits_selected_cases"):
             selected[name] += int(fields["global_"+name.replace("_cases", "")])
+        fields = verify_sparse_next(next_dispatch[index] if next_dispatch else "", configured,
+                                    kernel, parsed.get("profile_cells"))
+        for name in ("warp", "wide", "output"):
+            selected["sparse_"+name+"_selected_cases"] += int(fields["sparse_next_"+name+"_selected"])
     if feature and selected[feature+"_selected_cases"] == 0:
         raise ValueError("CPU gate never selected requested feature: " + feature)
+    if zero_feature and selected[zero_feature+"_selected_cases"] != 0:
+        raise ValueError("CPU gate selected a feature required to fall back: " + zero_feature)
     return selected
+
+
+def gate_plan(method, baseline_method="disabled"):
+    plan = []
+    def add(option, role="candidate", required=None, zero=None, **overrides):
+        plan.append(dict(option=option, role=role, required=required, zero=zero, overrides=overrides))
+    add("--quick", "disabled")
+    if baseline_method != "disabled":
+        add("--quick", "baseline")
+    add("--quick")
+    if method in ("multistate", "combined"):
+        add("--multistate", required="multistate", PP_ACTIVE="0")
+    if method in ("rolling", "combined"):
+        add("--rolling", required="rolling", PP_ACTIVE="0")
+        add("--rolling", required="rolling", PP_ACTIVE="1")
+    if method in ("sparse-bits", "combined"):
+        add("--sparse-bits", required="sparse_bits", PP_ACTIVE="1")
+        add("--sparse-bits", required="sparse_bits", PP_ACTIVE="1", PP_SUPPORT="tile")
+    if method in ("sparse-warp", "sparse-next"):
+        add("--sparse-warp", required="sparse_warp", PP_ACTIVE="1")
+        add("--rolling", required="sparse_warp", PP_ACTIVE="1")
+    if method in ("sparse-wide", "sparse-next"):
+        add("--sparse-wide", required="sparse_wide", PP_ACTIVE="1")
+        add("--sparse-wide", required="sparse_wide", PP_ACTIVE="1", PP_SUPPORT="tile")
+    if method in ("sparse-output", "sparse-next"):
+        add("--sparse", required="sparse_output", PP_ACTIVE="1")
+        add("--sparse-pageable", zero="sparse_output", PP_ACTIVE="1")
+    if method in ("rolling", "sparse-bits", "combined", "sparse-warp", "sparse-wide"):
+        add("--sparse", PP_ACTIVE="1")
+    if method in ("rolling", "sparse-bits", "combined", "sparse-warp", "sparse-wide", "sparse-output", "sparse-next"):
+        add("--support", PP_ACTIVE="1")
+    if method in ("rolling", "combined"):
+        add("--sparse", PP_ACTIVE="1", PP_ARCH="reduce")
+    return plan
 
 
 def summarize(samples, cases, blocks):
@@ -324,6 +439,7 @@ def compare(args):
         raise ValueError("--wall-timeout must be positive and at most 30")
     if not shutil.which(args.checker):
         raise ValueError("official checker missing: " + args.checker)
+    baseline_method = getattr(args, "baseline_method", "disabled")
     deadline = time.monotonic()+args.budget_seconds
     folder = args.outdir.resolve()
     folder.mkdir(parents=True, exist_ok=False)
@@ -355,11 +471,12 @@ def compare(args):
     paths = [Path(__file__).resolve(), Path(__file__).with_name("run_global_compare.sh"),
              Path(__file__).with_name("run_cases.py"), *binaries.values()]
     (folder/"sha256.log").write_text("\n".join(sha256(path)+"  "+str(path) for path in paths)+"\n")
-    configuration = dict(method=args.method, cases=cases, unprofiled_blocks=args.blocks,
+    configuration = dict(method=args.method, baseline_method=baseline_method, cases=cases, unprofiled_blocks=args.blocks,
                          separate_profile_blocks=args.profile_blocks, guard_case="11",
                          budget_seconds=args.budget_seconds, baseline_revision=manifest["baseline_revision"])
     (folder/"configuration.json").write_text(json.dumps(configuration, indent=2)+"\n")
     print("Baseline: " + manifest["baseline_revision"], flush=True)
+    print("Baseline flags: " + baseline_method + "; candidate flags: " + args.method, flush=True)
     print("Candidate build HEAD: " + manifest["candidate_revision"], flush=True)
     print("Cases: " + ",".join(cases) + "; 11 is the unchanged-family guard", flush=True)
     def remaining(required=0):
@@ -367,35 +484,21 @@ def compare(args):
         if value <= required:
             raise ValueError("comparison budget exhausted; partial logs retained, no COMPLETE")
         return value
-    gate_specs = [(False, "--quick", {}), (True, "--quick", {})]
-    if args.method in ("multistate", "combined"):
-        gate_specs.append((True, "--multistate", {"PP_ACTIVE": "0"}))
-    if args.method in ("rolling", "combined"):
-        gate_specs.extend([(True, "--rolling", {"PP_ACTIVE": "0"}),
-                           (True, "--rolling", {"PP_ACTIVE": "1"})])
-    if args.method in ("sparse-bits", "combined"):
-        gate_specs.extend([(True, "--sparse-bits", {"PP_ACTIVE": "1"}),
-                           (True, "--sparse-bits", {"PP_ACTIVE": "1", "PP_SUPPORT": "tile"})])
-    if args.method in ("rolling", "sparse-bits", "combined"):
-        gate_specs.extend([(True, "--sparse", {"PP_ACTIVE": "1"}),
-                           (True, "--support", {"PP_ACTIVE": "1"})])
-    if args.method in ("rolling", "combined"):
-        gate_specs.append((True, "--sparse", {"PP_ACTIVE": "1", "PP_ARCH": "reduce"}))
     environments = []
     gates = []
-    for index, (enabled, option, overrides) in enumerate(gate_specs):
-        configured = configure(args.method, enabled, True, **overrides)
+    for index, spec in enumerate(gate_plan(args.method, baseline_method)):
+        enabled, option = spec["role"] == "candidate", spec["option"]
+        gate_baseline = baseline_method if spec["role"] == "baseline" else "disabled"
+        configured = configure(args.method, enabled, True, baseline_method=gate_baseline, **spec["overrides"])
         environments.append(dict(kind="gate", index=index, option=option,
-                                 method="candidate" if enabled else "disabled", env=configured))
+                                 method=spec["role"], env=configured))
         (folder/"effective-environments.json").write_text(json.dumps(environments, indent=2)+"\n")
         log = folder/f"gate-{index:02d}-{option[2:]}.log"
         capture([str(binaries["gate"]), option], log, timeout=min(120, remaining(1)))
         text = log.read_text(encoding="utf-8")
         count = validate_gate(text, GATE_COUNTS[option])
-        required_feature = {"--multistate": "multistate", "--rolling": "rolling",
-                            "--sparse-bits": "sparse_bits"}.get(option)
-        selected = verify_gate_dispatch(text, configured, count, required_feature)
-        gates.append(dict(gate=index, feature_enabled=int(enabled), option=option, passed=count,
+        selected = verify_gate_dispatch(text, configured, count, spec["required"], spec["zero"])
+        gates.append(dict(gate=index, feature_enabled=int(enabled), role=spec["role"], option=option, passed=count,
                           active=configured.get("PP_ACTIVE", "auto"), support=configured["PP_SUPPORT"],
                           arch=configured["PP_ARCH"], **selected, log=log.name))
         write_table(folder/"gates.tsv", gates)
@@ -406,7 +509,8 @@ def compare(args):
         for block in range(1, blocks+1):
             for slot, method in enumerate(("baseline", "candidate", "candidate", "baseline"), 1):
                 round_number += 1
-                configured = configure(args.method, method == "candidate", profiled)
+                configured = configure(args.method, method == "candidate", profiled,
+                                       baseline_method=baseline_method)
                 environments.append(dict(kind="round", index=round_number, method=method, env=configured))
                 (folder/"effective-environments.json").write_text(json.dumps(environments, indent=2)+"\n")
                 order = cases if round_number % 2 else tuple(reversed(cases))
@@ -427,8 +531,14 @@ def compare(args):
                     raw = (case_folder/f"00-{case}.log").read_text(encoding="utf-8", errors="replace")
                     if profiled:
                         row.update(profile_fields(raw))
-                        if method == "candidate":
+                        if method == "candidate" or baseline_method != "disabled":
                             row.update(verify_global(raw, configured, row["profile_kernel"]))
+                            row.update(verify_sparse_next(raw, configured, row["profile_kernel"],
+                                                          row.get("profile_cells")))
+                            if method == "candidate" and any(configured[key] == "1" for key in NEXT_FEATURES):
+                                dispatch = next(line for line in raw.splitlines()
+                                                if line.startswith("[PP_SPARSE_NEXT] "))
+                                print(f"  Case {case}: {dispatch}", flush=True)
                     elif row["profile_status"] != "absent":
                         raise ValueError("instrumentation in unprofiled timing round")
                     sample = dict(round=round_number, block=block, slot=slot, position=position,
@@ -466,6 +576,8 @@ def main(argv=None):
     run.add_argument("--build-dir", type=Path, required=True)
     run.add_argument("--outdir", type=Path, required=True)
     run.add_argument("--method", choices=FEATURES, default="combined")
+    run.add_argument("--baseline-method", choices=BASELINE_METHODS, default="disabled",
+                     help="feature flags for the frozen baseline binary; defaults to all disabled")
     selection = run.add_mutually_exclusive_group()
     selection.add_argument("--group", choices=GROUPS, default="target")
     selection.add_argument("--cases", help="comma-separated case IDs/ranges; 11 guard always included")

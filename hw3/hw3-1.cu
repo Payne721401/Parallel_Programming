@@ -11,6 +11,7 @@
 // PP_ARCH=baseline|reduce|r1|r1shared|large|all: opt-in architecture experiments.
 // r1shared keeps the shared tile and reuses two adjacent output rows in registers.
 // PP_MULTISTATE=1, PP_SPARSE_BITS=1 and PP_ROLLING=1 enable new opt-in kernels.
+// PP_SPARSE_WARP=1, PP_SPARSE_WIDE=1, PP_SPARSE_OUTPUT=1: opt-in sparse follow-ups.
 #include <cuda_runtime.h>
 #include <chrono>
 #include <cstddef>
@@ -28,6 +29,9 @@
 #include "vn_diagonal.hpp"
 #include "r1_multistate.hpp"
 #include "rolling_filters.hpp"
+#include "r1_sparse_wide.hpp"
+#include "sparse_moore_warp.hpp"
+#include "sparse_output.hpp"
 
 namespace {
 
@@ -56,6 +60,25 @@ struct GlobalExperiments {
             "rolling_requested=%d rolling_selected=%d sparse_bits_requested=%d sparse_bits_selected=%d\n",
             int(multistate_requested), int(multistate_selected), int(rolling_requested),
             int(rolling_selected), int(sparse_bits_requested), int(sparse_bits_selected));
+    }
+};
+
+struct SparseExperiments {
+    bool warp_requested = GlobalExperiments::flag("PP_SPARSE_WARP");
+    bool wide_requested = GlobalExperiments::flag("PP_SPARSE_WIDE");
+    bool output_requested = GlobalExperiments::flag("PP_SPARSE_OUTPUT");
+    bool warp_selected = false, wide_selected = false, output_selected = false;
+    const char *output_reason = "disabled";
+    unsigned long long clear_bytes = 0, scatter_bytes = 0;
+    int tile_w = tile_geometry::width, tile_h = tile_geometry::height;
+    void report(bool profile) const {
+        if (profile) std::fprintf(stderr,
+            "[PP_SPARSE_NEXT] warp_requested=%d warp_selected=%d "
+            "wide_requested=%d wide_selected=%d output_requested=%d output_selected=%d "
+            "output_reason=%s clear_bytes=%llu scatter_bytes=%llu tile_w=%d tile_h=%d\n",
+            int(warp_requested), int(warp_selected), int(wide_requested), int(wide_selected),
+            int(output_requested), int(output_selected), output_reason, clear_bytes,
+            scatter_bytes, tile_w, tile_h);
     }
 };
 
@@ -760,6 +783,9 @@ struct SparseWorkspace {
 };
 
 #include "r1_sparse_bits.cuh"
+#include "r1_sparse_wide.cuh"
+#include "sparse_moore_warp.cuh"
+#include "sparse_output.cuh"
 #include "evolution_diag.cuh"
 
 } // namespace
@@ -769,6 +795,7 @@ void run(uint8_t *grid, const Problem &p) {
     EvolutionProfile evolution;
     BitplaneExperiment bitplane(p);
     GlobalExperiments global;
+    SparseExperiments next_sparse;
     const char *support_mode = std::getenv("PP_SUPPORT");
     const bool tight_support = support_mode ? std::strcmp(support_mode, "bbox") == 0 : !evolution.enabled;
     if (support_mode && !tight_support && std::strcmp(support_mode, "tile") != 0) {
@@ -808,6 +835,8 @@ void run(uint8_t *grid, const Problem &p) {
         bitplane.reason = bitplane.automatic || bitplane.requested ? "zero_steps" : "disabled";
         bitplane.report(profile.enabled);
         global.report(profile.enabled);
+        if (next_sparse.output_requested) next_sparse.output_reason = "zero_steps";
+        next_sparse.report(profile.enabled);
         if (profile.enabled)
             std::fprintf(stderr, "[PP_ARCH] mode=%s merged=0 r1_warp=0 vn_diagonal=0 r1_shared=0\n", arch_mode);
         return;
@@ -851,7 +880,7 @@ void run(uint8_t *grid, const Problem &p) {
     // Tiny unaligned rows may use more bytes when padded to 32 bits (e.g. W=3).
     // Reuse the existing two allocations; pack/evolve/unpack never alias in one launch.
     const bool packed_experiment_eligible = packed && !graph_requested && !evolution.enabled
-        && (global.multistate_requested || global.sparse_bits_requested);
+        && (global.multistate_requested || global.sparse_bits_requested || next_sparse.wide_requested);
     size_t allocation_bytes = bit_eligible && bit_words*sizeof(uint32_t) > bytes
                                   ? bit_words*sizeof(uint32_t) : bytes;
     if (packed_experiment_eligible) allocation_bytes = r1_multistate::allocation_bytes(p);
@@ -865,23 +894,46 @@ void run(uint8_t *grid, const Problem &p) {
     // Inspect actual state only where a full-grid scan can amortize over many
     // large generations. No case IDs, seed fingerprints or expected answers.
     const bool inspect_sparse = force_sparse || (adaptive && bytes >= (size_t(1) << 28) && p.steps >= 128);
-    SparseWorkspace sparse_work;
+    const bool wide_eligible = next_sparse.wide_requested && packed
+        && !graph_requested && !evolution.enabled;
+    SparseWorkspace narrow_work;
+    r1_sparse_wide_gpu::Workspace wide_work;
+    SparseWorkspace &sparse_work = wide_eligible ? static_cast<SparseWorkspace &>(wide_work) : narrow_work;
     uint8_t *src = nullptr, *dst = nullptr;
     const auto alloc_start = profile.enabled ? PhaseProfile::Clock::now() : PhaseProfile::Clock::time_point{};
     check(cudaMalloc(&src, allocation_bytes), "allocate source");
     check(cudaMalloc(&dst, allocation_bytes), "allocate destination");
-    if (inspect_sparse) sparse_work.allocate(p, profile.enabled);
+    if (inspect_sparse) {
+        if (wide_eligible) wide_work.allocate(p, profile.enabled);
+        else narrow_work.allocate(p, profile.enabled);
+    }
     if (profile.enabled) profile.alloc_host_ms = PhaseProfile::elapsed_ms(alloc_start);
     profile.prepare();
     profile.mark(0);
     check(cudaMemcpy(src, grid, bytes, cudaMemcpyHostToDevice), "copy initial grid");
     profile.mark(1);
-    const bool sparse = inspect_sparse && sparse_work.initialize(src, dst, p, force_sparse);
+    const bool sparse = inspect_sparse && (wide_eligible
+        ? wide_work.initialize(src, dst, p, force_sparse)
+        : narrow_work.initialize(src, dst, p, force_sparse));
+    next_sparse.wide_selected = wide_eligible && sparse;
+    next_sparse.warp_selected = next_sparse.warp_requested && sparse
+        && sparse_moore_warp::eligible(p) && (automatic || forced_tiled)
+        && !graph_requested && !evolution.enabled;
+    if (next_sparse.wide_selected) {
+        next_sparse.tile_w = r1_sparse_wide::width;
+        next_sparse.tile_h = r1_sparse_wide::height;
+    }
+    sparse_output_gpu::Mapping output_mapping;
+    check(sparse_output_gpu::prepare(grid, next_sparse.output_requested, sparse, output_mapping),
+          "inspect sparse host output mapping");
+    next_sparse.output_reason = output_mapping.reason;
     global.multistate_selected = global.multistate_requested && packed_experiment_eligible
         && !sparse && p.rule.states > 2;
-    global.sparse_bits_selected = global.sparse_bits_requested && packed_experiment_eligible && sparse;
+    global.sparse_bits_selected = global.sparse_bits_requested && packed_experiment_eligible
+        && sparse && !next_sparse.wide_selected;
     global.rolling_selected = global.rolling_requested && p.rule.radius >= 2
-        && (automatic || forced_tiled) && !graph_requested && !evolution.enabled;
+        && (automatic || forced_tiled) && !graph_requested && !evolution.enabled
+        && !next_sparse.warp_selected;
     bitplane.reason = !bitplane.requested ? (bitplane.automatic ? "auto_small_or_short" : "disabled") : evolution.enabled ? "evolution" :
         graph_requested ? "graph" : !packed ? "not_packed_r1" : p.rule.states != 2 ? "states" :
         sparse ? "sparse" : "enabled";
@@ -942,7 +994,12 @@ void run(uint8_t *grid, const Problem &p) {
                 // out of the reference kernel, rather than a per-cell runtime branch.
                 auto launch_sparse = [&](auto tight_tag) {
                     constexpr bool Tight = decltype(tight_tag)::value;
-                    if (global.rolling_selected && moore)
+                    if (next_sparse.warp_selected)
+                        sparse_moore_warp_gpu::launch<Tight>(src, dst, p, current, next,
+                            sparse_work.stamp, t + 1, sparse_work.counts + 2,
+                            sparse_work.tiles_x, sparse_work.tile_count, sparse_work.workers,
+                            device_epoch, stream);
+                    else if (global.rolling_selected && moore)
                         step_sparse<false, true, false, false, Tight, SparseMoore, true><<<sparse_work.workers, threads, rolling_shared, stream>>>(
                             src, dst, p, current, next, sparse_work.stamp, t + 1,
                             sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, device_epoch);
@@ -1010,22 +1067,28 @@ void run(uint8_t *grid, const Problem &p) {
             evolution.sample(t+1, src, dst, p, sparse ? sparse_work.counts+((t+1)&1) : nullptr,
                              sparse ? sparse_work.counts+2 : nullptr);
     };
-    if (global.multistate_selected || global.sparse_bits_selected) {
+    if (global.multistate_selected || global.sparse_bits_selected || next_sparse.wide_selected) {
         auto swap_buffers = [&]() { uint8_t *old = src; src = dst; dst = old; };
         check(r1_multistate_gpu::pack(src, reinterpret_cast<uint32_t *>(dst), p), "launch multistate pack");
         swap_buffers();
-        if (global.sparse_bits_selected)
+        if (global.sparse_bits_selected || next_sparse.wide_selected)
             check(cudaMemsetAsync(dst, 0, bit_words * r1_multistate::plane_count(p.rule.states) * sizeof(uint32_t)),
                   "clear sparse bit-plane destination");
         for (int t = 0; t < iterations; ++t) {
             const auto *input = reinterpret_cast<const uint32_t *>(src);
             auto *output = reinterpret_cast<uint32_t *>(dst);
-            if (global.sparse_bits_selected) {
+            if (global.sparse_bits_selected || next_sparse.wide_selected) {
                 const TileQueue current = sparse_work.queue(t & 1), next = sparse_work.queue((t + 1) & 1);
                 prepare_sparse<<<1, 1>>>(current, next, sparse_work.counts + 2,
                                         sparse_work.tile_count, sparse_work.stats, nullptr);
                 check(cudaGetLastError(), "launch bit-plane sparse prepare");
-                if (tight_support)
+                if (next_sparse.wide_selected && tight_support)
+                    r1_sparse_wide_gpu::launch<true>(input, output, p, current, next, sparse_work.stamp, t + 1,
+                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, sparse_work.workers);
+                else if (next_sparse.wide_selected)
+                    r1_sparse_wide_gpu::launch<false>(input, output, p, current, next, sparse_work.stamp, t + 1,
+                        sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, sparse_work.workers);
+                else if (tight_support)
                     r1_sparse_bits_gpu::launch<true>(input, output, p, current, next, sparse_work.stamp, t + 1,
                         sparse_work.counts + 2, sparse_work.tiles_x, sparse_work.tile_count, sparse_work.workers);
                 else
@@ -1099,7 +1162,19 @@ void run(uint8_t *grid, const Problem &p) {
     profile.mark(2);
     // Blocking D2H waits for all preceding kernels; src holds the final state
     // for either parity of T. Asynchronous execution errors also surface here.
-    check(cudaMemcpy(grid, src, bytes, cudaMemcpyDeviceToHost), "copy final grid");
+    if (next_sparse.output_requested && sparse) {
+        sparse_output_gpu::Result output_result;
+        const TileQueue final = sparse_work.queue(iterations & 1);
+        const auto geometry = sparse_output::geometry(p.width, p.height,
+            next_sparse.tile_w, next_sparse.tile_h);
+        check(sparse_output_gpu::finish(grid, src, p, sparse_work.nonzero, final.ids, final.count,
+            sparse_work.counts + 2, geometry, output_mapping, output_result, profile.enabled),
+            "reconstruct sparse final host grid");
+        next_sparse.output_selected = output_result.selected;
+        next_sparse.output_reason = output_result.reason;
+        next_sparse.clear_bytes = output_result.clear_bytes;
+        next_sparse.scatter_bytes = output_result.scatter_bytes;
+    } else check(cudaMemcpy(grid, src, bytes, cudaMemcpyDeviceToHost), "copy final grid");
     SparseStats sparse_stats{};
     if (profile.enabled && sparse)
         check(cudaMemcpy(&sparse_stats, sparse_work.stats, sizeof(sparse_stats), cudaMemcpyDeviceToHost),
@@ -1116,12 +1191,14 @@ void run(uint8_t *grid, const Problem &p) {
     check(cudaFree(src), "free source");
     sparse_work.release();
     if (profile.enabled) profile.free_host_ms = PhaseProfile::elapsed_ms(free_start);
-    profile.report(global.sparse_bits_selected ? "sparse_bits" : global.multistate_selected ? "dense_multistate"
+    profile.report(next_sparse.wide_selected ? "sparse_wide" : next_sparse.warp_selected ? "sparse_warp"
+                         : global.sparse_bits_selected ? "sparse_bits" : global.multistate_selected ? "dense_multistate"
                          : global.rolling_selected ? (sparse ? "sparse_rolling" : "rolling")
                          : sparse ? (packed ? "sparse_r1" : sliding ? "sparse_sliding" : tiled ? "sparse_tiled" : "sparse_naive")
                          : (bitplane.selected ? "dense_bits" : packed ? "dense_r1" : sliding ? "sliding" : tiled ? "tiled" : "naive"), p);
     bitplane.report(profile.enabled);
     global.report(profile.enabled);
+    next_sparse.report(profile.enabled);
     if (profile.enabled)
         std::fprintf(stderr,
             "[PP_GRAPH] requested=%d selected=%d batch=%d replays=%d tail=%d build_host_ms=%.6f\n",
@@ -1130,9 +1207,12 @@ void run(uint8_t *grid, const Problem &p) {
             graph_selected ? iterations % GRAPH_BATCH : iterations, graph_build_ms);
     if (profile.enabled)
         std::fprintf(stderr, "[PP_ARCH] mode=%s merged=%d r1_warp=%d vn_diagonal=%d r1_shared=%d\n",
-                     arch_mode, int((arch & 1) && sparse && !global.sparse_bits_selected),
-                     int((arch & 2) && packed && !bitplane.selected && !global.multistate_selected && !global.sparse_bits_selected), int(vn_diagonal_selected),
-                     int((arch & 8) && packed && !bitplane.selected && !global.multistate_selected && !global.sparse_bits_selected));
+                     arch_mode, int((arch & 1) && sparse && !global.sparse_bits_selected
+                                    && !next_sparse.wide_selected && !next_sparse.warp_selected),
+                     int((arch & 2) && packed && !bitplane.selected && !global.multistate_selected
+                         && !global.sparse_bits_selected && !next_sparse.wide_selected), int(vn_diagonal_selected),
+                     int((arch & 8) && packed && !bitplane.selected && !global.multistate_selected
+                         && !global.sparse_bits_selected && !next_sparse.wide_selected));
     if (profile.enabled && inspect_sparse)
         std::fprintf(stderr,
             "[PP_SPARSE] selected=%d tiles_total=%d initial_work=%d work_sum=%llu "
