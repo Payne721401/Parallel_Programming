@@ -51,6 +51,10 @@ __pycache__/
 # Course-provided shared test data / symlinks
 cases
 
+# Course slides and reference material stay local.
+slides/
+Parallel_Computing_Slide/
+
 # Markdown documents and personal notes stay local.
 *.md
 *-report.md
