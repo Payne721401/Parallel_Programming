@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
+from .graphs import rollout_graph
+
 def detach_clone(v):
     return v.detach().clone() if torch.is_tensor(v) else v
 
@@ -380,22 +382,47 @@ class JEPA(nn.Module):
         return torch.stack(passes)
 
     def rollout(self, info, action_sequence, history_size: int = 1):
-        """Rollout the model given an initial info dict and action sequence."""
+        """Rollout the model given an initial info dict and action sequence.
+
+        Calls that differentiate through the actions replay CUDA graphs of
+        _rollout_core (see model/graphs.py); all other calls run it eagerly.
+        """
 
         assert "pixels" in info, "pixels not in info_dict"
         H = info["pixels"].size(2)
         B, S, T = action_sequence.shape[:3]
-        act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
+        act_0, _ = torch.split(action_sequence, [H, T - H], dim=2)
         info["action"] = act_0
-        n_steps = T - H
 
         _init = {k: v[:, 0] for k, v in info.items() if torch.is_tensor(v)}
         if "embed_0" not in _init:
             with torch.no_grad():
                 _init = self.encode(_init)
-        emb = info["embed_0"] = _init["embed_0"].unsqueeze(1).expand(B, S, -1, -1)
-        _init = {k: detach_clone(v) for k, v in _init.items()}
+        emb0 = _init["embed_0"]
+        info["embed_0"] = emb0.unsqueeze(1).expand(B, S, -1, -1)
 
+        graphed = rollout_graph(self, emb0, action_sequence, H, history_size)
+        if graphed is not None:
+            info["predicted_embed_0"] = graphed(emb0, action_sequence)
+            return info
+
+        _init = {k: detach_clone(v) for k, v in _init.items()}  # result unused; kept as in the reference
+        info["predicted_embed_0"] = self._rollout_core(emb0, action_sequence, H, history_size)
+        return info
+
+    def _rollout_core(self, emb0, action_sequence, history: int, history_size: int = 1):
+        """Autoregressive rollout from the initial latent emb0 (B, history, D).
+
+        action_sequence: (B, S, T, action_dim). Returns the predicted stream
+        (B, S, T + 1, D), initial latent first. The eager path and the CUDA-graph
+        capture both run this function, so they launch the same kernels.
+        """
+        H = history
+        B, S, T = action_sequence.shape[:3]
+        act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
+        n_steps = T - H
+
+        emb = emb0.unsqueeze(1).expand(B, S, -1, -1)
         emb = rearrange(emb, "b s ... -> (b s) ...").clone()
         act = rearrange(act_0, "b s ... -> (b s) ...")
         act_future = rearrange(act_future, "b s ... -> (b s) ...")
@@ -418,10 +445,7 @@ class JEPA(nn.Module):
         pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]  # (BS, 1, D)
         emb = torch.cat([emb, pred_emb], dim=1)
 
-        pred_rollout = rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
-        info["predicted_embed_0"] = pred_rollout
-
-        return info
+        return rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
 
     def criterion(self, info_dict: dict):
         """Planning cost: MSE between the last cost_last_n predicted embeddings and the goal."""
