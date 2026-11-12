@@ -37,17 +37,22 @@ def addcmul_kernel(a_ptr, b_ptr, c_ptr, out_ptr, n, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def norm_modulate_kernel(x_ptr, shift_ptr, scale_ptr, out_ptr, D: tl.constexpr, eps):
-    """One row per program: LayerNorm (no affine) over D, then * scale + shift."""
+def norm_modulate_kernel(x_ptr, shift_ptr, scale_ptr, out_ptr, D, eps, BLOCK: tl.constexpr):
+    """One row per program: LayerNorm (no affine) over D, then * scale + shift.
+
+    tl.arange needs a power-of-two length, so a row is a BLOCK >= D with the tail masked.
+    """
     row = tl.program_id(0)
-    cols = tl.arange(0, D)
-    x = tl.load(x_ptr + row * D + cols)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < D
+    x = tl.load(x_ptr + row * D + cols, mask=mask, other=0.0)
     mean = tl.sum(x, axis=0) / D
-    centered = x - mean
+    centered = tl.where(mask, x - mean, 0.0)
     var = tl.sum(centered * centered, axis=0) / D
     normed = centered / tl.sqrt(var + eps)
-    out = normed * tl.load(scale_ptr + row * D + cols) + tl.load(shift_ptr + row * D + cols)
-    tl.store(out_ptr + row * D + cols, out)
+    scale = tl.load(scale_ptr + row * D + cols, mask=mask, other=0.0)
+    shift = tl.load(shift_ptr + row * D + cols, mask=mask, other=0.0)
+    tl.store(out_ptr + row * D + cols, normed * scale + shift, mask=mask)
 
 
 def timed(fn):
@@ -92,7 +97,7 @@ def main():
         return out
 
     def tri_norm():
-        norm_modulate_kernel[(N,)](a, b, c, out, D=D, eps=1e-6)
+        norm_modulate_kernel[(N,)](a, b, c, out, D, 1e-6, BLOCK=256)
         return out
 
     _, first = timed(tri_addcmul)
