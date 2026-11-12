@@ -55,12 +55,17 @@ def rollout(jepa, emb0: torch.Tensor, action_sequence: torch.Tensor) -> torch.Te
     # Action-only part, all T steps at once: (N, T, hidden).
     act_emb = jepa.action_embed(action_sequence.reshape(N, T, *action_sequence.shape[3:]))
     cond = transformer.cond_proj(act_emb)
+    # conditions[b][k][t]: block b, term k (shift/scale/gate for attention, then for the MLP),
+    # step t, each (N, hidden). unbind splits each (N, T, hidden) term once, so its backward
+    # is one stack per term; indexing [:, t] instead would make backward zero-fill a full
+    # (N, T, hidden) gradient for every step and add them up.
     conditions = []
     for block in transformer.layers:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             block.adaLN_modulation(cond).chunk(6, dim=-1)
         )
-        conditions.append((shift_msa, 1 + scale_msa, gate_msa, shift_mlp, 1 + scale_mlp, gate_mlp))
+        terms = (shift_msa, 1 + scale_msa, gate_msa, shift_mlp, 1 + scale_mlp, gate_mlp)
+        conditions.append([term.unbind(dim=1) for term in terms])
 
     position = predictor.pos_embedding[0, :1]  # (1, D)
     emb = emb0.unsqueeze(1).expand(B, S, -1, -1).reshape(N, -1)  # (N, D); history is 1
@@ -71,11 +76,11 @@ def rollout(jepa, emb0: torch.Tensor, action_sequence: torch.Tensor) -> torch.Te
                 transformer.layers, conditions):
             attn = block.attn
             inner_dim = attn.to_qkv.out_features // 3
-            h = torch.addcmul(shift_msa[:, t], block.norm1(x), scale_msa[:, t])
+            h = torch.addcmul(shift_msa[t], block.norm1(x), scale_msa[t])
             h = attn.to_out(F.linear(attn.norm(h), attn.to_qkv.weight[2 * inner_dim:]))
-            x = torch.addcmul(x, gate_msa[:, t], h)
-            h = torch.addcmul(shift_mlp[:, t], block.norm2(x), scale_mlp[:, t])
-            x = torch.addcmul(x, gate_mlp[:, t], block.mlp(h))
+            x = torch.addcmul(x, gate_msa[t], h)
+            h = torch.addcmul(shift_mlp[t], block.norm2(x), scale_mlp[t])
+            x = torch.addcmul(x, gate_mlp[t], block.mlp(h))
         emb = projector(transformer.output_proj(transformer.norm(x)))
         stream.append(emb)
     return torch.stack(stream, dim=1).view(B, S, T + 1, -1)
