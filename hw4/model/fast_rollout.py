@@ -44,6 +44,29 @@ def supported(jepa, history: int, history_size: int) -> bool:
     return True
 
 
+# The attention's V projection (no bias) feeds its output projection directly when there is
+# one token, so the two matrices are multiplied once at build time: to_out(V x) = (W_out W_v) x + b.
+FOLD = os.environ.get("HW4_FOLD_VO", "1") != "0"
+_FOLDED = "_hw4_vo_weight"
+
+
+@torch.no_grad()
+def prepare(jepa) -> None:
+    """Precompute each block's folded V/output matrix. Call after the weights are loaded."""
+    for block in jepa.predictor.predictor.transformer.layers:
+        attn = block.attn
+        attn.__dict__.pop(_FOLDED, None)
+        if not (FOLD and supported(jepa, 1, 1)):
+            continue
+        out = attn.to_out[0] if isinstance(attn.to_out, nn.Sequential) else None
+        if not isinstance(out, nn.Linear):
+            continue
+        inner_dim = attn.to_qkv.out_features // 3
+        w_v = attn.to_qkv.weight[2 * inner_dim:]
+        # The product is formed in float64 and rounded once to float32.
+        attn.__dict__[_FOLDED] = (out.weight.double() @ w_v.double()).to(out.weight.dtype).contiguous()
+
+
 def rollout(jepa, emb0: torch.Tensor, action_sequence: torch.Tensor) -> torch.Tensor:
     """emb0 (B, 1, D), action_sequence (B, S, T, A) -> predicted stream (B, S, T + 1, D)."""
     B, S, T = action_sequence.shape[:3]
@@ -77,7 +100,11 @@ def rollout(jepa, emb0: torch.Tensor, action_sequence: torch.Tensor) -> torch.Te
             attn = block.attn
             inner_dim = attn.to_qkv.out_features // 3
             h = torch.addcmul(shift_msa[t], block.norm1(x), scale_msa[t])
-            h = attn.to_out(F.linear(attn.norm(h), attn.to_qkv.weight[2 * inner_dim:]))
+            folded = attn.__dict__.get(_FOLDED)
+            if folded is not None:
+                h = F.linear(attn.norm(h), folded, attn.to_out[0].bias)
+            else:
+                h = attn.to_out(F.linear(attn.norm(h), attn.to_qkv.weight[2 * inner_dim:]))
             x = torch.addcmul(x, gate_msa[t], h)
             h = torch.addcmul(shift_mlp[t], block.norm2(x), scale_mlp[t])
             x = torch.addcmul(x, gate_mlp[t], block.mlp(h))
