@@ -12,7 +12,6 @@ import os
 import torch
 from torch import nn
 
-from . import fast_rollout
 from .hjepa import HJEPA
 from .jepa import JEPA, ProjectedEncoder, ProjectedPredictor
 from .modules import Embedder, MLP, ResidualLatentMLP
@@ -118,7 +117,4 @@ def build_model(weights, architecture):
     model.pixel_embed_dims = {}
     model.proprio_embed_dims = {}
     model.interpolate_pos_encoding = True
-    model = model.eval().requires_grad_(False)
-    for jepa in levels:
-        fast_rollout.prepare(jepa)
-    return model
+    return model.eval().requires_grad_(False)

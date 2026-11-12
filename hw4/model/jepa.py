@@ -395,6 +395,7 @@ class JEPA(nn.Module):
         """
 
         assert "pixels" in info, "pixels not in info_dict"
+        fast_rollout.ensure_prepared(self)
         H = info["pixels"].size(2)
         B, S, T = action_sequence.shape[:3]
         act_0, _ = torch.split(action_sequence, [H, T - H], dim=2)

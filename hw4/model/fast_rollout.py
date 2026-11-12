@@ -133,6 +133,14 @@ def prepare(jepa) -> None:
 _FUSED = "_hw4_fused"
 
 
+def ensure_prepared(jepa) -> None:
+    """Run prepare() once, on the first rollout, so check.py (which never rolls out) skips it."""
+    if _FUSED not in jepa.__dict__:
+        # Normal tensors even if the first rollout happens under inference_mode.
+        with torch.inference_mode(False):
+            prepare(jepa)
+
+
 def _fusable(jepa) -> bool:
     """True when every piece the Triton path (model/fused.py) relies on is present."""
     if not (fused.ENABLED and supported(jepa, 1, 1)):
