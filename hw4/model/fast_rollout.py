@@ -75,13 +75,49 @@ FOLD = os.environ.get("HW4_FOLD_VO", "1") != "0"
 _FOLDED = "_hw4_vo_weight"
 
 
+# cuBLAS picks sgemm_largek (about 25 us on an H100) for Linear layers whose input is wide
+# (K = 1024 or 2048) when they run as addmm. The same product as mm against a weight stored
+# transposed takes about 9 us, so those layers keep a transposed copy and add the bias after.
+WIDE_MM = os.environ.get("HW4_WIDE_MM", "1") != "0"
+WIDE_K = 512
+_TRANSPOSED = "_hw4_weight_t"
+
+
+def _run(sequential, x):
+    """sequential(x) in eval mode, with wide-input Linear layers as mm + bias."""
+    for module in sequential:
+        if isinstance(module, nn.Dropout):
+            continue
+        weight_t = module.__dict__.get(_TRANSPOSED)
+        if weight_t is None:
+            x = module(x)
+        else:
+            x = torch.mm(x, weight_t)
+            if module.bias is not None:
+                x = x + module.bias
+    return x
+
+
 @torch.no_grad()
 def prepare(jepa) -> None:
-    """Precompute each block's folded V/output matrix. Call after the weights are loaded."""
+    """Precompute the folded V/output matrices and transposed wide weights.
+
+    Call after the weights are loaded and the model is in eval mode.
+    """
+    usable = supported(jepa, 1, 1)
+    projector = jepa.predictor.projector
+    sequences = [block.mlp.net for block in jepa.predictor.predictor.transformer.layers]
+    if isinstance(getattr(projector, "net", None), nn.Sequential):
+        sequences.append(projector.net)
+    for sequential in sequences:
+        for module in sequential:
+            module.__dict__.pop(_TRANSPOSED, None)
+            if usable and WIDE_MM and isinstance(module, nn.Linear) and module.in_features >= WIDE_K:
+                module.__dict__[_TRANSPOSED] = module.weight.t().contiguous()
     for block in jepa.predictor.predictor.transformer.layers:
         attn = block.attn
         attn.__dict__.pop(_FOLDED, None)
-        if not (FOLD and supported(jepa, 1, 1)):
+        if not (FOLD and usable):
             continue
         out = attn.to_out[0] if isinstance(attn.to_out, nn.Sequential) else None
         if not isinstance(out, nn.Linear):
@@ -115,6 +151,7 @@ def rollout(jepa, emb0: torch.Tensor, action_sequence: torch.Tensor) -> torch.Te
         terms = (shift_msa, 1 + scale_msa, gate_msa, shift_mlp, 1 + scale_mlp, gate_mlp)
         conditions.append([term.unbind(dim=1) for term in terms])
 
+    wide_projector = isinstance(getattr(projector, "net", None), nn.Sequential) and hasattr(projector, "final_norm")
     position = predictor.pos_embedding[0, :1]  # (1, D)
     emb = emb0.unsqueeze(1).expand(B, S, -1, -1).reshape(N, -1)  # (N, D); history is 1
     stream = [emb]
@@ -132,7 +169,8 @@ def rollout(jepa, emb0: torch.Tensor, action_sequence: torch.Tensor) -> torch.Te
                 h = attn.to_out(F.linear(attn.norm(h), attn.to_qkv.weight[2 * inner_dim:]))
             x = _addcmul(x, gate_msa[t], h)
             h = _addcmul(shift_mlp[t], block.norm2(x), scale_mlp[t])
-            x = _addcmul(x, gate_mlp[t], block.mlp(h))
-        emb = projector(transformer.output_proj(transformer.norm(x)))
+            x = _addcmul(x, gate_mlp[t], _run(block.mlp.net, h))
+        x = transformer.output_proj(transformer.norm(x))
+        emb = projector.final_norm(_run(projector.net, x)) if wide_projector else projector(x)
         stream.append(emb)
     return torch.stack(stream, dim=1).view(B, S, T + 1, -1)
