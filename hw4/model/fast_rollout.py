@@ -44,6 +44,31 @@ def supported(jepa, history: int, history_size: int) -> bool:
     return True
 
 
+class _AddCMul(torch.autograd.Function):
+    """a + b * c with the backward written out.
+
+    torch.addcmul's derivative is grad * (c * value) even for value == 1, two kernels
+    per product. Returning grad * c and grad * b gives the same bits with one each.
+    """
+
+    @staticmethod
+    def forward(ctx, a, b, c):
+        ctx.save_for_backward(b, c)
+        return torch.addcmul(a, b, c)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad):
+        b, c = ctx.saved_tensors
+        need_a, need_b, need_c = ctx.needs_input_grad
+        return (grad if need_a else None,
+                grad * c if need_b else None,
+                grad * b if need_c else None)
+
+
+_addcmul = _AddCMul.apply
+
+
 # The attention's V projection (no bias) feeds its output projection directly when there is
 # one token, so the two matrices are multiplied once at build time: to_out(V x) = (W_out W_v) x + b.
 FOLD = os.environ.get("HW4_FOLD_VO", "1") != "0"
@@ -99,15 +124,15 @@ def rollout(jepa, emb0: torch.Tensor, action_sequence: torch.Tensor) -> torch.Te
                 transformer.layers, conditions):
             attn = block.attn
             inner_dim = attn.to_qkv.out_features // 3
-            h = torch.addcmul(shift_msa[t], block.norm1(x), scale_msa[t])
+            h = _addcmul(shift_msa[t], block.norm1(x), scale_msa[t])
             folded = attn.__dict__.get(_FOLDED)
             if folded is not None:
                 h = F.linear(attn.norm(h), folded, attn.to_out[0].bias)
             else:
                 h = attn.to_out(F.linear(attn.norm(h), attn.to_qkv.weight[2 * inner_dim:]))
-            x = torch.addcmul(x, gate_msa[t], h)
-            h = torch.addcmul(shift_mlp[t], block.norm2(x), scale_mlp[t])
-            x = torch.addcmul(x, gate_mlp[t], block.mlp(h))
+            x = _addcmul(x, gate_msa[t], h)
+            h = _addcmul(shift_mlp[t], block.norm2(x), scale_mlp[t])
+            x = _addcmul(x, gate_mlp[t], block.mlp(h))
         emb = projector(transformer.output_proj(transformer.norm(x)))
         stream.append(emb)
     return torch.stack(stream, dim=1).view(B, S, T + 1, -1)
