@@ -18,8 +18,8 @@ from .initialization import init_module_weights
 
 # Set before starting Python so every spawned worker captures the same path.
 # off: reference; sdpa: full QKV then V; v: project only the V weight rows.
-# Keep the validated baseline until the candidate passes the Nano5 gates.
-SINGLE_TOKEN_ATTENTION = os.environ.get("HW4_SINGLE_TOKEN_ATTN", "off")
+# v passed the 50-task run on Nano5 (46/50, same count as off).
+SINGLE_TOKEN_ATTENTION = os.environ.get("HW4_SINGLE_TOKEN_ATTN", "v")
 if SINGLE_TOKEN_ATTENTION not in ("off", "sdpa", "v"):
     raise ValueError("HW4_SINGLE_TOKEN_ATTN must be off, sdpa, or v")
 

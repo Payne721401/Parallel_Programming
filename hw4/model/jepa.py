@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
+from . import fast_rollout
 from .graphs import rollout_graph
 
 def detach_clone(v):
@@ -417,6 +418,8 @@ class JEPA(nn.Module):
         (B, S, T + 1, D), initial latent first. The eager path and the CUDA-graph
         capture both run this function, so they launch the same kernels.
         """
+        if fast_rollout.supported(self, history, history_size):
+            return fast_rollout.rollout(self, emb0, action_sequence)
         H = history
         B, S, T = action_sequence.shape[:3]
         act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)

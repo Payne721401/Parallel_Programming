@@ -20,6 +20,12 @@ export PROF_OUT="$HOME/hw4-prof/tasks-${TAG}-${SLURM_JOB_ID:-manual}"
 export HW4_ASSETS_VERIFIED=1
 mkdir -p "$PROF_OUT"
 echo "PROF_OUT=$PROF_OUT  host=$(hostname)  commit=$(git rev-parse --short HEAD)  tasks=$TASKS  start=$(date)"
+echo "== check.py: one case in a fresh process (startup time), then all cases =="
+{ time $PY check.py --case 01 --output "$PROF_OUT/check01.json" 2>&1 ; } 2> "$PROF_OUT/check01.time"
+cat "$PROF_OUT/check01.time"
+$PY check.py --output "$PROF_OUT/check.json" 2>&1
+$PY -c "import sys; sys.path.insert(0, '.'); import runner, torch; runner.load_model(); print('transformers imported:', 'transformers' in sys.modules)"
+echo "== evaluate.py =="
 # shellcheck disable=SC2086
 { time $PY evaluate.py --workers 8 --tasks $TASKS --no-forward-timing \
     --output-dir "$PROF_OUT/eval8" 2>&1 ; } 2> "$PROF_OUT/eval8.time"

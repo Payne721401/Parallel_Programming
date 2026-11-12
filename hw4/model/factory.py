@@ -7,16 +7,31 @@ strictly. Freezing parameters retains gradients with respect to action inputs.
 from __future__ import annotations
 
 from functools import partial
+import os
 
 import torch
 from torch import nn
-from transformers import ViTConfig, ViTModel
 
 from .hjepa import HJEPA
 from .jepa import JEPA, ProjectedEncoder, ProjectedPredictor
 from .modules import Embedder, MLP, ResidualLatentMLP
 from .predictors import ARPredictor
 from .sequence import SequenceEncoder
+
+
+# native: PyTorch-only ViT (model/vit.py), no transformers import. hf: the original.
+VIT_IMPL = os.environ.get("HW4_VIT_IMPL", "native")
+if VIT_IMPL not in ("hf", "native"):
+    raise ValueError("HW4_VIT_IMPL must be hf or native")
+
+
+def vit_layout(weights):
+    """Which transformers parameter naming the checkpoint's ViT uses, or None if unknown."""
+    if any(".layers.0.attention.q_proj.weight" in key for key in weights):
+        return "v5"
+    if any(".encoder.layer.0.attention.attention.query.weight" in key for key in weights):
+        return "v4"
+    return None
 
 
 def make_mlp(settings):
@@ -31,15 +46,29 @@ def make_mlp(settings):
     return MLP(**settings, norm_fn=norm_fn)
 
 
-def make_encoder(settings):
+def make_encoder(settings, layout=None):
     if settings["kind"] == "vit":
-        config = ViTConfig.from_dict(settings["vit_config"])
-        config._attn_implementation = settings["attention_implementation"]
-        encoder = ViTModel(
-            config,
-            add_pooling_layer=settings["add_pooling_layer"],
-            use_mask_token=settings["use_mask_token"],
-        )
+        # An unrecognised checkpoint naming falls back to the transformers model.
+        if VIT_IMPL == "native" and layout is not None:
+            from .vit import NativeViT
+
+            encoder = NativeViT(
+                settings["vit_config"],
+                attention_implementation=settings["attention_implementation"],
+                add_pooling_layer=settings["add_pooling_layer"],
+                use_mask_token=settings["use_mask_token"],
+                layout=layout,
+            )
+        else:
+            from transformers import ViTConfig, ViTModel
+
+            config = ViTConfig.from_dict(settings["vit_config"])
+            config._attn_implementation = settings["attention_implementation"]
+            encoder = ViTModel(
+                config,
+                add_pooling_layer=settings["add_pooling_layer"],
+                use_mask_token=settings["use_mask_token"],
+            )
         return ProjectedEncoder(encoder, make_mlp(settings["projector"]))
     if settings["kind"] == "latent_mlp":
         return ProjectedEncoder(ResidualLatentMLP(**settings["mlp"]))
@@ -64,9 +93,10 @@ def build_model(weights, architecture):
     if len(devices) != 1:
         raise ValueError("All weight tensors must be on the same device")
     levels = []
+    layout = vit_layout(weights)
     for settings in architecture["levels"]:
         levels.append(JEPA(
-            make_encoder(settings["encoder"]),
+            make_encoder(settings["encoder"], layout),
             ProjectedPredictor(
                 ARPredictor(**settings["predictor"]),
                 make_mlp(settings["predictor_projector"]),

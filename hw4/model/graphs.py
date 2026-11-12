@@ -79,7 +79,8 @@ def _capture(jepa, emb0, actions, history, history_size):
     started = time.perf_counter()
     before = torch.cuda.memory_allocated(device) if LOG else 0
     try:
-        graphed = torch.cuda.make_graphed_callables(core, sample)
+        # One eager warm-up pass is enough to initialise cuBLAS/cuDNN before the capture.
+        graphed = torch.cuda.make_graphed_callables(core, sample, num_warmup_iters=1)
     except Exception as error:  # this shape stays eager
         print(f"[hw4-graph] capture failed for level {jepa.level} actions {tuple(actions.shape)}, "
               f"running eager: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
