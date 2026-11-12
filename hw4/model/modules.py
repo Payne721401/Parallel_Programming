@@ -2,9 +2,11 @@
 
 Adapted from https://github.com/kevinghst/H-JEPA, revision
 97054ecaff83e13839195ec4b92d74c08a0127c5. See LICENSE.
-No inference operator or planning gradient has been replaced.
+Single-token attention has optional algebraically equivalent evaluation paths.
 """
 """Module Implementations for Transformer-based Models"""
+
+import os
 
 from einops import rearrange
 import torch
@@ -12,6 +14,14 @@ from torch.nn import functional as F
 import torch.nn as nn
 
 from .initialization import init_module_weights
+
+
+# Set before starting Python so every spawned worker captures the same path.
+# off: reference; sdpa: full QKV then V; v: project only the V weight rows.
+# Keep the validated baseline until the candidate passes the Nano5 gates.
+SINGLE_TOKEN_ATTENTION = os.environ.get("HW4_SINGLE_TOKEN_ATTN", "off")
+if SINGLE_TOKEN_ATTENTION not in ("off", "sdpa", "v"):
+    raise ValueError("HW4_SINGLE_TOKEN_ATTN must be off, sdpa, or v")
 
 
 def build_projector(projector_cfg, *, input_dim: int, output_dim: int) -> nn.Module:
@@ -87,6 +97,21 @@ class Attention(nn.Module):
         """
         x = self.norm(x)
         drop = self.dropout if self.training else 0.0
+        if (SINGLE_TOKEN_ATTENTION != "off" and not self.training
+                and x.shape[1] == 1 and drop == 0.0):
+            # One finite attention score has softmax == 1, for either causal
+            # setting. Keep normalization/output projection and input gradients.
+            if SINGLE_TOKEN_ATTENTION == "sdpa":
+                # Stage 1 keeps the original GEMM shape and only removes SDPA.
+                v = self.to_qkv(x).chunk(3, dim=-1)[2]
+            else:
+                # Stage 2: [Q rows | K rows | V rows], not interleaved by head.
+                # This row slice is a contiguous view of the original parameter:
+                # no copy, detach, new parameter, or stale cache after .to/load.
+                # F.linear sees only [inner_dim, input_dim], never the Q/K rows.
+                inner_dim = self.to_qkv.out_features // 3
+                v = F.linear(x, self.to_qkv.weight[2 * inner_dim:])
+            return self.to_out(v)
         qkv = self.to_qkv(x).chunk(3, dim=-1)  # q, k, v: (B, heads, T, dim_head)
         q, k, v = (rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in qkv)
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
