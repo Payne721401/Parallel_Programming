@@ -10,7 +10,7 @@ drop the residual (first block of a step) or the modulate (end of a step, where 
 transformer's final LayerNorm follows the residual directly; then a = n * gamma + beta).
 
 Every operation of the reference is kept; only kernel boundaries change, so results
-differ from PyTorch in the last bits (FMA contraction). Enabled with HW4_FUSED=1.
+differ from PyTorch in the last bits (FMA contraction). HW4_FUSED=0 disables it.
 Triton is imported on first use, so check.py never loads it.
 """
 from __future__ import annotations
@@ -19,7 +19,8 @@ import os
 
 import torch
 
-ENABLED = os.environ.get("HW4_FUSED", "0") == "1"
+# On by default: 49/50 tasks succeeded on Nano5 with it. HW4_FUSED=0 disables it.
+ENABLED = os.environ.get("HW4_FUSED", "1") != "0"
 BLOCK = 256  # tl.arange needs a power of two; rows are D <= BLOCK wide with the tail masked
 _K = {}
 
