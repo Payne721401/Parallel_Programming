@@ -30,6 +30,9 @@ def _kernels():
     import triton
     import triton.language as tl
 
+    # Triton resolves names used inside a kernel from the module globals, not from this closure.
+    globals().update(triton=triton, tl=tl)
+
     @triton.jit
     def chain_fwd(x_ptr, g_ptr, o_ptr, b_ptr, shift_ptr, scale_ptr, gamma_ptr, beta_ptr, u_ptr, a_ptr,
                   D, g_stride, shift_stride, scale_stride, inv_d, eps1, eps2,
