@@ -1,74 +1,53 @@
 #!/usr/bin/env bash
 # Run once after copying the assignment: bash scripts/setup_env.sh
-# Defaults to an isolated Python 3.11 environment beside this package.
+# Builds .venv beside this package over a uv-managed Python 3.11, which brings
+# its own headers and lives on a shared filesystem, so the venv runs on every
+# GPU node and Triton finds Python.h. A system Python would tie the venv to
+# the nodes that happen to have the same one installed.
 set -Eeuo pipefail
 PACKAGE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_DIR="${FOURROOM_ENV_DIR:-$PACKAGE_DIR/.venv}"
-SHARE_PACKAGES="${FOURROOM_SYSTEM_SITE_PACKAGES:-0}"
+# On Nano5: the Python the judge's own environment is built over.
+JUDGE_PYTHONS=/work/dogeon188/pp26/judge/python
 export PYTHONNOUSERSITE=1
 unset PYTHONPATH PYTHONHOME
 
 fail() { printf 'setup_env: %s\n' "$*" >&2; exit 1; }
 
-# Accept an executable path or an executable available on PATH.
-find_command() {
-    if [[ "$1" == */* ]]; then
-        [[ -x "$1" && ! -d "$1" ]] || return 1
-        printf '%s\n' "$1"
-    else
-        command -v -- "$1"
-    fi
-}
-
 is_python311() {
     "$1" -c 'import sys; sys.exit(sys.version_info[:2] != (3, 11))' >/dev/null 2>&1
 }
 
-[[ "$SHARE_PACKAGES" == 0 || "$SHARE_PACKAGES" == 1 ]] || \
-    fail 'FOURROOM_SYSTEM_SITE_PACKAGES must be 0 or 1.'
-
-if [[ ! -x "$ENV_DIR/bin/python" ]]; then
-    BASE_PYTHON=''
-    if [[ -n "${FOURROOM_BASE_PYTHON:-}" ]]; then
-        BASE_PYTHON="$(find_command "$FOURROOM_BASE_PYTHON")" || \
-            fail "Cannot execute FOURROOM_BASE_PYTHON: $FOURROOM_BASE_PYTHON"
-        is_python311 "$BASE_PYTHON" || fail 'FOURROOM_BASE_PYTHON must be Python 3.11.'
-    else
-        for candidate in python3.11 python3 python; do
-            candidate_path="$(find_command "$candidate")" || continue
-            if is_python311 "$candidate_path"; then
-                BASE_PYTHON="$candidate_path"
-                break
-            fi
-        done
-    fi
-
-    if [[ -n "$BASE_PYTHON" ]]; then
-        venv_options=()
-        if [[ "$SHARE_PACKAGES" == 1 ]]; then
-            # Explicit opt-in only; pip installs still target the new environment.
-            venv_options+=(--system-site-packages)
+# The base interpreter: FOURROOM_BASE_PYTHON if set, else the judge's
+# uv-managed Python 3.11, else one uv installs.
+BASE_PYTHON=''
+if [[ -n "${FOURROOM_BASE_PYTHON:-}" ]]; then
+    BASE_PYTHON="$(command -v -- "$FOURROOM_BASE_PYTHON")" || \
+        fail "Cannot execute FOURROOM_BASE_PYTHON: $FOURROOM_BASE_PYTHON"
+elif [[ -d "$JUDGE_PYTHONS" ]]; then
+    for candidate in $(printf '%s\n' "$JUDGE_PYTHONS"/cpython-3.11*/bin/python3.11 | sort -rV); do
+        if is_python311 "$candidate"; then
+            BASE_PYTHON="$candidate"
+            break
         fi
-        "$BASE_PYTHON" -m venv "${venv_options[@]}" "$ENV_DIR"
-    else
-        [[ "$SHARE_PACKAGES" == 0 ]] || \
-            fail 'Package sharing needs an existing Python 3.11; set FOURROOM_BASE_PYTHON.'
-        CONDA_BIN=''
-        if [[ -n "${FOURROOM_CONDA_EXE:-}" ]]; then
-            CONDA_BIN="$(find_command "$FOURROOM_CONDA_EXE")" || \
-                fail "Cannot execute FOURROOM_CONDA_EXE: $FOURROOM_CONDA_EXE"
-        else
-            for candidate in "${CONDA_EXE:-}" conda \
-                "${HOME:?}/miniconda3/bin/conda" "$HOME/miniforge3/bin/conda"; do
-                [[ -n "$candidate" ]] || continue
-                CONDA_BIN="$(find_command "$candidate")" && break
-            done
-        fi
-        [[ -n "$CONDA_BIN" ]] || fail \
-            'Python 3.11 and Conda were not found. Install Miniconda, or set FOURROOM_BASE_PYTHON / FOURROOM_CONDA_EXE.'
-        "$CONDA_BIN" create --yes --prefix "$ENV_DIR" \
-            --override-channels --channel conda-forge python=3.11 pip
-    fi
+    done
+fi
+if [[ -z "$BASE_PYTHON" ]] && command -v uv >/dev/null; then
+    uv python install 3.11 >&2
+    BASE_PYTHON="$(UV_PYTHON_PREFERENCE=only-managed uv python find 3.11)"
+fi
+[[ -n "$BASE_PYTHON" ]] || fail \
+    "No uv-managed Python 3.11: $JUDGE_PYTHONS is missing and uv is not on PATH. Install uv, or set FOURROOM_BASE_PYTHON."
+is_python311 "$BASE_PYTHON" || fail "$BASE_PYTHON is not Python 3.11."
+
+# Rebuild a venv made over any other interpreter, such as one an earlier
+# version of this script made over a system Python.
+base_of() {
+    "$1" -c 'import os, sys; print(os.path.realpath(sys._base_executable))' 2>/dev/null
+}
+if [[ "$(base_of "$ENV_DIR/bin/python" || true)" != "$(base_of "$BASE_PYTHON")" ]]; then
+    printf 'setup_env: building %s over %s\n' "$ENV_DIR" "$BASE_PYTHON"
+    "$BASE_PYTHON" -m venv --clear "$ENV_DIR"
 fi
 PYTHON="$ENV_DIR/bin/python"
 [[ -x "$PYTHON" ]] || fail "Environment creation did not provide $PYTHON"
