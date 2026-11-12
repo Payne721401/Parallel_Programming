@@ -8,7 +8,6 @@ Single-token attention has optional algebraically equivalent evaluation paths.
 
 import os
 
-from einops import rearrange
 import torch
 from torch.nn import functional as F
 import torch.nn as nn
@@ -113,9 +112,9 @@ class Attention(nn.Module):
                 v = F.linear(x, self.to_qkv.weight[2 * inner_dim:])
             return self.to_out(v)
         qkv = self.to_qkv(x).chunk(3, dim=-1)  # q, k, v: (B, heads, T, dim_head)
-        q, k, v = (rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in qkv)
+        q, k, v = (t.reshape(t.shape[0], t.shape[1], self.heads, -1).transpose(1, 2) for t in qkv)
         out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=causal)
-        out = rearrange(out, "b h t d -> b t (h d)")
+        out = out.transpose(1, 2).reshape(out.shape[0], out.shape[2], -1)
         return self.to_out(out)
 
 

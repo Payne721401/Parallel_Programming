@@ -8,11 +8,20 @@ No inference operator or planning gradient has been replaced.
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
 from torch import nn
 
 from . import fast_rollout
 from .graphs import rollout_graph
+
+def _merge01(x):
+    """(a, b, ...) -> (a * b, ...)"""
+    return x.reshape(x.shape[0] * x.shape[1], *x.shape[2:])
+
+
+def _split0(x, a):
+    """(a * b, ...) -> (a, b, ...)"""
+    return x.reshape(a, x.shape[0] // a, *x.shape[1:])
+
 
 def detach_clone(v):
     return v.detach().clone() if torch.is_tensor(v) else v
@@ -66,7 +75,7 @@ class ProjectedEncoder(nn.Module):
         return self.projector(hidden)
 
     def encode_info(self, info, *, key: str, allow_cls_token: bool = True):
-        x = rearrange(info[key].float(), "b t ... -> (b t) ...")
+        x = _merge01(info[key].float())
         return {"embed": self(x, allow_cls_token=allow_cls_token)}
 
 
@@ -121,8 +130,8 @@ class ProjectedPredictor(nn.Module):
 
     def forward(self, emb, act_emb):
         preds = self.predictor(emb, act_emb)
-        preds = self.projector(rearrange(preds, "b t d -> (b t) d"))
-        return rearrange(preds, "(b t) ... -> b t ...", b=emb.size(0))
+        preds = self.projector(_merge01(preds))
+        return _split0(preds, emb.size(0))
 
 
 class JEPA(nn.Module):
@@ -344,11 +353,7 @@ class JEPA(nn.Module):
             allow_cls_token=not chunked_state_input,
         )
         for output_key, value in encoder_outputs.items():
-            info[f"{output_key}_0"] = rearrange(
-                value,
-                "(b t) ... -> b t ...",
-                b=B,
-            )
+            info[f"{output_key}_0"] = _split0(value, B)
 
         if "action" in info:
             action_mask = info.get("action_mask")
@@ -426,9 +431,9 @@ class JEPA(nn.Module):
         n_steps = T - H
 
         emb = emb0.unsqueeze(1).expand(B, S, -1, -1)
-        emb = rearrange(emb, "b s ... -> (b s) ...").clone()
-        act = rearrange(act_0, "b s ... -> (b s) ...")
-        act_future = rearrange(act_future, "b s ... -> (b s) ...")
+        emb = _merge01(emb).clone()
+        act = _merge01(act_0)
+        act_future = _merge01(act_future)
 
         HS = history_size
         for t in range(n_steps):
@@ -448,7 +453,7 @@ class JEPA(nn.Module):
         pred_emb = self.predict(emb_trunc, act_trunc)[:, -1:]  # (BS, 1, D)
         emb = torch.cat([emb, pred_emb], dim=1)
 
-        return rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
+        return _split0(emb, B)
 
     def criterion(self, info_dict: dict):
         """Planning cost: MSE between the last cost_last_n predicted embeddings and the goal."""
