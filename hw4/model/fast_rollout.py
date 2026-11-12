@@ -21,6 +21,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from . import fused
 from .modules import Attention, ConditionalBlock, FeedForward, Transformer
 from .predictors import ARPredictor
 
@@ -126,6 +127,54 @@ def prepare(jepa) -> None:
         w_v = attn.to_qkv.weight[2 * inner_dim:]
         # The product is formed in float64 and rounded once to float32.
         attn.__dict__[_FOLDED] = (out.weight.double() @ w_v.double()).to(out.weight.dtype).contiguous()
+    jepa.__dict__[_FUSED] = _fusable(jepa)
+
+
+_FUSED = "_hw4_fused"
+
+
+def _fusable(jepa) -> bool:
+    """True when every piece the Triton path (model/fused.py) relies on is present."""
+    if not (fused.ENABLED and supported(jepa, 1, 1)):
+        return False
+    transformer = jepa.predictor.predictor.transformer
+    for block in transformer.layers:
+        net = block.mlp.net
+        kinds = (nn.LayerNorm, nn.Linear, nn.GELU, nn.Dropout, nn.Linear, nn.Dropout)
+        if len(net) != 6 or not all(isinstance(m, k) for m, k in zip(net, kinds)):
+            return False
+        if net[2].approximate != "none" or _TRANSPOSED not in net[4].__dict__ or net[4].bias is None:
+            return False
+        if _FOLDED not in block.attn.__dict__ or block.attn.to_out[0].bias is None:
+            return False
+        if block.norm1.elementwise_affine or block.norm2.elementwise_affine:
+            return False
+        if not (block.attn.norm.elementwise_affine and net[0].elementwise_affine):
+            return False
+        if block.norm1.weight is not None or transformer.norm.weight is None:
+            return False
+    return transformer.norm.normalized_shape[0] <= fused.BLOCK
+
+
+def _fused_step(transformer, conditions, x, t):
+    """One predictor step on the latent path with the fused kernels; returns transformer.norm's output."""
+    pending = None  # (gate, branch output, its bias) not yet added to x
+    for block, terms in zip(transformer.layers, conditions):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (term[t] for term in terms)
+        attn, net = block.attn, block.mlp.net
+        if pending is None:
+            a = fused.mod_norm(x, shift_msa, scale_msa, attn.norm.weight, attn.norm.bias,
+                               block.norm1.eps, attn.norm.eps)
+        else:
+            x, a = fused.res_mod_norm(x, *pending, shift_msa, scale_msa, attn.norm.weight, attn.norm.bias,
+                                      block.norm1.eps, attn.norm.eps)
+        o = torch.mm(a, attn.__dict__[_FOLDED].t())
+        x, a = fused.res_mod_norm(x, gate_msa, o, attn.to_out[0].bias, shift_mlp, scale_mlp,
+                                  net[0].weight, net[0].bias, block.norm2.eps, net[0].eps)
+        o = torch.mm(F.gelu(net[1](a)), net[4].__dict__[_TRANSPOSED])
+        pending = (gate_mlp, o, net[4].bias)
+    norm = transformer.norm
+    return fused.res_norm(x, *pending, norm.weight, norm.bias, norm.eps)
 
 
 def rollout(jepa, emb0: torch.Tensor, action_sequence: torch.Tensor) -> torch.Tensor:
@@ -155,8 +204,14 @@ def rollout(jepa, emb0: torch.Tensor, action_sequence: torch.Tensor) -> torch.Te
     position = predictor.pos_embedding[0, :1]  # (1, D)
     emb = emb0.unsqueeze(1).expand(B, S, -1, -1).reshape(N, -1)  # (N, D); history is 1
     stream = [emb]
+    use_fused = jepa.__dict__.get(_FUSED, False)
     for t in range(T):
         x = transformer.input_proj(emb + position)
+        if use_fused:
+            x = transformer.output_proj(_fused_step(transformer, conditions, x, t))
+            emb = projector.final_norm(_run(projector.net, x)) if wide_projector else projector(x)
+            stream.append(emb)
+            continue
         for block, (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) in zip(
                 transformer.layers, conditions):
             attn = block.attn
