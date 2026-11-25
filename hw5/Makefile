@@ -16,7 +16,11 @@ endif
 hw5: main.cu hw5.cu mixtral.hpp
 	$(NVCC) $(NVCCFLAGS) main.cu hw5.cu -o $@
 
+# The same build with the per-section timing of hw5.cu (HW5_PROF) compiled in. Not the judge's.
+hw5_prof: main.cu hw5.cu mixtral.hpp
+	$(NVCC) $(NVCCFLAGS) -DHW5_PROF main.cu hw5.cu -o $@
+
 clean:
-	rm -f hw5
+	rm -f hw5 hw5_prof
 
 .PHONY: clean

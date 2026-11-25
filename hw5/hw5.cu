@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -210,6 +211,75 @@ struct Row {
     bool output;   // the prompt's last prompt row, or a decode row: its next token is wanted
 };
 
+// ---- per-section timing, only with -DHW5_PROF (the judge's build has none of it) ----------------
+// mark(s) waits for both GPUs and charges the time since the previous mark to section s of the
+// current phase. Every mark synchronizes, so the sections add up to more than the judge's time.
+#ifdef HW5_PROF
+enum Seg { S_SETUP, S_EMBED, S_QKV, S_ROPE_KV, S_ATTN, S_OPROJ, S_ROUTER, S_MOE_HOST, S_MOE_XFER,
+           S_W1, S_SILU, S_W2, S_SCATTER, S_LMHEAD, S_OUT_D2H, S_FREE, N_SEG };
+const char *const SEG_NAME[N_SEG] = {"setup (alloc, rope)", "embed", "attn_norm + qkv", "rope + store_kv",
+                                     "attention", "o_proj", "mlp_norm + router + D2H", "moe host lists + upload",
+                                     "moe gather + peer copies", "expert w1", "expert silu", "expert w2",
+                                     "expert scatter_add", "final norm + lm_head", "argmax + D2H", "free"};
+struct Prof {
+    double t[2][N_SEG] = {};             // [0] prefill, [1] decode
+    double flop[2][N_SEG] = {};          // the GEMM sections' arithmetic, for GFLOP/s
+    long long expert_rows[2][N_EXPERT] = {};
+    long long attn_pairs[2] = {};        // sum over rows of the positions attended to
+    long long rows[2] = {};
+    int passes[2] = {};
+    int phase = 0;
+    std::chrono::steady_clock::time_point last;
+    std::vector<int> devs;
+
+    void sync()
+    {
+        int cur;
+        cudaGetDevice(&cur);
+        for (int d : devs) {
+            cudaSetDevice(d);
+            check(cudaDeviceSynchronize(), "prof sync");
+        }
+        cudaSetDevice(cur);
+    }
+    void start() { sync(); last = std::chrono::steady_clock::now(); }
+    void mark(Seg s, double fl = 0)
+    {
+        sync();
+        const auto now = std::chrono::steady_clock::now();
+        t[phase][s] += std::chrono::duration<double>(now - last).count();
+        flop[phase][s] += fl;
+        last = now;
+    }
+    void report() const
+    {
+        const char *ph[2] = {"prefill", "decode"};
+        double all = 0;
+        for (int p = 0; p < 2; p++)
+            for (int s = 0; s < N_SEG; s++) all += t[p][s];
+        std::fprintf(stderr, "[prof] total %.3f s (synchronized after every section)\n", all);
+        for (int p = 0; p < 2; p++) {
+            double sum = 0;
+            for (int s = 0; s < N_SEG; s++) sum += t[p][s];
+            std::fprintf(stderr, "[prof] %s: %.3f s, %d passes, %lld rows, attention pairs %lld\n", ph[p], sum, passes[p],
+                         rows[p], attn_pairs[p]);
+            for (int s = 0; s < N_SEG; s++) {
+                if (t[p][s] == 0) continue;
+                std::fprintf(stderr, "[prof]   %-26s %9.3f s %5.1f%%", SEG_NAME[s], t[p][s], 100 * t[p][s] / all);
+                if (flop[p][s] > 0) std::fprintf(stderr, "  %8.1f GFLOP/s", flop[p][s] / t[p][s] / 1e9);
+                std::fprintf(stderr, "\n");
+            }
+            std::fprintf(stderr, "[prof]   expert rows (all layers):");
+            for (int e = 0; e < N_EXPERT; e++) std::fprintf(stderr, " %lld", expert_rows[p][e]);
+            std::fprintf(stderr, "\n");
+        }
+    }
+};
+#define PROF(...) prof.__VA_ARGS__
+#else
+#define PROF(...) ((void)0)
+#endif
+
 }  // namespace
 
 void run(const std::vector<Device> &devices, const std::vector<std::vector<int>> &prompts,
@@ -217,6 +287,11 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
 {
     const int N = int(prompts.size());
     const Device &d0 = devices[0];
+#ifdef HW5_PROF
+    Prof prof;
+    for (const Device &dv : devices) prof.devs.push_back(dv.device);
+    prof.start();
+#endif
     std::vector<int> expert_device(N_EXPERT);   // which Device holds expert e
     for (size_t i = 0; i < devices.size(); i++)
         for (int e = devices[i].first_expert; e < devices[i].first_expert + devices[i].n_expert; e++) expert_device[e] = int(i);
@@ -259,8 +334,9 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
                       dalloc<float>(size_t(CHUNK) * I), dalloc<float>(size_t(CHUNK) * D)};
     }
     check(cudaSetDevice(d0.device), "cudaSetDevice");
+    PROF(mark(S_SETUP));
 
-    auto upload = [](int *d, const std::vector<int> &v) {
+    auto upload =[](int *d, const std::vector<int> &v) {
         check(cudaMemcpy(d, v.data(), v.size() * 4, cudaMemcpyHostToDevice), "upload");
     };
 
@@ -279,8 +355,15 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
         upload(d_pos, pos);
         upload(d_start, rstart);
         upload(d_slot, slot);
+#ifdef HW5_PROF
+        prof.phase = prefill ? 0 : 1;
+        prof.passes[prof.phase]++;
+        prof.rows[prof.phase] += R;
+        for (int r = 0; r < R; r++) prof.attn_pairs[prof.phase] += (long long)(rows[r].pos + 1) * N_LAYER;
+#endif
 
         embed_kernel<<<R, 256>>>(d_token, d0.embed, x);
+        PROF(mark(S_EMBED));
         for (int l = 0; l < N_LAYER; l++) {
             const LayerWeights &L = d0.layers[l];
             float *k_l = kc + size_t(l) * slots * KV_DIM, *v_l = vc + size_t(l) * slots * KV_DIM;
@@ -288,10 +371,14 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
             // Attention.
             rmsnorm_kernel<<<R, 256>>>(x, L.attn_norm, h);
             linear(h, L.qkv_w, qkv, R, QKV_DIM, D);
+            PROF(mark(S_QKV, 2.0 * R * QKV_DIM * D));
             rope_kernel<<<dim3(R, N_HEAD + N_KV), HEAD_DIM / 2>>>(qkv, d_pos, d_cos, d_sin);
             store_kv_kernel<<<R, KV_DIM>>>(qkv, d_slot, k_l, v_l);
+            PROF(mark(S_ROPE_KV));
             attention_kernel<<<blocks(size_t(R) * N_HEAD, 128), 128>>>(qkv, d_start, d_slot, k_l, v_l, att, R);
+            PROF(mark(S_ATTN));
             linear(att, L.o_w, x, R, D, Q_DIM, true);
+            PROF(mark(S_OPROJ, 2.0 * R * D * Q_DIM));
 
             // The mixture of experts: the router's choices go to the host, which lists each
             // expert's rows and weights; then each expert runs on its GPU over its rows.
@@ -301,6 +388,7 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
             std::vector<float> gate(size_t(R) * TOP_K);
             check(cudaMemcpy(sel.data(), d_sel, sel.size() * 4, cudaMemcpyDeviceToHost), "router");
             check(cudaMemcpy(gate.data(), d_gate, gate.size() * 4, cudaMemcpyDeviceToHost), "router");
+            PROF(mark(S_ROUTER));
             for (int e = 0; e < N_EXPERT; e++) {
                 std::vector<int> idx;
                 std::vector<float> g;
@@ -317,19 +405,29 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
                 const size_t j = size_t(e - dv.first_expert);   // its index on its device
                 upload(d_idx, idx);
                 check(cudaMemcpy(d_g, g.data(), n * 4, cudaMemcpyHostToDevice), "upload");
+#ifdef HW5_PROF
+                prof.expert_rows[prof.phase][e] += n;
+#endif
+                PROF(mark(S_MOE_HOST));
                 gather_kernel<<<n, 256>>>(h, d_idx, S0.he);
                 if (di != 0) {
                     check(cudaMemcpyPeer(S.he, dv.device, S0.he, d0.device, size_t(n) * D * 4), "rows to the expert's GPU");
                     check(cudaSetDevice(dv.device), "cudaSetDevice");
                 }
+                PROF(mark(S_MOE_XFER));
                 linear(S.he, dv.layers[l].w1 + j * 2 * I * D, S.t, n, 2 * I, D);
+                PROF(mark(S_W1, 2.0 * n * 2 * I * D));
                 silu_kernel<<<blocks(size_t(n) * I, 256), 256>>>(S.t, S.u, size_t(n) * I);
+                PROF(mark(S_SILU));
                 linear(S.u, dv.layers[l].w2 + j * D * I, S.y, n, D, I);
+                PROF(mark(S_W2, 2.0 * n * D * I));
                 if (di != 0) {
                     check(cudaMemcpyPeer(S0.y, d0.device, S.y, dv.device, size_t(n) * D * 4), "rows back");
                     check(cudaSetDevice(d0.device), "cudaSetDevice");
+                    PROF(mark(S_MOE_XFER));
                 }
                 scatter_add_kernel<<<n, 256>>>(x, d_idx, d_g, S0.y);
+                PROF(mark(S_SCATTER));
             }
         }
 
@@ -344,6 +442,7 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
         gather_kernel<<<n, 256>>>(x, d_idx, att);   // att holds the output rows from here
         rmsnorm_kernel<<<n, 256>>>(att, d0.final_norm, h);
         linear(h, d0.lm_head, logits, n, VOCAB, D);
+        PROF(mark(S_LMHEAD, 2.0 * n * VOCAB * D));
         argmax_kernel<<<blocks(n, 128), 128>>>(logits, d_next, n);
         std::vector<int> best(n);
         check(cudaMemcpy(best.data(), d_next, n * 4, cudaMemcpyDeviceToHost), "next tokens");
@@ -351,6 +450,7 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
         if (prefill)
             for (int o = 0; o < n; o++)
                 check(cudaMemcpy(&hidden_out[size_t(rows[out[o]].prompt) * D], h + size_t(o) * D, D * 4, cudaMemcpyDeviceToHost), "hidden");
+        PROF(mark(S_OUT_D2H));
         return next;
     };
 
@@ -395,4 +495,9 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
         check(cudaSetDevice(devices[i].device), "cudaSetDevice");
         for (float *p : {scratch[i].he, scratch[i].t, scratch[i].u, scratch[i].y}) check(cudaFree(p), "cudaFree");
     }
+#ifdef HW5_PROF
+    prof.phase = 1;
+    prof.mark(S_FREE);
+    prof.report();
+#endif
 }
