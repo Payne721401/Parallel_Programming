@@ -30,7 +30,7 @@ echo "Report directory: $report"
     echo "$mode case=$case_id phase=$phase kernel=$kernel device=$device"
 } > "$report/config.txt"
 app=(./hw5_nsight weights.bin "cases/$case_id.txt" "$report/out.bin")
-allocation=(srun -A ACD115218 -p dev -N1 -n1 -c4 --gpus-per-task=2 -t 00:06:00)
+allocation=(srun -A ACD115218 -p dev -N1 -n1 -c4 --gpus-per-node=2 -t 00:06:00)
 if [[ -n ${HW5_EXCLUDE_NODE:-} ]]; then
     allocation+=(--exclude="$HW5_EXCLUDE_NODE")
 fi
