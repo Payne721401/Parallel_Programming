@@ -166,6 +166,72 @@ __global__ void attention_kernel(const float *qkv, const int *start, const int *
     for (int i = 0; i < HEAD_DIM; i++) att[size_t(r) * Q_DIM + hd * HEAD_DIM + i] = out[i] / z;
 }
 
+// Flash-Decoding sequence split: one block per (query head, 32 cached positions).
+// Each partial stores the unnormalized value vector, maximum score and softmax mass.
+constexpr int KV_TILE = 32;
+constexpr int PART_WIDTH = HEAD_DIM + 2;
+constexpr int MAX_KV_TILES = (N_CTX + KV_TILE - 1) / KV_TILE;
+static_assert(MAX_KV_TILES <= HEAD_DIM, "merge loads one tile per thread");
+static_assert(N_HEAD * MAX_KV_TILES * PART_WIDTH <= CHUNK * 2 * I, "partials must fit expert scratch");
+
+__global__ void decode_partial_kernel(const float *qkv, const float *kc, const float *vc,
+                                      int first, int length, float *partials)
+{
+    __shared__ float scores[KV_TILE];
+    const int head = blockIdx.y, tile = blockIdx.x;
+    const int t = threadIdx.x, lane = t % 32;
+    const int offset = tile * KV_TILE, count = min(KV_TILE, length - offset);
+    const size_t base = size_t(first + offset) * KV_DIM + (head / (N_HEAD / N_KV)) * HEAD_DIM;
+    const float *q = qkv + head * HEAD_DIM;
+    for (int j = t / 32; j < count; j += HEAD_DIM / 32) {
+        const float *k = kc + base + j * KV_DIM;
+        float dot = 0.f;
+        for (int i = lane; i < HEAD_DIM; i += 32) dot = fmaf(q[i], k[i], dot);
+        for (int d = 16; d; d /= 2) dot += __shfl_down_sync(0xffffffffu, dot, d);
+        if (lane == 0) scores[j] = dot * ATTN_SCALE;
+    }
+    __syncthreads();
+    float *part = partials + (head * gridDim.x + tile) * PART_WIDTH;
+    if (t < 32) {
+        const float score = t < count ? scores[t] : -INFINITY;
+        float maximum = score;
+        for (int d = 16; d; d /= 2)
+            maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, d));
+        float weight = expf(score - maximum);
+        scores[t] = weight;
+        for (int d = 16; d; d /= 2) weight += __shfl_down_sync(0xffffffffu, weight, d);
+        if (t == 0) {
+            part[HEAD_DIM] = maximum;
+            part[HEAD_DIM + 1] = weight;
+        }
+    }
+    __syncthreads();
+    float value = 0.f;
+    for (int j = 0; j < count; j++) value = fmaf(scores[j], vc[base + j * KV_DIM + t], value);
+    part[t] = value;
+}
+
+__global__ void decode_merge_kernel(const float *partials, int tiles, float *att)
+{
+    __shared__ float scale[MAX_KV_TILES];
+    const int head = blockIdx.x, t = threadIdx.x;
+    const float *parts = partials + head * tiles * PART_WIDTH;
+    if (t < tiles) scale[t] = parts[t * PART_WIDTH + HEAD_DIM];
+    __syncthreads();
+    float maximum = -INFINITY;
+    for (int j = 0; j < tiles; j++) maximum = fmaxf(maximum, scale[j]);
+    __syncthreads();
+    if (t < tiles) scale[t] = expf(scale[t] - maximum);
+    __syncthreads();
+    float value = 0.f, mass = 0.f;
+    for (int j = 0; j < tiles; j++) {
+        const float *part = parts + j * PART_WIDTH;
+        value = fmaf(scale[j], part[t], value);
+        mass = fmaf(scale[j], part[HEAD_DIM + 1], mass);
+    }
+    att[head * HEAD_DIM + t] = value / mass;
+}
+
 // One thread per row: the 8 router logits, the two largest (the lower index on a tie) and their
 // softmax weights.
 __global__ void router_kernel(const float *h, const __nv_bfloat16 *router_w, int *sel, float *gate, int rows)
@@ -395,7 +461,15 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
             rope_kernel<<<dim3(R, N_HEAD + N_KV), HEAD_DIM / 2>>>(qkv, d_pos, d_cos, d_sin);
             store_kv_kernel<<<R, KV_DIM>>>(qkv, d_slot, k_l, v_l);
             PROF(mark(S_ROPE_KV));
-            attention_kernel<<<blocks(size_t(R) * N_HEAD, 128), 128>>>(qkv, d_start, d_slot, k_l, v_l, att, R);
+            if (!prefill && R == 1) {
+                const int length = pos[0] + 1, tiles = blocks(length, KV_TILE);
+                // The expert intermediate is idle until the MoE stage on this same stream.
+                float *parts = scratch[0].t;
+                decode_partial_kernel<<<dim3(tiles, N_HEAD), HEAD_DIM>>>(qkv, k_l, v_l, rstart[0], length, parts);
+                decode_merge_kernel<<<N_HEAD, HEAD_DIM>>>(parts, tiles, att);
+            } else {
+                attention_kernel<<<blocks(size_t(R) * N_HEAD, 128), 128>>>(qkv, d_start, d_slot, k_l, v_l, att, R);
+            }
             PROF(mark(S_ATTN));
             linear(att, L.o_w, x, R, D, Q_DIM, true);
             PROF(mark(S_OPROJ, 2.0 * R * D * Q_DIM));
