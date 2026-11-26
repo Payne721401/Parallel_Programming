@@ -1,0 +1,13 @@
+srun: job 503459 queued and waiting for resources
+srun: job 503459 has been allocated resources
+Devices: 2, experts per device: 4, weights per device: 44.9902 GB, free: 33.5615 GB
+Load time: 24.3485 s (CUDA contexts and weights; not counted)
+[hw5] expert transport: packed direct P2P
+Capture range started in the application.
+Capture range ended in the application.
+Generating '/tmp/nsys-report-20e2.qdstrm'
+[1/1] [0%                          ] timeline.nsys-rep[1/1] [0%                          ] timeline.nsys-rep[1/1] [8%                          ] timeline.nsys-rep[1/1] [0%                          ] timeline.nsys-rep[1/1] [5%                          ] timeline.nsys-rep[1/1] [9%                          ] timeline.nsys-rep[1/1] [6%                          ] timeline.nsys-rep[1/1] [==19%                       ] timeline.nsys-rep[1/1] [======35%                   ] timeline.nsys-rep[1/1] [===========50%              ] timeline.nsys-rep[1/1] [===============66%          ] timeline.nsys-rep[1/1] [==================77%       ] timeline.nsys-rep[1/1] [========================100%] timeline.nsys-rep[1/1] [========================100%] timeline.nsys-rep
+Case dec12_60.txt: prompts 1, tokens 513, generate 60
+Compute time: 6.74016 s
+Generated:
+    /home/ou721401/Parallel_Programming/hw5/nsight-systems-dec12-5Ndxax/timeline.nsys-rep
