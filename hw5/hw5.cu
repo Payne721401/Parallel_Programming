@@ -70,8 +70,8 @@ __global__ void rmsnorm_kernel(const float *x, const __nv_bfloat16 *scale, float
 }
 
 // y[M][N] = x[M][K] * W[N][K]^T, or y += it. A block of 256 threads computes a 64x64 tile of y,
-// each thread a 4x4 piece of it, from 64x16 slices of x and W staged in shared memory.
-constexpr int TM = 64, TN = 64, TK = 16;
+// each thread a 4x4 piece of it, from 64x32 slices of x and W staged in shared memory.
+constexpr int TM = 64, TN = 64, TK = 32;
 __global__ void linear_kernel(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add)
 {
     __shared__ float xs[TM][TK + 1], ws[TN][TK + 1];
@@ -113,8 +113,8 @@ __global__ void gemv_kernel(const float *x, const __nv_bfloat16 *W, float *y, in
     if (lane == 0) y[out] = add ? y[out] + sum : sum;
 }
 
-// Share each converted weight across up to four token rows in the same warp.
-constexpr int SMALL_ROWS = 4;
+// Reuse a converted weight across several token rows before loading the next one.
+template <int SMALL_ROWS>
 __global__ void small_linear_kernel(const float *x, const __nv_bfloat16 *W, float *y,
                                     int M, int N, int K, bool add)
 {
@@ -146,19 +146,23 @@ __global__ void small_linear_kernel(const float *x, const __nv_bfloat16 *W, floa
 }
 
 // Every K here (D, Q_DIM, I) is a multiple of TK.
-void linear(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add = false)
+void linear(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add = false, cudaStream_t stream = nullptr)
 {
     if (M == 1) {
-        gemv_kernel<<<blocks(N, GEMV_WARPS), GEMV_WARPS * 32>>>(x, W, y, N, K, add);
+        gemv_kernel<<<blocks(N, GEMV_WARPS), GEMV_WARPS * 32, 0, stream>>>(x, W, y, N, K, add);
         return;
     }
     if (M <= 16) {
-        dim3 grid(blocks(N, GEMV_WARPS), blocks(M, SMALL_ROWS));
-        small_linear_kernel<<<grid, GEMV_WARPS * 32>>>(x, W, y, M, N, K, add);
+        const int gx = blocks(N, GEMV_WARPS);
+        if (N == 2 * I && M >= 8) {
+            small_linear_kernel<8><<<dim3(gx, blocks(M, 8)), GEMV_WARPS * 32, 0, stream>>>(x, W, y, M, N, K, add);
+        } else {
+            small_linear_kernel<4><<<dim3(gx, blocks(M, 4)), GEMV_WARPS * 32, 0, stream>>>(x, W, y, M, N, K, add);
+        }
         return;
     }
     dim3 grid(blocks(N, TN), blocks(M, TM));
-    linear_kernel<<<grid, 256>>>(x, W, y, M, N, K, add);
+    linear_kernel<<<grid, 256, 0, stream>>>(x, W, y, M, N, K, add);
 }
 
 // Rotates q's 32 heads and k's 8 by each row's position. Grid: (rows, N_HEAD + N_KV), block: 64.
@@ -281,18 +285,18 @@ __global__ void decode_merge_kernel(const float *partials, int tile_stride, cons
     att[row_head * HEAD_DIM + t] = value / mass;
 }
 
-// One thread per row: the 8 router logits, the two largest (the lower index on a tie) and their
-// softmax weights.
-__global__ void router_kernel(const float *h, const __nv_bfloat16 *router_w, int *sel, float *gate, int rows)
+// One block per token, one warp per expert. Preserve lowest-index ties.
+__global__ void router_kernel(const float *h, const __nv_bfloat16 *router_w, int *sel, float *gate)
 {
-    const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
-    float lg[N_EXPERT];
-    for (int e = 0; e < N_EXPERT; e++) {
-        float s = 0.f;
-        for (int i = 0; i < D; i++) s += h[size_t(r) * D + i] * __bfloat162float(router_w[size_t(e) * D + i]);
-        lg[e] = s;
-    }
+    __shared__ float lg[N_EXPERT];
+    const int r = blockIdx.x, expert = threadIdx.x / 32, lane = threadIdx.x % 32;
+    float sum = 0.f;
+    for (int i = lane; i < D; i += 32)
+        sum = fmaf(h[size_t(r) * D + i], __bfloat162float(router_w[size_t(expert) * D + i]), sum);
+    for (int step = 16; step; step /= 2) sum += __shfl_down_sync(0xffffffffu, sum, step);
+    if (lane == 0) lg[expert] = sum;
+    __syncthreads();
+    if (threadIdx.x != 0) return;
     int e1 = 0;
     for (int e = 1; e < N_EXPERT; e++)
         if (lg[e] > lg[e1]) e1 = e;
@@ -354,11 +358,11 @@ struct Row {
 // current phase. Every mark synchronizes, so the sections add up to more than the judge's time.
 #ifdef HW5_PROF
 enum Seg { S_SETUP, S_EMBED, S_QKV, S_ROPE_KV, S_ATTN, S_OPROJ, S_ROUTER, S_MOE_HOST, S_MOE_XFER,
-           S_W1, S_SILU, S_W2, S_SCATTER, S_LMHEAD, S_OUT_D2H, S_FREE, N_SEG };
+           S_W1, S_SILU, S_W2, S_SCATTER, S_PARALLEL_MOE, S_LMHEAD, S_OUT_D2H, S_FREE, N_SEG };
 const char *const SEG_NAME[N_SEG] = {"setup (alloc, rope)", "embed", "attn_norm + qkv", "rope + store_kv",
                                      "attention", "o_proj", "mlp_norm + router + ids D2H", "moe group + routes H2D",
                                      "moe gather + peer copies", "expert w1", "expert silu", "expert w2",
-                                     "expert scatter_add", "final norm + lm_head", "argmax + D2H", "free"};
+                                     "expert scatter_add", "two-GPU MoE wall time", "final norm + lm_head", "argmax + D2H", "free"};
 struct Prof {
     double t[2][N_SEG] = {};             // [0] prefill, [1] decode
     double flop[2][N_SEG] = {};          // the GEMM sections' arithmetic, for GFLOP/s
@@ -466,6 +470,45 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
     check(cudaMemcpy(d_cos, rcos.data(), rcos.size() * 4, cudaMemcpyHostToDevice), "rope");
     check(cudaMemcpy(d_sin, rsin.data(), rsin.size() * 4, cudaMemcpyHostToDevice), "rope");
 
+    // Only undo access enabled by this call. A staged link can still overlap expert work.
+    bool peer_owned[2] = {};
+    bool parallel = devices.size() == 2;
+#ifdef HW5_SERIAL_EXPERTS
+    parallel = false;  // diagnostic control: new compute kernels, original serial transport
+#endif
+    bool direct = parallel;
+    for (int i = 0; direct && i < 2; ++i) {
+        int can_access = 0;
+        const int peer = devices[1 - i].device;
+        check(cudaDeviceCanAccessPeer(&can_access, devices[i].device, peer), "query peer access");
+        if (!can_access) { direct = false; break; }
+        check(cudaSetDevice(devices[i].device), "select peer device");
+        cudaError_t status = cudaDeviceEnablePeerAccess(peer, 0);
+        if (status == cudaSuccess) peer_owned[i] = true;
+        else if (status == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
+        else if (status == cudaErrorTooManyPeers) { cudaGetLastError(); direct = false; }
+        else check(status, "enable peer access");
+    }
+    cudaEvent_t packed_ready = nullptr, results_ready = nullptr;
+    cudaStream_t remote_stream = nullptr;
+    float *stage = nullptr, *remote_rows = nullptr, *host_stage = nullptr;
+#if defined(HW5_PROF) || defined(HW5_NSIGHT)
+    std::fprintf(stderr, "[hw5] expert transport: %s\n",
+                 !parallel ? "serial peer copies" : direct ? "packed direct P2P" : "packed host staging");
+#endif
+    if (parallel) {
+        const size_t capacity = std::min(size_t(CHUNK), slots) * TOP_K * D;
+        check(cudaSetDevice(d0.device), "select staging device");
+        stage = dalloc<float>(capacity);
+        if (!direct)
+            check(cudaMallocHost(&host_stage, capacity * sizeof(float)), "allocate pinned staging");
+        check(cudaEventCreateWithFlags(&packed_ready, cudaEventDisableTiming), "packed event");
+        check(cudaSetDevice(devices[1].device), "select remote device");
+        remote_rows = dalloc<float>(capacity);
+        check(cudaStreamCreateWithFlags(&remote_stream, cudaStreamNonBlocking), "remote stream");
+        check(cudaEventCreateWithFlags(&results_ready, cudaEventDisableTiming), "results event");
+    }
+
     // On each GPU: an expert's rows in (he), its hidden layer (t, u) and its output (y).
     struct Scratch { float *he, *t, *u, *y; };
     std::vector<Scratch> scratch(devices.size());
@@ -537,7 +580,7 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
 
             // Group flat routing-table indices by expert. Gates stay on GPU 0 for scatter.
             rmsnorm_kernel<<<R, 256>>>(x, L.mlp_norm, h);
-            router_kernel<<<blocks(R, 128), 128>>>(h, L.router_w, d_sel, d_gate, R);
+            router_kernel<<<R, N_EXPERT * 32>>>(h, L.router_w, d_sel, d_gate);
             check(cudaMemcpy(sel.data(), d_sel, sel.size() * 4, cudaMemcpyDeviceToHost), "router");
             PROF(mark(S_ROUTER));
             int offsets[N_EXPERT + 1] = {};
@@ -548,36 +591,84 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
             for (int j = 0; j < R * TOP_K; ++j) routes[cursor[sel[j]]++] = j;
             upload(d_idx, routes);
             PROF(mark(S_MOE_HOST));
-            for (int e = 0; e < N_EXPERT; e++) {
+            // A contiguous expert range on each device makes each remote batch one transfer.
+            const int split = parallel ? devices[1].first_expert : N_EXPERT;
+            const int first_remote = offsets[split];
+            const int n_remote = offsets[N_EXPERT] - first_remote;
+            auto project_expert = [&](int e, int di, int n, const float *input, float *output, cudaStream_t stream) {
+                const Device &device = devices[di];
+                const Scratch &work = scratch[di];
+                const size_t j = size_t(e - device.first_expert);
+                linear(input, device.layers[l].w1 + j * 2 * I * D, work.t, n, 2 * I, D, false, stream);
+                if (!n_remote) { PROF(mark(S_W1, 2.0 * n * 2 * I * D)); }
+                silu_kernel<<<blocks(size_t(n) * I, 256), 256, 0, stream>>>(work.t, work.u, size_t(n) * I);
+                if (!n_remote) { PROF(mark(S_SILU)); }
+                linear(work.u, device.layers[l].w2 + j * D * I, output, n, D, I, false, stream);
+                if (!n_remote) { PROF(mark(S_W2, 2.0 * n * D * I)); }
+#ifdef HW5_PROF
+                prof.expert_rows[prof.phase][e] += n;
+#endif
+            };
+            if (n_remote) {
+                const Device &remote = devices[1];
+                const size_t bytes = size_t(n_remote) * D * sizeof(float);
+                gather_kernel<TOP_K><<<n_remote, 256>>>(h, d_idx + first_remote, stage);
+                if (direct)
+                    check(cudaMemcpyPeerAsync(remote_rows, remote.device, stage, d0.device, bytes), "send packed rows");
+                else
+                    check(cudaMemcpyAsync(host_stage, stage, bytes, cudaMemcpyDeviceToHost), "stage remote inputs");
+                check(cudaEventRecord(packed_ready), "publish remote inputs");
+                check(cudaSetDevice(remote.device), "select remote experts");
+                check(cudaStreamWaitEvent(remote_stream, packed_ready, 0), "wait for gathered rows");
+                if (!direct)
+                    check(cudaMemcpyAsync(remote_rows, host_stage, bytes, cudaMemcpyHostToDevice, remote_stream), "load remote inputs");
+                for (int e = split; e < N_EXPERT; ++e) {
+                    const int n = offsets[e + 1] - offsets[e];
+                    if (!n) continue;
+                    float *rows_e = remote_rows + size_t(offsets[e] - first_remote) * D;
+                    project_expert(e, 1, n, rows_e, rows_e, remote_stream);
+                }
+                if (direct)
+                    check(cudaMemcpyPeerAsync(stage, d0.device, remote_rows, remote.device, bytes, remote_stream), "return packed rows");
+                else
+                    check(cudaMemcpyAsync(host_stage, remote_rows, bytes, cudaMemcpyDeviceToHost, remote_stream), "stage remote results");
+                check(cudaEventRecord(results_ready, remote_stream), "publish remote results");
+                check(cudaSetDevice(d0.device), "select local experts");
+            }
+            for (int e = 0; e < split; e++) {
                 const int n = offsets[e + 1] - offsets[e];
                 if (n == 0) continue;
                 const int di = expert_device[e];
                 const Device &dv = devices[di];
                 const Scratch &S0 = scratch[0], &S = scratch[di];
-                const size_t j = size_t(e - dv.first_expert);   // its index on its device
                 const int *expert_routes = d_idx + offsets[e];
-#ifdef HW5_PROF
-                prof.expert_rows[prof.phase][e] += n;
-#endif
                 gather_kernel<TOP_K><<<n, 256>>>(h, expert_routes, S0.he);
                 if (di != 0) {
                     check(cudaMemcpyPeer(S.he, dv.device, S0.he, d0.device, size_t(n) * D * 4), "rows to the expert's GPU");
                     check(cudaSetDevice(dv.device), "cudaSetDevice");
                 }
-                PROF(mark(S_MOE_XFER));
-                linear(S.he, dv.layers[l].w1 + j * 2 * I * D, S.t, n, 2 * I, D);
-                PROF(mark(S_W1, 2.0 * n * 2 * I * D));
-                silu_kernel<<<blocks(size_t(n) * I, 256), 256>>>(S.t, S.u, size_t(n) * I);
-                PROF(mark(S_SILU));
-                linear(S.u, dv.layers[l].w2 + j * D * I, S.y, n, D, I);
-                PROF(mark(S_W2, 2.0 * n * D * I));
+                if (!n_remote) { PROF(mark(S_MOE_XFER)); }
+                project_expert(e, di, n, S.he, S.y, nullptr);
                 if (di != 0) {
                     check(cudaMemcpyPeer(S0.y, d0.device, S.y, dv.device, size_t(n) * D * 4), "rows back");
                     check(cudaSetDevice(d0.device), "cudaSetDevice");
-                    PROF(mark(S_MOE_XFER));
+                    if (!n_remote) { PROF(mark(S_MOE_XFER)); }
                 }
                 scatter_add_kernel<<<n, 256>>>(x, expert_routes, d_gate, S0.y);
-                PROF(mark(S_SCATTER));
+                if (!n_remote) { PROF(mark(S_SCATTER)); }
+            }
+            if (n_remote) {
+                check(cudaStreamWaitEvent(nullptr, results_ready, 0), "join remote experts");
+                if (!direct)
+                    check(cudaMemcpyAsync(stage, host_stage, size_t(n_remote) * D * sizeof(float),
+                                          cudaMemcpyHostToDevice), "load remote results");
+                // Preserve the original expert-ID accumulation order for rows routed twice.
+                for (int e = split; e < N_EXPERT; ++e) {
+                    const int n = offsets[e + 1] - offsets[e];
+                    if (n) scatter_add_kernel<<<n, 256>>>(x, d_idx + offsets[e], d_gate,
+                        stage + size_t(offsets[e] - first_remote) * D);
+                }
+                PROF(mark(S_PARALLEL_MOE));
             }
         }
 
@@ -652,6 +743,20 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
     for (size_t i = 0; i < devices.size(); i++) {
         check(cudaSetDevice(devices[i].device), "cudaSetDevice");
         for (float *p : {scratch[i].he, scratch[i].t, scratch[i].u, scratch[i].y}) check(cudaFree(p), "cudaFree");
+    }
+    if (parallel) {
+        check(cudaSetDevice(devices[1].device), "release remote staging");
+        check(cudaFree(remote_rows), "free remote rows");
+        check(cudaStreamDestroy(remote_stream), "destroy remote stream");
+        check(cudaEventDestroy(results_ready), "destroy results event");
+        check(cudaSetDevice(d0.device), "release local staging");
+        check(cudaFree(stage), "free staging");
+        if (host_stage) check(cudaFreeHost(host_stage), "free pinned staging");
+        check(cudaEventDestroy(packed_ready), "destroy packed event");
+    }
+    for (int i = 0; i < 2; ++i) if (peer_owned[i]) {
+        check(cudaSetDevice(devices[i].device), "release peer access");
+        check(cudaDeviceDisablePeerAccess(devices[1 - i].device), "disable peer access");
     }
 #ifdef HW5_NSIGHT
     check(cudaSetDevice(d0.device), "restore capture device");
