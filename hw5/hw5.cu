@@ -93,9 +93,29 @@ __global__ void linear_kernel(const float *x, const __nv_bfloat16 *W, float *y, 
         }
 }
 
+// Single-row projection: one warp computes one dot product along a contiguous row of W.
+constexpr int GEMV_WARPS = 4;
+__global__ void gemv_kernel(const float *x, const __nv_bfloat16 *W, float *y, int N, int K, bool add)
+{
+    const int out = blockIdx.x * GEMV_WARPS + threadIdx.x / 32;
+    if (out >= N) return;  // uniform within each warp
+    const int lane = threadIdx.x % 32;
+    const __nv_bfloat16 *w = W + size_t(out) * K;
+    float sum = 0.f;
+    for (int k = lane; k < K; k += 32)
+        sum = fmaf(x[k], __bfloat162float(w[k]), sum);
+    for (int offset = 16; offset > 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0) y[out] = add ? y[out] + sum : sum;
+}
+
 // Every K here (D, Q_DIM, I) is a multiple of TK.
 void linear(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add = false)
 {
+    if (M == 1) {
+        gemv_kernel<<<blocks(N, GEMV_WARPS), GEMV_WARPS * 32>>>(x, W, y, N, K, add);
+        return;
+    }
     dim3 grid(blocks(N, TN), blocks(M, TM));
     linear_kernel<<<grid, 256>>>(x, W, y, M, N, K, add);
 }
