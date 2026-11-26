@@ -97,78 +97,94 @@ __global__ void linear_kernel(const float *x, const __nv_bfloat16 *W, float *y, 
         }
 }
 
-// Few rows (decode): a projection reads all of W for little arithmetic, so it is bound by how
-// fast W streams in, as in TensorRT-LLM's batched GEMV. One warp computes one output column for
-// up to R rows: each lane loads 8 bf16 of the column's row of W at once (16 bytes), widens them
-// exactly by shifting the bits into an fp32 (bf16 is fp32's top half), and uses each against the
-// same 8 values of every row's x (two float4 loads), so W is read once for all R rows. The 8 warps
-// of a block share x through L1.
+// Few rows (decode): a projection reads all of W for little arithmetic. The tiling follows
+// TensorRT-LLM's weightOnlyBatchedGemv (v0.7.1 kernel.h), whose threads each hold an accumulator
+// of Batch x NPerBlock: every 16-byte activation load is used against NPerBlock weight columns,
+// and every weight load against all Batch rows. Nsight Compute showed the one-column version
+// spending its time on L1 (82-98% busy, 65x more L1 load traffic than weight bytes) re-reading x,
+// with DRAM at 4-43%, so x is now loaded once for C columns.
 //
-// Every product and sum is fp32. Each lane sums its 8-wide chunks in increasing k, and the warp
-// adds the 32 lane sums in one fixed tree, the same for every R, so a row's result does not depend
-// on how many rows share the launch.
+// One warp computes C consecutive output columns for up to R rows. Each lane loads 8 bf16 of each
+// column's row of W at once (16 bytes), widens them exactly by moving the bits into an fp32's top
+// half (bf16 is fp32's top half), and applies them to the same 8 values of every row's x (two
+// float4 loads, shared by the C columns). Every product and sum is fp32. Each lane sums its 8-wide
+// chunks in increasing k and the warp adds the 32 lane sums in one fixed tree, the same for every
+// R and C, so an output does not depend on how many rows share the launch.
 constexpr int SKINNY_WARPS = 8, SKINNY_MAX_ROWS = 64;
 static_assert(D % 256 == 0 && Q_DIM % 256 == 0 && I % 256 == 0, "every K is a whole number of 32 lanes x 8");
 
 __device__ __forceinline__ float bf16_lo(unsigned u) { return __uint_as_float(u << 16); }
 __device__ __forceinline__ float bf16_hi(unsigned u) { return __uint_as_float(u & 0xffff0000u); }
 
-template <int R>
+template <int R, int C>
 __global__ void __launch_bounds__(SKINNY_WARPS * 32) skinny_kernel(const float *x, const __nv_bfloat16 *W, float *y,
                                                                    int M, int N, int K, bool add)
 {
-    const int out = blockIdx.x * SKINNY_WARPS + threadIdx.x / 32;
-    if (out >= N) return;   // uniform within each warp
-    const int lane = threadIdx.x % 32, first = blockIdx.y * R;
-    const uint4 *w = reinterpret_cast<const uint4 *>(W + size_t(out) * K);
-    const float4 *xr[R];
+    const int out0 = (blockIdx.x * SKINNY_WARPS + threadIdx.x / 32) * C;
+    if (out0 >= N) return;   // uniform within each warp; N is a multiple of C
+    const int lane = threadIdx.x % 32, first = blockIdx.y * R, k4 = K / 4;
+    const uint4 *w = reinterpret_cast<const uint4 *>(W + size_t(out0) * K);
+    const float4 *x4 = reinterpret_cast<const float4 *>(x);
+    int row_off[R];
     #pragma unroll
-    for (int r = 0; r < R; r++) xr[r] = reinterpret_cast<const float4 *>(x + size_t(min(first + r, M - 1)) * K);
-    float sum[R];
+    for (int r = 0; r < R; r++) row_off[r] = min(first + r, M - 1) * k4;
+    float sum[R][C];
     #pragma unroll
-    for (int r = 0; r < R; r++) sum[r] = 0.f;
-    #pragma unroll 2
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int j = 0; j < C; j++) sum[r][j] = 0.f;
     for (int c = lane; c < K / 8; c += 32) {
-        const uint4 p = __ldg(w + c);
-        const float wf[8] = {bf16_lo(p.x), bf16_hi(p.x), bf16_lo(p.y), bf16_hi(p.y),
-                             bf16_lo(p.z), bf16_hi(p.z), bf16_lo(p.w), bf16_hi(p.w)};
+        float wf[C][8];
+        #pragma unroll
+        for (int j = 0; j < C; j++) {
+            const uint4 p = __ldg(w + size_t(j) * (K / 8) + c);
+            wf[j][0] = bf16_lo(p.x); wf[j][1] = bf16_hi(p.x); wf[j][2] = bf16_lo(p.y); wf[j][3] = bf16_hi(p.y);
+            wf[j][4] = bf16_lo(p.z); wf[j][5] = bf16_hi(p.z); wf[j][6] = bf16_lo(p.w); wf[j][7] = bf16_hi(p.w);
+        }
         #pragma unroll
         for (int r = 0; r < R; r++) {
-            const float4 a = __ldg(xr[r] + 2 * c), b = __ldg(xr[r] + 2 * c + 1);
-            float s = sum[r];
-            s = fmaf(a.x, wf[0], s); s = fmaf(a.y, wf[1], s); s = fmaf(a.z, wf[2], s); s = fmaf(a.w, wf[3], s);
-            s = fmaf(b.x, wf[4], s); s = fmaf(b.y, wf[5], s); s = fmaf(b.z, wf[6], s); s = fmaf(b.w, wf[7], s);
-            sum[r] = s;
+            const float4 a = __ldg(x4 + row_off[r] + 2 * c), b = __ldg(x4 + row_off[r] + 2 * c + 1);
+            #pragma unroll
+            for (int j = 0; j < C; j++) {
+                float s = sum[r][j];
+                s = fmaf(a.x, wf[j][0], s); s = fmaf(a.y, wf[j][1], s); s = fmaf(a.z, wf[j][2], s); s = fmaf(a.w, wf[j][3], s);
+                s = fmaf(b.x, wf[j][4], s); s = fmaf(b.y, wf[j][5], s); s = fmaf(b.z, wf[j][6], s); s = fmaf(b.w, wf[j][7], s);
+                sum[r][j] = s;
+            }
         }
     }
     #pragma unroll
-    for (int r = 0; r < R; r++) {
-        float s = sum[r];
-        for (int d = 16; d; d /= 2) s += __shfl_down_sync(0xffffffffu, s, d);
-        if (lane == 0 && first + r < M) {
-            float *dst = y + size_t(first + r) * N + out;
-            *dst = add ? *dst + s : s;
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int j = 0; j < C; j++) {
+            float s = sum[r][j];
+            for (int d = 16; d; d /= 2) s += __shfl_down_sync(0xffffffffu, s, d);
+            if (lane == 0 && first + r < M) {
+                float *dst = y + size_t(first + r) * N + out0 + j;
+                *dst = add ? *dst + s : s;
+            }
         }
-    }
 }
 
-template <int R>
+template <int R, int C>
 void skinny(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add, cudaStream_t stream)
 {
-    skinny_kernel<R><<<dim3(blocks(N, SKINNY_WARPS), blocks(M, R)), SKINNY_WARPS * 32, 0, stream>>>(x, W, y, M, N, K, add);
+    skinny_kernel<R, C><<<dim3(blocks(N, SKINNY_WARPS * C), blocks(M, R)), SKINNY_WARPS * 32, 0, stream>>>(x, W, y, M, N, K, add);
 }
 
-// Every K here (D, Q_DIM, I) is a multiple of TK and of 256. x, W and y are the starts of
-// allocations or of whole rows in them, so the 16-byte loads of skinny_kernel are aligned.
+// Every K here (D, Q_DIM, I) is a multiple of TK and of 256, and every N (QKV_DIM, D, 2I, VOCAB)
+// of 4. x, W and y are the starts of allocations or of whole rows in them, so the 16-byte loads
+// of skinny_kernel are aligned. Up to 16 rows share one pass over W; 17-64 rows take 2-4 passes,
+// which keeps the accumulators (R x C = 32) and so the occupancy where Nsight showed R = 32 lose it.
+static_assert(QKV_DIM % 4 == 0 && D % 4 == 0 && (2 * I) % 4 == 0 && VOCAB % 4 == 0, "C divides every N");
 void linear(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add = false, cudaStream_t stream = nullptr)
 {
-    if (M <= SKINNY_MAX_ROWS) {   // one launch reads W once per 32 rows at most
-        if (M == 1) skinny<1>(x, W, y, M, N, K, add, stream);
-        else if (M <= 2) skinny<2>(x, W, y, M, N, K, add, stream);
-        else if (M <= 4) skinny<4>(x, W, y, M, N, K, add, stream);
-        else if (M <= 8) skinny<8>(x, W, y, M, N, K, add, stream);
-        else if (M <= 16) skinny<16>(x, W, y, M, N, K, add, stream);
-        else skinny<32>(x, W, y, M, N, K, add, stream);
+    if (M <= SKINNY_MAX_ROWS) {
+        if (M == 1) skinny<1, 4>(x, W, y, M, N, K, add, stream);
+        else if (M <= 2) skinny<2, 4>(x, W, y, M, N, K, add, stream);
+        else if (M <= 4) skinny<4, 4>(x, W, y, M, N, K, add, stream);
+        else if (M <= 8) skinny<8, 4>(x, W, y, M, N, K, add, stream);
+        else skinny<16, 2>(x, W, y, M, N, K, add, stream);
         return;
     }
     dim3 grid(blocks(N, TN), blocks(M, TM));
