@@ -1,0 +1,15 @@
+srun: job 503375 queued and waiting for resources
+srun: job 503375 has been allocated resources
+job=503375 node=hgpn01 CUDA_VISIBLE_DEVICES=0,1 SLURM_STEP_GPUS=1,3
+Before Nsight: cudaGetDeviceCount status=0, visible=2
+Devices: 2, experts per device: 4, weights per device: 44.9902 GB, free: 33.5615 GB
+Load time: 23.9794 s (CUDA contexts and weights; not counted)
+[hw5] expert transport: packed direct P2P
+Capture range started in the application.
+Capture range ended in the application.
+Generating '/tmp/nsys-report-cbbf.qdstrm'
+[1/1] [0%                          ] timeline.nsys-rep[1/1] [0%                          ] timeline.nsys-rep[1/1] [8%                          ] timeline.nsys-rep[1/1] [==19%                       ] timeline.nsys-rep[1/1] [======35%                   ] timeline.nsys-rep[1/1] [=======36%                  ] timeline.nsys-rep[1/1] [=======37%                  ] timeline.nsys-rep[1/1] [=======38%                  ] timeline.nsys-rep[1/1] [====================85%     ] timeline.nsys-rep[1/1] [========================100%] timeline.nsys-rep[1/1] [========================100%] timeline.nsys-rep
+Case cases/03.txt: prompts 16, tokens 6298, generate 16
+Compute time: 8.16379 s
+Generated:
+    /home/ou721401/Parallel_Programming/hw5/nsight-systems-03-WJKhmD/timeline.nsys-rep
