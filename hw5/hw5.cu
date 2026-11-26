@@ -216,10 +216,15 @@ static_assert(D % 256 == 0 && Q_DIM % 256 == 0 && I % 256 == 0, "every K is a wh
 
 // At least 2 blocks per SM: ptxas gave <8,4> 148 and <16,2> 144 registers, which Nsight Compute
 // showed holding the SM to one block, 12.5% of its warps, with DRAM at 9-19%.
+//
+// With dM, the rows are counted on the GPU (decode routing): M is only the bound the grid covers,
+// *dM the rows there are, and blocks past them return. The arithmetic of each row is unchanged.
 template <int R, int C>
 __global__ void __launch_bounds__(SKINNY_WARPS * 32, 2) skinny_kernel(const float *x, const __nv_bfloat16 *W, float *y,
-                                                                   int M, int N, int K, bool add)
+                                                                   int M, int N, int K, bool add, const int *dM)
 {
+    if (dM) M = *dM;
+    if (int(blockIdx.y) * R >= M) return;   // uniform within the block
     const int out0 = (blockIdx.x * SKINNY_WARPS + threadIdx.x / 32) * C;
     if (out0 >= N) return;   // uniform within each warp; N is a multiple of C
     const int lane = threadIdx.x % 32, first = blockIdx.y * R, k4 = K / 4;
@@ -267,9 +272,10 @@ __global__ void __launch_bounds__(SKINNY_WARPS * 32, 2) skinny_kernel(const floa
 }
 
 template <int R, int C>
-void skinny(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add, cudaStream_t stream)
+void skinny(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add, cudaStream_t stream,
+            const int *dM)
 {
-    skinny_kernel<R, C><<<dim3(blocks(N, SKINNY_WARPS * C), blocks(M, R)), SKINNY_WARPS * 32, 0, stream>>>(x, W, y, M, N, K, add);
+    skinny_kernel<R, C><<<dim3(blocks(N, SKINNY_WARPS * C), blocks(M, R)), SKINNY_WARPS * 32, 0, stream>>>(x, W, y, M, N, K, add, dM);
 }
 
 // Every K here (D, Q_DIM, I) is a multiple of TK and of 256, and every N (QKV_DIM, D, 2I, VOCAB)
@@ -277,16 +283,19 @@ void skinny(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int 
 // of skinny_kernel are aligned. Up to 16 rows share one pass over W; 17-64 rows take 2-4 passes,
 // which keeps the accumulators (R x C = 32) and so the occupancy where Nsight showed R = 32 lose it.
 static_assert(QKV_DIM % 4 == 0 && D % 4 == 0 && (2 * I) % 4 == 0 && VOCAB % 4 == 0, "C divides every N");
-void linear(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add = false, cudaStream_t stream = nullptr)
+// With dM (rows counted on the GPU), M is their bound and must be at most SKINNY_MAX_ROWS; the
+// kernel is chosen by the bound, which leaves every row's arithmetic as it is.
+void linear(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add = false,
+            cudaStream_t stream = nullptr, const int *dM = nullptr)
 {
     if (M <= SKINNY_MAX_ROWS) {
         // One row: x is a single vector, so reuse buys little and C = 1 keeps 4x the warps
         // (case 12 ran 6% slower with C = 4).
-        if (M == 1) skinny<1, 1>(x, W, y, M, N, K, add, stream);
-        else if (M <= 2) skinny<2, 4>(x, W, y, M, N, K, add, stream);
-        else if (M <= 4) skinny<4, 4>(x, W, y, M, N, K, add, stream);
-        else if (M <= 8) skinny<8, 4>(x, W, y, M, N, K, add, stream);
-        else skinny<16, 2>(x, W, y, M, N, K, add, stream);
+        if (M == 1) skinny<1, 1>(x, W, y, M, N, K, add, stream, dM);
+        else if (M <= 2) skinny<2, 4>(x, W, y, M, N, K, add, stream, dM);
+        else if (M <= 4) skinny<4, 4>(x, W, y, M, N, K, add, stream, dM);
+        else if (M <= 8) skinny<8, 4>(x, W, y, M, N, K, add, stream, dM);
+        else skinny<16, 2>(x, W, y, M, N, K, add, stream, dM);
         return;
     }
     if (N % GBN == 0 && K % GBK == 0) {   // every N and K of the model
@@ -573,6 +582,47 @@ __global__ void gather_kernel(const float *src, const int *idx, float *dst)
     for (int c = threadIdx.x; c < D; c += blockDim.x) dst[size_t(i) * D + c] = src[size_t(row) * D + c];
 }
 
+// Decode routing on the GPU, so the host never waits for the router (Nsight Systems: GPU 0 idle
+// 31% of a single-row decode step, mostly behind the per-layer copy of the choices to the host).
+// One thread groups the routes as the host did: expert e's k-th route, in increasing flat index
+// j = row * TOP_K + choice, is idx[e * cap + k], and cnt[e] counts them. cap bounds the routes of
+// one expert (a row picks an expert at most once, so the batch's rows).
+__global__ void route_kernel(const int *sel, int routes, int cap, int *cnt, int *idx)
+{
+    if (threadIdx.x != 0) return;
+    int c[N_EXPERT] = {};
+    for (int j = 0; j < routes; j++) {
+        const int e = sel[j];
+        idx[e * cap + c[e]++] = j;
+    }
+    for (int e = 0; e < N_EXPERT; e++) cnt[e] = c[e];
+}
+
+// dst block y, row k = src[row of expert (first + y)'s k-th route], for k < its count; the block
+// (0, y) also copies that count to cnt_out[y] when cnt_out is given. src, idx and cnt may be on
+// the other GPU (peer access). Grid: (cap, experts), block: 256.
+__global__ void gather_routed_kernel(const float *src, const int *idx, const int *cnt, int first, int cap,
+                                     float *dst, int *cnt_out)
+{
+    const int e = first + blockIdx.y, k = blockIdx.x, n = cnt[e];
+    if (cnt_out && k == 0 && threadIdx.x == 0) cnt_out[blockIdx.y] = n;
+    if (k >= n) return;
+    const int row = idx[e * cap + k] / TOP_K;
+    float *out = dst + (size_t(blockIdx.y) * cap + k) * D;
+    for (int c = threadIdx.x; c < D; c += blockDim.x) out[c] = src[size_t(row) * D + c];
+}
+
+// x[row of route k] += gate * y[k] for the k < *cnt routes of one expert, as scatter_add_kernel.
+// y may be on the other GPU. Grid: cap, block: 256.
+__global__ void scatter_routed_kernel(float *x, const int *routes, const int *cnt, const float *gate, const float *y)
+{
+    const int i = blockIdx.x;
+    if (i >= *cnt) return;
+    const int route = routes[i], row = route / TOP_K;
+    const float weight = gate[route];
+    for (int c = threadIdx.x; c < D; c += blockDim.x) x[size_t(row) * D + c] += weight * y[size_t(i) * D + c];
+}
+
 __global__ void scatter_add_kernel(float *x, const int *routes, const float *gate, const float *y)
 {
     const int i = blockIdx.x;
@@ -581,10 +631,11 @@ __global__ void scatter_add_kernel(float *x, const int *routes, const float *gat
     for (int c = threadIdx.x; c < D; c += blockDim.x) x[size_t(row) * D + c] += weight * y[size_t(i) * D + c];
 }
 
-// u[r][j] = silu(t[r][j]) * t[r][I + j], over n = rows * I values.
-__global__ void silu_kernel(const float *t, float *u, size_t n)
+// u[r][j] = silu(t[r][j]) * t[r][I + j], over n = rows * I values; with dM, over *dM rows.
+__global__ void silu_kernel(const float *t, float *u, size_t n, const int *dM = nullptr)
 {
     const size_t k = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+    if (dM) n = size_t(*dM) * I;
     if (k >= n) return;
     const size_t r = k / I, j = k % I;
     const float gate = t[r * 2 * I + j];
@@ -765,6 +816,7 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
     cudaEvent_t packed_ready = nullptr, results_ready = nullptr;
     cudaStream_t remote_stream = nullptr;
     float *stage = nullptr, *remote_rows = nullptr, *host_stage = nullptr;
+    int *d_cnt = nullptr, *d_cnt1 = nullptr;   // decode routing on the GPU: routes per expert, on each GPU
 #if defined(HW5_PROF) || defined(HW5_NSIGHT)
     std::fprintf(stderr, "[hw5] expert transport: %s\n",
                  !parallel ? "serial peer copies" : direct ? "packed direct P2P" : "packed host staging");
@@ -776,7 +828,9 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
         if (!direct)
             check(cudaMallocHost(&host_stage, capacity * sizeof(float)), "allocate pinned staging");
         check(cudaEventCreateWithFlags(&packed_ready, cudaEventDisableTiming), "packed event");
+        d_cnt = dalloc<int>(N_EXPERT);
         check(cudaSetDevice(devices[1].device), "select remote device");
+        d_cnt1 = dalloc<int>(N_EXPERT);
         remote_rows = dalloc<float>(capacity);
         check(cudaStreamCreateWithFlags(&remote_stream, cudaStreamNonBlocking), "remote stream");
         check(cudaEventCreateWithFlags(&results_ready, cudaEventDisableTiming), "results event");
@@ -818,6 +872,9 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
         upload(d_slot, slot);
         const int tile_stride = !prefill && R <= MAX_SPLIT_ROWS
             ? (*std::max_element(pos.begin(), pos.end()) / KV_TILE + 1) : 0;
+        // Decode batches small enough for skinny_kernel route their rows on the GPU (needs both
+        // GPUs and direct peer access, which GPU 1's gather and GPU 0's scatter read through).
+        const bool gpu_routing = !prefill && direct && R <= SKINNY_MAX_ROWS;
 #ifdef HW5_PROF
         prof.phase = prefill ? 0 : 1;
         prof.passes[prof.phase]++;
@@ -856,6 +913,46 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
             // Group flat routing-table indices by expert. Gates stay on GPU 0 for scatter.
             rmsnorm_kernel<<<R, 256>>>(x, L.mlp_norm, h);
             router_kernel<<<R, N_EXPERT * 32>>>(h, L.router_w, d_sel, d_gate);
+            if (gpu_routing) {
+                // The same experts, kernels and accumulation order as below, with each expert's
+                // rows counted on GPU 0 and read where they are needed: nothing waits for the host.
+                const int cap = R, split = devices[1].first_expert;
+                auto expert = [&](int di, int e, const float *in, float *out, const int *n, cudaStream_t stream) {
+                    const Device &device = devices[di];
+                    const Scratch &work = scratch[di];
+                    const size_t j = size_t(e - device.first_expert);
+                    linear(in, device.layers[l].w1 + j * 2 * I * D, work.t, cap, 2 * I, D, false, stream, n);
+                    silu_kernel<<<blocks(size_t(cap) * I, 256), 256, 0, stream>>>(work.t, work.u, size_t(cap) * I, n);
+                    linear(work.u, device.layers[l].w2 + j * D * I, out, cap, D, I, false, stream, n);
+                };
+                route_kernel<<<1, 32>>>(d_sel, R * TOP_K, cap, d_cnt, d_idx);
+                check(cudaEventRecord(packed_ready), "publish routes");
+                // GPU 1 pulls its experts' rows over peer access, runs them in place, and GPU 0
+                // pulls the results back in its scatter.
+                check(cudaSetDevice(devices[1].device), "select remote experts");
+                check(cudaStreamWaitEvent(remote_stream, packed_ready, 0), "wait for routes");
+                gather_routed_kernel<<<dim3(cap, N_EXPERT - split), 256, 0, remote_stream>>>(h, d_idx, d_cnt, split, cap,
+                                                                                             remote_rows, d_cnt1);
+                for (int e = split; e < N_EXPERT; e++) {
+                    float *rows_e = remote_rows + size_t(e - split) * cap * D;
+                    expert(1, e, rows_e, rows_e, d_cnt1 + (e - split), remote_stream);
+                }
+                check(cudaEventRecord(results_ready, remote_stream), "publish remote results");
+                check(cudaSetDevice(d0.device), "select local experts");
+                const Scratch &S0 = scratch[0];
+                for (int e = 0; e < split; e++) {
+                    gather_routed_kernel<<<dim3(cap, 1), 256>>>(h, d_idx, d_cnt, e, cap, S0.he, nullptr);
+                    expert(0, e, S0.he, S0.y, d_cnt + e, nullptr);
+                    scatter_routed_kernel<<<cap, 256>>>(x, d_idx + e * cap, d_cnt + e, d_gate, S0.y);
+                }
+                // Expert-ID order for rows routed to both GPUs, as below.
+                check(cudaStreamWaitEvent(nullptr, results_ready, 0), "join remote experts");
+                for (int e = split; e < N_EXPERT; e++)
+                    scatter_routed_kernel<<<cap, 256>>>(x, d_idx + e * cap, d_cnt + e, d_gate,
+                                                        remote_rows + size_t(e - split) * cap * D);
+                PROF(mark(S_PARALLEL_MOE));
+                continue;
+            }
             check(cudaMemcpy(sel.data(), d_sel, sel.size() * 4, cudaMemcpyDeviceToHost), "router");
             PROF(mark(S_ROUTER));
             int offsets[N_EXPERT + 1] = {};
@@ -1078,10 +1175,12 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
     if (parallel) {
         check(cudaSetDevice(devices[1].device), "release remote staging");
         check(cudaFree(remote_rows), "free remote rows");
+        check(cudaFree(d_cnt1), "free remote route counts");
         check(cudaStreamDestroy(remote_stream), "destroy remote stream");
         check(cudaEventDestroy(results_ready), "destroy results event");
         check(cudaSetDevice(d0.device), "release local staging");
         check(cudaFree(stage), "free staging");
+        check(cudaFree(d_cnt), "free route counts");
         if (host_stage) check(cudaFreeHost(host_stage), "free pinned staging");
         check(cudaEventDestroy(packed_ready), "destroy packed event");
     }
