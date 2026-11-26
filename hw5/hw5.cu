@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -177,8 +178,10 @@ __global__ void __launch_bounds__(GTHREADS) sgemm_kernel(const float *x, const _
 constexpr int SKINNY_WARPS = 8, SKINNY_MAX_ROWS = 64;
 static_assert(D % 256 == 0 && Q_DIM % 256 == 0 && I % 256 == 0, "every K is a whole number of 32 lanes x 8");
 
+// At least 2 blocks per SM: ptxas gave <8,4> 148 and <16,2> 144 registers, which Nsight Compute
+// showed holding the SM to one block, 12.5% of its warps, with DRAM at 9-19%.
 template <int R, int C>
-__global__ void __launch_bounds__(SKINNY_WARPS * 32) skinny_kernel(const float *x, const __nv_bfloat16 *W, float *y,
+__global__ void __launch_bounds__(SKINNY_WARPS * 32, 2) skinny_kernel(const float *x, const __nv_bfloat16 *W, float *y,
                                                                    int M, int N, int K, bool add)
 {
     const int out0 = (blockIdx.x * SKINNY_WARPS + threadIdx.x / 32) * C;
@@ -276,6 +279,118 @@ __global__ void store_kv_kernel(const float *qkv, const int *slot, float *kc, fl
     const int r = blockIdx.x, c = threadIdx.x;
     kc[size_t(slot[r]) * KV_DIM + c] = qkv[size_t(r) * QKV_DIM + Q_DIM + c];
     vc[size_t(slot[r]) * KV_DIM + c] = qkv[size_t(r) * QKV_DIM + Q_DIM + KV_DIM + c];
+}
+
+// Prefill attention, tiled as FlashAttention-2 (Dao 2023) does it and as the FP32 CUDA-core
+// version flash-attention-minimal (tspeterkim) lays it out: a block keeps a tile of queries in
+// shared memory, streams the keys and values through shared memory 32 positions at a time, and
+// keeps a running maximum, softmax mass and output per query (online softmax), so each key and
+// value is read once per query tile instead of once per query. Nsight Systems showed the
+// one-thread-per-(row, head) kernel at 3.23 s of case 03's 7.16 s prefill, on GPU 0 alone.
+//
+// A block takes FA_ROWS consecutive rows and one key/value head, so its 64 query vectors (16 rows
+// x the 4 query heads that read that key/value head) share every K/V tile. Warp w owns query
+// vectors 8w .. 8w+7 (two rows): for the scores lane j takes key j of the tile, for the output it
+// takes dimensions 4j .. 4j+3. Rows of a block may belong to different prompts; each key is masked
+// to its row's own cache, start[r] .. slot[r], and the block walks the union of those ranges.
+constexpr int FA_ROWS = 16, FA_Q = FA_ROWS * (N_HEAD / N_KV), FA_KEYS = 32, FA_THREADS = 256;
+constexpr int FA_KPAD = HEAD_DIM + 4;   // float4 reads of 8 lanes x key rows fall in distinct banks
+constexpr size_t FA_SMEM = sizeof(float) * (size_t(FA_Q) * HEAD_DIM + FA_KEYS * FA_KPAD + FA_KEYS * HEAD_DIM + FA_Q * FA_KEYS);
+static_assert(FA_Q == 64 && FA_THREADS / 32 * 8 == FA_Q && HEAD_DIM == 4 * 32 && FA_KEYS == 32, "warp/lane mapping");
+
+__global__ void __launch_bounds__(FA_THREADS) flash_prefill_kernel(const float *qkv, const int *start, const int *slot,
+                                                                   const float *kc, const float *vc, float *att, int rows)
+{
+    extern __shared__ __align__(16) float fa_smem[];
+    float *Qs = fa_smem;                          // [FA_Q][HEAD_DIM]
+    float *Ks = Qs + FA_Q * HEAD_DIM;             // [FA_KEYS][FA_KPAD]
+    float *Vs = Ks + FA_KEYS * FA_KPAD;           // [FA_KEYS][HEAD_DIM]
+    float *Ps = Vs + FA_KEYS * HEAD_DIM;          // [FA_Q][FA_KEYS]
+    __shared__ int lo[FA_ROWS], hi[FA_ROWS];
+    const int r0 = blockIdx.x * FA_ROWS, g = blockIdx.y, t = threadIdx.x, lane = t % 32, warp = t / 32;
+    if (t < FA_ROWS) {
+        lo[t] = r0 + t < rows ? start[r0 + t] : INT_MAX;   // a row past the batch matches no key
+        hi[t] = r0 + t < rows ? slot[r0 + t] : -1;
+    }
+    for (int i = t; i < FA_Q * HEAD_DIM / 4; i += FA_THREADS) {   // query vector qv = (row qv/4, head 4g + qv%4)
+        const int qv = i / (HEAD_DIM / 4), d = i % (HEAD_DIM / 4) * 4, row = r0 + qv / 4;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (row < rows) v = *reinterpret_cast<const float4 *>(qkv + size_t(row) * QKV_DIM + (g * 4 + qv % 4) * HEAD_DIM + d);
+        *reinterpret_cast<float4 *>(Qs + qv * HEAD_DIM + d) = v;
+    }
+    __syncthreads();
+    int kmin = INT_MAX, kmax = -1;
+    for (int i = 0; i < FA_ROWS; i++) { kmin = min(kmin, lo[i]); kmax = max(kmax, hi[i]); }
+
+    float m[8], l[8], o[8][4];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        m[i] = -INFINITY; l[i] = 0.f;
+        o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.f;
+    }
+    for (int k0 = kmin; k0 <= kmax; k0 += FA_KEYS) {
+        __syncthreads();   // every warp is done with the previous tile
+        for (int i = t; i < FA_KEYS * HEAD_DIM / 4; i += FA_THREADS) {
+            const int j = i / (HEAD_DIM / 4), d = i % (HEAD_DIM / 4) * 4, s = k0 + j;
+            float4 kv = make_float4(0.f, 0.f, 0.f, 0.f), vv = kv;
+            if (s <= kmax) {
+                kv = *reinterpret_cast<const float4 *>(kc + size_t(s) * KV_DIM + g * HEAD_DIM + d);
+                vv = *reinterpret_cast<const float4 *>(vc + size_t(s) * KV_DIM + g * HEAD_DIM + d);
+            }
+            *reinterpret_cast<float4 *>(Ks + j * FA_KPAD + d) = kv;
+            *reinterpret_cast<float4 *>(Vs + j * HEAD_DIM + d) = vv;
+        }
+        __syncthreads();
+        float s[8] = {};
+        for (int d = 0; d < HEAD_DIM; d += 4) {
+            const float4 kf = *reinterpret_cast<const float4 *>(Ks + lane * FA_KPAD + d);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const float4 qf = *reinterpret_cast<const float4 *>(Qs + (warp * 8 + i) * HEAD_DIM + d);
+                s[i] = fmaf(qf.x, kf.x, s[i]); s[i] = fmaf(qf.y, kf.y, s[i]);
+                s[i] = fmaf(qf.z, kf.z, s[i]); s[i] = fmaf(qf.w, kf.w, s[i]);
+            }
+        }
+        const int key = k0 + lane;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int row = (warp * 8 + i) / 4;
+            const float sc = key >= lo[row] && key <= hi[row] ? s[i] * ATTN_SCALE : -INFINITY;
+            float mx = sc;
+            for (int d = 16; d; d /= 2) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, d));
+            const float mnew = fmaxf(m[i], mx);
+            float p = 0.f, alpha = 1.f;
+            if (mnew != -INFINITY) {   // some key of this row seen so far
+                p = expf(sc - mnew);
+                alpha = expf(m[i] - mnew);
+            }
+            float ps = p;
+            for (int d = 16; d; d /= 2) ps += __shfl_xor_sync(0xffffffffu, ps, d);
+            l[i] = l[i] * alpha + ps;
+            m[i] = mnew;
+            Ps[(warp * 8 + i) * FA_KEYS + lane] = p;
+            o[i][0] *= alpha; o[i][1] *= alpha; o[i][2] *= alpha; o[i][3] *= alpha;
+        }
+        __syncwarp();
+        for (int j = 0; j < FA_KEYS; j++) {
+            const float4 vf = *reinterpret_cast<const float4 *>(Vs + j * HEAD_DIM + lane * 4);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const float p = Ps[(warp * 8 + i) * FA_KEYS + j];
+                o[i][0] = fmaf(p, vf.x, o[i][0]); o[i][1] = fmaf(p, vf.y, o[i][1]);
+                o[i][2] = fmaf(p, vf.z, o[i][2]); o[i][3] = fmaf(p, vf.w, o[i][3]);
+            }
+        }
+        __syncwarp();   // Ps is rewritten by this warp for the next tile
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const int qv = warp * 8 + i, row = r0 + qv / 4;
+        if (row >= rows) continue;
+        const float inv = 1.f / l[i];
+        *reinterpret_cast<float4 *>(att + size_t(row) * Q_DIM + (g * 4 + qv % 4) * HEAD_DIM + lane * 4) =
+            make_float4(o[i][0] * inv, o[i][1] * inv, o[i][2] * inv, o[i][3] * inv);
+    }
 }
 
 // Shared prompt prefixes: pair i copies the key and value of cache slot src[i] to slot dst[i] in
@@ -563,6 +678,8 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
 
     // On GPU 0: one batch's activations, and every prompt's key/value cache.
     check(cudaSetDevice(d0.device), "cudaSetDevice");
+    check(cudaFuncSetAttribute(flash_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(FA_SMEM)),
+          "prefill attention shared memory");
     float *x = dalloc<float>(size_t(CHUNK) * D), *h = dalloc<float>(size_t(CHUNK) * D);
     float *qkv = dalloc<float>(size_t(CHUNK) * QKV_DIM), *att = dalloc<float>(size_t(CHUNK) * Q_DIM);
     float *logits = dalloc<float>(size_t(N) * VOCAB);
@@ -691,7 +808,9 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
                 decode_partial_kernel<<<dim3(tile_stride, N_HEAD, R), HEAD_DIM>>>(
                     qkv, k_l, v_l, d_start, d_pos, rstart[0], pos[0] + 1, parts);
                 decode_merge_kernel<<<dim3(N_HEAD, R), HEAD_DIM>>>(parts, tile_stride, d_pos, att);
-            } else {
+            } else if (prefill) {
+                flash_prefill_kernel<<<dim3(blocks(R, FA_ROWS), N_KV), FA_THREADS, FA_SMEM>>>(qkv, d_start, d_slot, k_l, v_l, att, R);
+            } else {   // a decode batch of more than MAX_SPLIT_ROWS rows, one per prompt
                 attention_kernel<<<blocks(size_t(R) * N_HEAD, 128), 128>>>(qkv, d_start, d_slot, k_l, v_l, att, R);
             }
             PROF(mark(S_ATTN));
