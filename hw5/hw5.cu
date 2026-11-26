@@ -97,6 +97,70 @@ __global__ void linear_kernel(const float *x, const __nv_bfloat16 *W, float *y, 
         }
 }
 
+// Many rows (prefill): y[M][N] = x[M][K] * W[N][K]^T on the FP32 cores, structured as the 2D
+// block-tiled, vectorized SGEMM of Simon Boehm's SGEMM_CUDA (kernels 6 and 9: 128 x 128 block
+// tile, BK = 16, 256 threads each holding an 8 x 8 register tile). Nsight Compute showed the 64 x 64
+// kernel above at 19 TFLOPS with the FMA pipe 46% busy and the LSU 75%: each thread did 16 FMAs per
+// 8 scalar shared loads. Here a thread does 64 FMAs per four float4 shared loads. Both operands
+// are K-contiguous, so both tiles are stored transposed (k-major) in shared memory, as Boehm does for
+// A; W's 8 bf16 per 16-byte load are widened exactly by bit shifts. Each output is one fmaf chain
+// over k in increasing order, the same order as linear_kernel.
+constexpr int GBM = 128, GBN = 128, GBK = 16, GT = 8, GTHREADS = (GBM / GT) * (GBN / GT);
+static_assert(GTHREADS == 256 && GBM * GBK / 4 == 2 * GTHREADS && GBN * GBK / 8 == GTHREADS, "tile loads per thread");
+
+// bf16 is the top half of an fp32: widening a packed pair is exact, two bit operations.
+__device__ __forceinline__ float bf16_lo(unsigned u) { return __uint_as_float(u << 16); }
+__device__ __forceinline__ float bf16_hi(unsigned u) { return __uint_as_float(u & 0xffff0000u); }
+__global__ void __launch_bounds__(GTHREADS) sgemm_kernel(const float *x, const __nv_bfloat16 *W, float *y,
+                                                        int M, int N, int K, bool add)
+{
+    __shared__ __align__(16) float xs[GBK][GBM];
+    __shared__ __align__(16) float ws[GBK][GBN];
+    const int m0 = blockIdx.y * GBM, n0 = blockIdx.x * GBN, t = threadIdx.x;
+    const int tr = t / (GBN / GT), tc = t % (GBN / GT);   // this thread's rows tr*8.., columns tc*8..
+    float acc[GT][GT] = {};
+    for (int k0 = 0; k0 < K; k0 += GBK) {
+        // x: 128 rows x 16 floats, 512 float4, two per thread; stored k-major.
+        #pragma unroll
+        for (int i = t; i < GBM * GBK / 4; i += GTHREADS) {
+            const int r = i / (GBK / 4), c = (i % (GBK / 4)) * 4;
+            const float4 v = m0 + r < M ? *reinterpret_cast<const float4 *>(x + size_t(m0 + r) * K + k0 + c)
+                                        : make_float4(0.f, 0.f, 0.f, 0.f);
+            xs[c][r] = v.x; xs[c + 1][r] = v.y; xs[c + 2][r] = v.z; xs[c + 3][r] = v.w;
+        }
+        // W: 128 rows x 16 bf16, 256 loads of 16 bytes, one per thread; stored k-major as fp32.
+        {
+            const int r = t / (GBK / 8), c = (t % (GBK / 8)) * 8;
+            const uint4 p = __ldg(reinterpret_cast<const uint4 *>(W + size_t(n0 + r) * K + k0 + c));
+            ws[c][r] = bf16_lo(p.x); ws[c + 1][r] = bf16_hi(p.x); ws[c + 2][r] = bf16_lo(p.y); ws[c + 3][r] = bf16_hi(p.y);
+            ws[c + 4][r] = bf16_lo(p.z); ws[c + 5][r] = bf16_hi(p.z); ws[c + 6][r] = bf16_lo(p.w); ws[c + 7][r] = bf16_hi(p.w);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < GBK; k++) {
+            const float4 a0 = *reinterpret_cast<const float4 *>(&xs[k][tr * GT]);
+            const float4 a1 = *reinterpret_cast<const float4 *>(&xs[k][tr * GT + 4]);
+            const float4 b0 = *reinterpret_cast<const float4 *>(&ws[k][tc * GT]);
+            const float4 b1 = *reinterpret_cast<const float4 *>(&ws[k][tc * GT + 4]);
+            const float a[GT] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const float b[GT] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+            #pragma unroll
+            for (int i = 0; i < GT; i++)
+                #pragma unroll
+                for (int j = 0; j < GT; j++) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < GT; i++) {
+        const int m = m0 + tr * GT + i;
+        if (m >= M) break;
+        float *dst = y + size_t(m) * N + n0 + tc * GT;
+        #pragma unroll
+        for (int j = 0; j < GT; j++) dst[j] = add ? dst[j] + acc[i][j] : acc[i][j];
+    }
+}
+
 // Few rows (decode): a projection reads all of W for little arithmetic. The tiling follows
 // TensorRT-LLM's weightOnlyBatchedGemv (v0.7.1 kernel.h), whose threads each hold an accumulator
 // of Batch x NPerBlock: every 16-byte activation load is used against NPerBlock weight columns,
@@ -112,9 +176,6 @@ __global__ void linear_kernel(const float *x, const __nv_bfloat16 *W, float *y, 
 // R and C, so an output does not depend on how many rows share the launch.
 constexpr int SKINNY_WARPS = 8, SKINNY_MAX_ROWS = 64;
 static_assert(D % 256 == 0 && Q_DIM % 256 == 0 && I % 256 == 0, "every K is a whole number of 32 lanes x 8");
-
-__device__ __forceinline__ float bf16_lo(unsigned u) { return __uint_as_float(u << 16); }
-__device__ __forceinline__ float bf16_hi(unsigned u) { return __uint_as_float(u & 0xffff0000u); }
 
 template <int R, int C>
 __global__ void __launch_bounds__(SKINNY_WARPS * 32) skinny_kernel(const float *x, const __nv_bfloat16 *W, float *y,
@@ -180,11 +241,17 @@ static_assert(QKV_DIM % 4 == 0 && D % 4 == 0 && (2 * I) % 4 == 0 && VOCAB % 4 ==
 void linear(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add = false, cudaStream_t stream = nullptr)
 {
     if (M <= SKINNY_MAX_ROWS) {
-        if (M == 1) skinny<1, 4>(x, W, y, M, N, K, add, stream);
+        // One row: x is a single vector, so reuse buys little and C = 1 keeps 4x the warps
+        // (case 12 ran 6% slower with C = 4).
+        if (M == 1) skinny<1, 1>(x, W, y, M, N, K, add, stream);
         else if (M <= 2) skinny<2, 4>(x, W, y, M, N, K, add, stream);
         else if (M <= 4) skinny<4, 4>(x, W, y, M, N, K, add, stream);
         else if (M <= 8) skinny<8, 4>(x, W, y, M, N, K, add, stream);
         else skinny<16, 2>(x, W, y, M, N, K, add, stream);
+        return;
+    }
+    if (N % GBN == 0 && K % GBK == 0) {   // every N and K of the model
+        sgemm_kernel<<<dim3(N / GBN, blocks(M, GBM)), GTHREADS, 0, stream>>>(x, W, y, M, N, K, add);
         return;
     }
     dim3 grid(blocks(N, TN), blocks(M, TM));
@@ -209,6 +276,16 @@ __global__ void store_kv_kernel(const float *qkv, const int *slot, float *kc, fl
     const int r = blockIdx.x, c = threadIdx.x;
     kc[size_t(slot[r]) * KV_DIM + c] = qkv[size_t(r) * QKV_DIM + Q_DIM + c];
     vc[size_t(slot[r]) * KV_DIM + c] = qkv[size_t(r) * QKV_DIM + Q_DIM + KV_DIM + c];
+}
+
+// Shared prompt prefixes: pair i copies the key and value of cache slot src[i] to slot dst[i] in
+// every layer. Grid: (pairs, N_LAYER), block: KV_DIM.
+__global__ void copy_kv_kernel(const int *src, const int *dst, float *kc, float *vc, size_t slots)
+{
+    const size_t layer = size_t(blockIdx.y) * slots * KV_DIM, c = threadIdx.x;
+    const size_t from = layer + size_t(src[blockIdx.x]) * KV_DIM + c, to = layer + size_t(dst[blockIdx.x]) * KV_DIM + c;
+    kc[to] = kc[from];
+    vc[to] = vc[from];
 }
 
 // One thread per (row, query head): softmax(q . k_j * ATTN_SCALE) over the slots start .. slot
@@ -746,19 +823,75 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
         return next;
     };
 
-    // Prefill: every prompt's tokens in order, CHUNK rows at a time. A batch's rows read cache
-    // slots that earlier batches or the batch itself wrote.
-    std::vector<Row> all;
-    for (int i = 0; i < N; i++) {
-        const int L = int(prompts[i].size());
-        for (int p = 0; p < L; p++) all.push_back({i, p, prompts[i][p], p == L - 1});
+    // Shared prefixes, as in vLLM's automatic prefix caching and SGLang's RadixAttention: the key
+    // and value of a position depend only on the tokens up to it, so prompts that begin with the
+    // same tokens can compute them once. The host only compares token ids, choosing which rows to
+    // run (Section 2.5 lets it decide the batches); the GPU computes every value it then copies.
+    //
+    // Prompts are taken longest first. Each is either a donor, all of whose rows run in the first
+    // round, or shares its longest common prefix with one donor: after the first round that prefix's
+    // cache slots are copied from the donor in every layer, and only the prompt's later rows run in
+    // the second round. A prompt always runs its own last row, which gives its hidden state and
+    // first token, so it shares at most L - 1 positions. A prompt shares only a prefix of at least
+    // MIN_SHARED_PREFIX tokens (every prompt begins with token 1), and sharing is skipped when it
+    // would save fewer than MIN_SHARED_ROWS rows in all, below the cost of the second round's pass.
+    constexpr int MIN_SHARED_PREFIX = 8, MIN_SHARED_ROWS = 128;
+    std::vector<int> order(N), shared(N, 0), donor(N, -1), donors;
+    for (int i = 0; i < N; i++) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return prompts[a].size() > prompts[b].size(); });
+    long long saved = 0;
+    for (int i : order) {
+        const std::vector<int> &p = prompts[i];
+        int best = 0, from = -1;
+        for (int d : donors) {
+            const std::vector<int> &q = prompts[d];
+            const size_t n = std::min(p.size(), q.size());
+            size_t lcp = 0;
+            while (lcp < n && p[lcp] == q[lcp]) lcp++;
+            if (int(lcp) > best) { best = int(lcp); from = d; }
+        }
+        best = std::min(best, int(p.size()) - 1);
+        if (best >= MIN_SHARED_PREFIX) { shared[i] = best; donor[i] = from; saved += best; }
+        else donors.push_back(i);
     }
+    if (saved < MIN_SHARED_ROWS) {
+        std::fill(shared.begin(), shared.end(), 0);
+        std::fill(donor.begin(), donor.end(), -1);
+    }
+
+    // Prefill: each round's rows in prompt order, CHUNK rows at a time. A batch's rows read cache
+    // slots that earlier batches, the batch itself, or the copy before the round wrote.
     std::vector<int> last(N), len(N);   // each prompt's last token and its positions so far
-    for (size_t c = 0; c < all.size(); c += CHUNK) {
-        const std::vector<Row> rows(all.begin() + c, all.begin() + std::min(all.size(), c + CHUNK));
-        const std::vector<int> next = forward(rows, true);
-        for (size_t r = 0; r < rows.size(); r++)
-            if (rows[r].output) last[rows[r].prompt] = tokens_out[rows[r].prompt][0] = next[r];
+    auto prefill_round = [&](bool sharers) {
+        std::vector<Row> all;
+        for (int i = 0; i < N; i++) {
+            if ((donor[i] >= 0) != sharers) continue;
+            const int L = int(prompts[i].size());
+            for (int p = shared[i]; p < L; p++) all.push_back({i, p, prompts[i][p], p == L - 1});
+        }
+        for (size_t c = 0; c < all.size(); c += CHUNK) {
+            const std::vector<Row> rows(all.begin() + c, all.begin() + std::min(all.size(), c + CHUNK));
+            const std::vector<int> next = forward(rows, true);
+            for (size_t r = 0; r < rows.size(); r++)
+                if (rows[r].output) last[rows[r].prompt] = tokens_out[rows[r].prompt][0] = next[r];
+        }
+    };
+    prefill_round(false);
+    if (saved >= MIN_SHARED_ROWS) {
+        std::vector<int> src, dst;
+        for (int i = 0; i < N; i++)
+            for (int p = 0; p < shared[i]; p++) {
+                src.push_back(start[donor[i]] + p);
+                dst.push_back(start[i] + p);
+            }
+        int *d_src = dalloc<int>(src.size()), *d_dst = dalloc<int>(dst.size());
+        upload(d_src, src);
+        upload(d_dst, dst);
+        copy_kv_kernel<<<dim3(unsigned(src.size()), N_LAYER), KV_DIM>>>(d_src, d_dst, kc, vc, slots);
+        check(cudaGetLastError(), "copy shared prefixes");
+        prefill_round(true);
+        check(cudaFree(d_src), "cudaFree");
+        check(cudaFree(d_dst), "cudaFree");
     }
     for (int i = 0; i < N; i++) len[i] = int(prompts[i].size());
 
