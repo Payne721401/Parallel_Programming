@@ -1,0 +1,14 @@
+srun: job 503395 queued and waiting for resources
+srun: job 503395 has been allocated resources
+==PROF== Connected to process 3391888 (/home/ou721401/Parallel_Programming/hw5/hw5_nsight)
+Devices: 2, experts per device: 4, weights per device: 44.9902 GB, free: 33.4561 GB
+Load time: 41.9427 s (CUDA contexts and weights; not counted)
+[hw5] expert transport: packed direct P2P
+==PROF== Profiling "sgemm_kernel": 0%
+==WARNING== Backing up device memory in system memory. Kernel replay might be slow. Consider using "--replay-mode application" to avoid memory save-and-restore.
+....50%....100% - 20 passes
+==PROF== Profiling "sgemm_kernel": 0%....50%....100% - 20 passes
+Case cases/03.txt: prompts 16, tokens 6298, generate 16
+Compute time: 107.922 s
+==PROF== Disconnected from process 3391888
+==PROF== Report: /home/ou721401/Parallel_Programming/hw5/nsight-compute-03-c328fL/kernel.ncu-rep
