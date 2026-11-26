@@ -216,15 +216,10 @@ static_assert(D % 256 == 0 && Q_DIM % 256 == 0 && I % 256 == 0, "every K is a wh
 
 // At least 2 blocks per SM: ptxas gave <8,4> 148 and <16,2> 144 registers, which Nsight Compute
 // showed holding the SM to one block, 12.5% of its warps, with DRAM at 9-19%.
-//
-// With dM, the rows are counted on the GPU (decode routing): M is only the bound the grid covers,
-// *dM the rows there are, and blocks past them return. The arithmetic of each row is unchanged.
 template <int R, int C>
 __global__ void __launch_bounds__(SKINNY_WARPS * 32, 2) skinny_kernel(const float *x, const __nv_bfloat16 *W, float *y,
-                                                                   int M, int N, int K, bool add, const int *dM)
+                                                                   int M, int N, int K, bool add)
 {
-    if (dM) M = *dM;
-    if (int(blockIdx.y) * R >= M) return;   // uniform within the block
     const int out0 = (blockIdx.x * SKINNY_WARPS + threadIdx.x / 32) * C;
     if (out0 >= N) return;   // uniform within each warp; N is a multiple of C
     const int lane = threadIdx.x % 32, first = blockIdx.y * R, k4 = K / 4;
@@ -272,10 +267,100 @@ __global__ void __launch_bounds__(SKINNY_WARPS * 32, 2) skinny_kernel(const floa
 }
 
 template <int R, int C>
-void skinny(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add, cudaStream_t stream,
-            const int *dM)
+void skinny(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add, cudaStream_t stream)
 {
-    skinny_kernel<R, C><<<dim3(blocks(N, SKINNY_WARPS * C), blocks(M, R)), SKINNY_WARPS * 32, 0, stream>>>(x, W, y, M, N, K, add, dM);
+    skinny_kernel<R, C><<<dim3(blocks(N, SKINNY_WARPS * C), blocks(M, R)), SKINNY_WARPS * 32, 0, stream>>>(x, W, y, M, N, K, add);
+}
+
+// Decode MoE, grouped as vLLM's fused_moe does it: moe_align_kernel (vLLM's moe_align_block_size)
+// sorts one GPU's routes by expert into slots and cuts each expert's slots into tiles of at most R
+// rows; one launch then covers all of that GPU's experts, block row y taking tile y and the expert
+// it names, and blocks past the last tile returning. An expert with no rows gets no tile, where a
+// launch per expert ran every expert (Nsight Systems: 384 empty launches a step for one row).
+//
+// The table, in ints: [0] tiles, [1] slots, then in_rows[cap_slots] (a slot's batch row),
+// out_rows[cap_slots] (its route j = row * TOP_K + choice), tiles[3 * cap_tiles] (expert on this
+// GPU, first slot, rows). by_token: x is the batch (row in_rows[slot]) and y the slots (w1);
+// otherwise x is the slots and y the routes (w2). Each row's arithmetic is skinny_kernel's.
+constexpr int tab_ints(int cap_slots, int cap_tiles) { return 2 + 2 * cap_slots + 3 * cap_tiles; }
+
+template <int R, int C>
+__global__ void __launch_bounds__(SKINNY_WARPS * 32, 2) skinny_grouped_kernel(const float *x, const __nv_bfloat16 *W,
+    size_t w_stride, float *y, int N, int K, const int *tab, int cap_slots, bool by_token)
+{
+    const int tile = blockIdx.y;
+    if (tile >= tab[0]) return;   // uniform within the block
+    const int out0 = (blockIdx.x * SKINNY_WARPS + threadIdx.x / 32) * C;
+    if (out0 >= N) return;
+    const int *in_rows = tab + 2, *out_rows = tab + 2 + cap_slots, *t3 = tab + 2 + 2 * cap_slots + 3 * tile;
+    const int first = t3[1], n = t3[2], lane = threadIdx.x % 32, k4 = K / 4;
+    const uint4 *w = reinterpret_cast<const uint4 *>(W + size_t(t3[0]) * w_stride + size_t(out0) * K);
+    const float4 *x4 = reinterpret_cast<const float4 *>(x);
+    int row_off[R];
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        const int s = first + min(r, n - 1);
+        row_off[r] = (by_token ? in_rows[s] : s) * k4;
+    }
+    float sum[R][C];
+    #pragma unroll
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int j = 0; j < C; j++) sum[r][j] = 0.f;
+    for (int c = lane; c < K / 8; c += 32) {
+        float wf[C][8];
+        #pragma unroll
+        for (int j = 0; j < C; j++) {
+            const uint4 p = __ldg(w + size_t(j) * (K / 8) + c);
+            wf[j][0] = bf16_lo(p.x); wf[j][1] = bf16_hi(p.x); wf[j][2] = bf16_lo(p.y); wf[j][3] = bf16_hi(p.y);
+            wf[j][4] = bf16_lo(p.z); wf[j][5] = bf16_hi(p.z); wf[j][6] = bf16_lo(p.w); wf[j][7] = bf16_hi(p.w);
+        }
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            const float4 a = __ldg(x4 + row_off[r] + 2 * c), b = __ldg(x4 + row_off[r] + 2 * c + 1);
+            #pragma unroll
+            for (int j = 0; j < C; j++) {
+                float s = sum[r][j];
+                s = fmaf(a.x, wf[j][0], s); s = fmaf(a.y, wf[j][1], s); s = fmaf(a.z, wf[j][2], s); s = fmaf(a.w, wf[j][3], s);
+                s = fmaf(b.x, wf[j][4], s); s = fmaf(b.y, wf[j][5], s); s = fmaf(b.z, wf[j][6], s); s = fmaf(b.w, wf[j][7], s);
+                sum[r][j] = s;
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < R; r++)
+        #pragma unroll
+        for (int j = 0; j < C; j++) {
+            float s = sum[r][j];
+            for (int d = 16; d; d /= 2) s += __shfl_down_sync(0xffffffffu, s, d);
+            if (lane == 0 && r < n) y[size_t(by_token ? first + r : out_rows[first + r]) * N + out0 + j] = s;
+        }
+}
+
+// The rows per tile for a decode batch of `rows`: about the routes an expert gets, rows * TOP_K /
+// N_EXPERT, rounded up to a kernel's R; and the bounds of one GPU's slots and tiles.
+int moe_tile_rows(int rows)
+{
+    const int avg = (rows * TOP_K + N_EXPERT - 1) / N_EXPERT;
+    return avg <= 1 ? 1 : avg <= 2 ? 2 : avg <= 4 ? 4 : avg <= 8 ? 8 : 16;
+}
+int moe_cap_tiles(int rows, int rt, int experts)
+{
+    const int slots = rows * TOP_K;   // sum over experts of ceil(n_e / rt) <= slots / rt + experts, and <= slots
+    return std::min(slots, (slots + rt - 1) / rt + experts);
+}
+
+void skinny_grouped(int rt, const float *x, const __nv_bfloat16 *W, size_t w_stride, float *y, int N, int K,
+                    const int *tab, int cap_slots, int cap_tiles, bool by_token, cudaStream_t stream)
+{
+#define HW5_GROUPED(R, C) skinny_grouped_kernel<R, C><<<dim3(blocks(N, SKINNY_WARPS * C), cap_tiles), SKINNY_WARPS * 32, 0, stream>>>( \
+        x, W, w_stride, y, N, K, tab, cap_slots, by_token)
+    if (rt == 1) HW5_GROUPED(1, 1);
+    else if (rt == 2) HW5_GROUPED(2, 4);
+    else if (rt == 4) HW5_GROUPED(4, 4);
+    else if (rt == 8) HW5_GROUPED(8, 4);
+    else HW5_GROUPED(16, 2);
+#undef HW5_GROUPED
 }
 
 // Every K here (D, Q_DIM, I) is a multiple of TK and of 256, and every N (QKV_DIM, D, 2I, VOCAB)
@@ -283,19 +368,16 @@ void skinny(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int 
 // of skinny_kernel are aligned. Up to 16 rows share one pass over W; 17-64 rows take 2-4 passes,
 // which keeps the accumulators (R x C = 32) and so the occupancy where Nsight showed R = 32 lose it.
 static_assert(QKV_DIM % 4 == 0 && D % 4 == 0 && (2 * I) % 4 == 0 && VOCAB % 4 == 0, "C divides every N");
-// With dM (rows counted on the GPU), M is their bound and must be at most SKINNY_MAX_ROWS; the
-// kernel is chosen by the bound, which leaves every row's arithmetic as it is.
-void linear(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add = false,
-            cudaStream_t stream = nullptr, const int *dM = nullptr)
+void linear(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add = false, cudaStream_t stream = nullptr)
 {
     if (M <= SKINNY_MAX_ROWS) {
         // One row: x is a single vector, so reuse buys little and C = 1 keeps 4x the warps
         // (case 12 ran 6% slower with C = 4).
-        if (M == 1) skinny<1, 1>(x, W, y, M, N, K, add, stream, dM);
-        else if (M <= 2) skinny<2, 4>(x, W, y, M, N, K, add, stream, dM);
-        else if (M <= 4) skinny<4, 4>(x, W, y, M, N, K, add, stream, dM);
-        else if (M <= 8) skinny<8, 4>(x, W, y, M, N, K, add, stream, dM);
-        else skinny<16, 2>(x, W, y, M, N, K, add, stream, dM);
+        if (M == 1) skinny<1, 1>(x, W, y, M, N, K, add, stream);
+        else if (M <= 2) skinny<2, 4>(x, W, y, M, N, K, add, stream);
+        else if (M <= 4) skinny<4, 4>(x, W, y, M, N, K, add, stream);
+        else if (M <= 8) skinny<8, 4>(x, W, y, M, N, K, add, stream);
+        else skinny<16, 2>(x, W, y, M, N, K, add, stream);
         return;
     }
     if (N % GBN == 0 && K % GBK == 0) {   // every N and K of the model
@@ -582,46 +664,53 @@ __global__ void gather_kernel(const float *src, const int *idx, float *dst)
     for (int c = threadIdx.x; c < D; c += blockDim.x) dst[size_t(i) * D + c] = src[size_t(row) * D + c];
 }
 
-// Decode routing on the GPU, so the host never waits for the router (Nsight Systems: GPU 0 idle
-// 31% of a single-row decode step, mostly behind the per-layer copy of the choices to the host).
-// One thread groups the routes as the host did: expert e's k-th route, in increasing flat index
-// j = row * TOP_K + choice, is idx[e * cap + k], and cnt[e] counts them. cap bounds the routes of
-// one expert (a row picks an expert at most once, so the batch's rows).
-__global__ void route_kernel(const int *sel, int routes, int cap, int *cnt, int *idx)
+// vLLM's moe_align_block_size for our decode batches: the routes of GPU g's experts (split * g ..)
+// sorted by expert, each expert's in increasing route j as the host grouped them, into the table of
+// skinny_grouped_kernel, cut into tiles of at most rt rows. One thread: at most 2 x 64 routes.
+__global__ void moe_align_kernel(const int *sel, int routes, int rt, int split, int cap_slots, int *tab0, int *tab1)
 {
     if (threadIdx.x != 0) return;
-    int c[N_EXPERT] = {};
-    for (int j = 0; j < routes; j++) {
-        const int e = sel[j];
-        idx[e * cap + c[e]++] = j;
+    for (int g = 0; g < 2; g++) {
+        int *tab = g ? tab1 : tab0, *in_rows = tab + 2, *out_rows = tab + 2 + cap_slots, *tiles = tab + 2 + 2 * cap_slots;
+        const int e_begin = g ? split : 0, e_end = g ? N_EXPERT : split;
+        int slots = 0, nt = 0;
+        for (int e = e_begin; e < e_end; e++) {
+            const int first = slots;
+            for (int j = 0; j < routes; j++)
+                if (sel[j] == e) {
+                    in_rows[slots] = j / TOP_K;
+                    out_rows[slots] = j;
+                    slots++;
+                }
+            for (int f = first; f < slots; f += rt) {
+                tiles[3 * nt] = e - e_begin;
+                tiles[3 * nt + 1] = f;
+                tiles[3 * nt + 2] = min(rt, slots - f);
+                nt++;
+            }
+        }
+        tab[0] = nt;
+        tab[1] = slots;
     }
-    for (int e = 0; e < N_EXPERT; e++) cnt[e] = c[e];
 }
 
-// dst block y, row k = src[row of expert (first + y)'s k-th route], for k < its count; the block
-// (0, y) also copies that count to cnt_out[y] when cnt_out is given. src, idx and cnt may be on
-// the other GPU (peer access). Grid: (cap, experts), block: 256.
-__global__ void gather_routed_kernel(const float *src, const int *idx, const int *cnt, int first, int cap,
-                                     float *dst, int *cnt_out)
+// x[r] += gate * y for the row's two routes, the lower expert first, as the host path's scatter
+// in expert-ID order. y_lo holds the routes of experts below split (GPU 0), y_hi the others (from
+// GPU 1), both indexed by route. Grid: rows, block: 256.
+__global__ void moe_combine_kernel(float *x, const int *sel, const float *gate, const float *y_lo, const float *y_hi, int split)
 {
-    const int e = first + blockIdx.y, k = blockIdx.x, n = cnt[e];
-    if (cnt_out && k == 0 && threadIdx.x == 0) cnt_out[blockIdx.y] = n;
-    if (k >= n) return;
-    const int row = idx[e * cap + k] / TOP_K;
-    float *out = dst + (size_t(blockIdx.y) * cap + k) * D;
-    for (int c = threadIdx.x; c < D; c += blockDim.x) out[c] = src[size_t(row) * D + c];
+    const int r = blockIdx.x, base = r * TOP_K;
+    const int a = base + (sel[base] < sel[base + 1] ? 0 : 1), b = 2 * base + 1 - a;   // the two routes, lower expert first
+    const float *ya = (sel[a] < split ? y_lo : y_hi) + size_t(a) * D, *yb = (sel[b] < split ? y_lo : y_hi) + size_t(b) * D;
+    const float ga = gate[a], gb = gate[b];
+    for (int c = threadIdx.x; c < D; c += blockDim.x) {
+        float v = x[size_t(r) * D + c];
+        v += ga * ya[c];
+        v += gb * yb[c];
+        x[size_t(r) * D + c] = v;
+    }
 }
-
-// x[row of route k] += gate * y[k] for the k < *cnt routes of one expert, as scatter_add_kernel.
-// y may be on the other GPU. Grid: cap, block: 256.
-__global__ void scatter_routed_kernel(float *x, const int *routes, const int *cnt, const float *gate, const float *y)
-{
-    const int i = blockIdx.x;
-    if (i >= *cnt) return;
-    const int route = routes[i], row = route / TOP_K;
-    const float weight = gate[route];
-    for (int c = threadIdx.x; c < D; c += blockDim.x) x[size_t(row) * D + c] += weight * y[size_t(i) * D + c];
-}
+static_assert(TOP_K == 2, "moe_combine_kernel adds two routes");
 
 __global__ void scatter_add_kernel(float *x, const int *routes, const float *gate, const float *y)
 {
@@ -816,7 +905,9 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
     cudaEvent_t packed_ready = nullptr, results_ready = nullptr;
     cudaStream_t remote_stream = nullptr;
     float *stage = nullptr, *remote_rows = nullptr, *host_stage = nullptr;
-    int *d_cnt = nullptr, *d_cnt1 = nullptr;   // decode routing on the GPU: routes per expert, on each GPU
+    // Decode MoE routed on the GPU: both GPUs' tables on GPU 0 (made there), GPU 1's copy on GPU 1.
+    constexpr int MOE_TAB = tab_ints(SKINNY_MAX_ROWS * TOP_K, SKINNY_MAX_ROWS * TOP_K);
+    int *d_tab = nullptr, *d_tab1 = nullptr;
 #if defined(HW5_PROF) || defined(HW5_NSIGHT)
     std::fprintf(stderr, "[hw5] expert transport: %s\n",
                  !parallel ? "serial peer copies" : direct ? "packed direct P2P" : "packed host staging");
@@ -828,9 +919,9 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
         if (!direct)
             check(cudaMallocHost(&host_stage, capacity * sizeof(float)), "allocate pinned staging");
         check(cudaEventCreateWithFlags(&packed_ready, cudaEventDisableTiming), "packed event");
-        d_cnt = dalloc<int>(N_EXPERT);
+        d_tab = dalloc<int>(2 * size_t(MOE_TAB));
         check(cudaSetDevice(devices[1].device), "select remote device");
-        d_cnt1 = dalloc<int>(N_EXPERT);
+        d_tab1 = dalloc<int>(MOE_TAB);
         remote_rows = dalloc<float>(capacity);
         check(cudaStreamCreateWithFlags(&remote_stream, cudaStreamNonBlocking), "remote stream");
         check(cudaEventCreateWithFlags(&results_ready, cudaEventDisableTiming), "results event");
@@ -872,9 +963,11 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
         upload(d_slot, slot);
         const int tile_stride = !prefill && R <= MAX_SPLIT_ROWS
             ? (*std::max_element(pos.begin(), pos.end()) / KV_TILE + 1) : 0;
-        // Decode batches small enough for skinny_kernel route their rows on the GPU (needs both
-        // GPUs and direct peer access, which GPU 1's gather and GPU 0's scatter read through).
+        // Decode batches small enough for the skinny kernels route on the GPU, grouped per GPU as
+        // vLLM's fused_moe, so the host does not wait for each layer's router (needs both GPUs and
+        // direct peer access). The bounds of one GPU's slots and tiles follow from R alone.
         const bool gpu_routing = !prefill && direct && R <= SKINNY_MAX_ROWS;
+        const int moe_rt = moe_tile_rows(R), moe_slots = R * TOP_K;
 #ifdef HW5_PROF
         prof.phase = prefill ? 0 : 1;
         prof.passes[prof.phase]++;
@@ -914,42 +1007,38 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
             rmsnorm_kernel<<<R, 256>>>(x, L.mlp_norm, h);
             router_kernel<<<R, N_EXPERT * 32>>>(h, L.router_w, d_sel, d_gate);
             if (gpu_routing) {
-                // The same experts, kernels and accumulation order as below, with each expert's
-                // rows counted on GPU 0 and read where they are needed: nothing waits for the host.
-                const int cap = R, split = devices[1].first_expert;
-                auto expert = [&](int di, int e, const float *in, float *out, const int *n, cudaStream_t stream) {
+                // One w1, one silu and one w2 launch per GPU over the tiles of its experts; GPU 1
+                // gets the batch and its table by peer copies and returns its routes' outputs.
+                const int split = devices[1].first_expert;
+                const int caps[2] = {moe_cap_tiles(R, moe_rt, split), moe_cap_tiles(R, moe_rt, N_EXPERT - split)};
+                int *tab0 = d_tab, *tab_g1 = d_tab + MOE_TAB;
+                auto experts = [&](int di, const float *batch, const int *tab, float *out, cudaStream_t stream) {
                     const Device &device = devices[di];
                     const Scratch &work = scratch[di];
-                    const size_t j = size_t(e - device.first_expert);
-                    linear(in, device.layers[l].w1 + j * 2 * I * D, work.t, cap, 2 * I, D, false, stream, n);
-                    silu_kernel<<<blocks(size_t(cap) * I, 256), 256, 0, stream>>>(work.t, work.u, size_t(cap) * I, n);
-                    linear(work.u, device.layers[l].w2 + j * D * I, out, cap, D, I, false, stream, n);
+                    skinny_grouped(moe_rt, batch, device.layers[l].w1, size_t(2 * I) * D, work.t, 2 * I, D, tab, moe_slots,
+                                   caps[di], true, stream);
+                    silu_kernel<<<blocks(size_t(moe_slots) * I, 256), 256, 0, stream>>>(work.t, work.u, size_t(moe_slots) * I, tab + 1);
+                    skinny_grouped(moe_rt, work.u, device.layers[l].w2, size_t(D) * I, out, D, I, tab, moe_slots,
+                                   caps[di], false, stream);
                 };
-                route_kernel<<<1, 32>>>(d_sel, R * TOP_K, cap, d_cnt, d_idx);
+                moe_align_kernel<<<1, 32>>>(d_sel, R * TOP_K, moe_rt, split, moe_slots, tab0, tab_g1);
                 check(cudaEventRecord(packed_ready), "publish routes");
-                // GPU 1 pulls its experts' rows over peer access, runs them in place, and GPU 0
-                // pulls the results back in its scatter.
-                check(cudaSetDevice(devices[1].device), "select remote experts");
+                const Device &remote = devices[1];
+                const Scratch &S1 = scratch[1];
+                check(cudaSetDevice(remote.device), "select remote experts");
                 check(cudaStreamWaitEvent(remote_stream, packed_ready, 0), "wait for routes");
-                gather_routed_kernel<<<dim3(cap, N_EXPERT - split), 256, 0, remote_stream>>>(h, d_idx, d_cnt, split, cap,
-                                                                                             remote_rows, d_cnt1);
-                for (int e = split; e < N_EXPERT; e++) {
-                    float *rows_e = remote_rows + size_t(e - split) * cap * D;
-                    expert(1, e, rows_e, rows_e, d_cnt1 + (e - split), remote_stream);
-                }
+                check(cudaMemcpyPeerAsync(d_tab1, remote.device, tab_g1, d0.device, size_t(MOE_TAB) * sizeof(int), remote_stream),
+                      "send the remote table");
+                check(cudaMemcpyPeerAsync(S1.he, remote.device, h, d0.device, size_t(R) * D * sizeof(float), remote_stream),
+                      "send the batch");
+                experts(1, S1.he, d_tab1, S1.y, remote_stream);
+                check(cudaMemcpyPeerAsync(stage, d0.device, S1.y, remote.device, size_t(moe_slots) * D * sizeof(float), remote_stream),
+                      "return the remote routes");
                 check(cudaEventRecord(results_ready, remote_stream), "publish remote results");
                 check(cudaSetDevice(d0.device), "select local experts");
-                const Scratch &S0 = scratch[0];
-                for (int e = 0; e < split; e++) {
-                    gather_routed_kernel<<<dim3(cap, 1), 256>>>(h, d_idx, d_cnt, e, cap, S0.he, nullptr);
-                    expert(0, e, S0.he, S0.y, d_cnt + e, nullptr);
-                    scatter_routed_kernel<<<cap, 256>>>(x, d_idx + e * cap, d_cnt + e, d_gate, S0.y);
-                }
-                // Expert-ID order for rows routed to both GPUs, as below.
+                experts(0, h, tab0, scratch[0].y, nullptr);
                 check(cudaStreamWaitEvent(nullptr, results_ready, 0), "join remote experts");
-                for (int e = split; e < N_EXPERT; e++)
-                    scatter_routed_kernel<<<cap, 256>>>(x, d_idx + e * cap, d_cnt + e, d_gate,
-                                                        remote_rows + size_t(e - split) * cap * D);
+                moe_combine_kernel<<<R, 256>>>(x, d_sel, d_gate, scratch[0].y, stage, split);
                 PROF(mark(S_PARALLEL_MOE));
                 continue;
             }
@@ -1175,12 +1264,12 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
     if (parallel) {
         check(cudaSetDevice(devices[1].device), "release remote staging");
         check(cudaFree(remote_rows), "free remote rows");
-        check(cudaFree(d_cnt1), "free remote route counts");
+        check(cudaFree(d_tab1), "free remote MoE table");
         check(cudaStreamDestroy(remote_stream), "destroy remote stream");
         check(cudaEventDestroy(results_ready), "destroy results event");
         check(cudaSetDevice(d0.device), "release local staging");
         check(cudaFree(stage), "free staging");
-        check(cudaFree(d_cnt), "free route counts");
+        check(cudaFree(d_tab), "free MoE tables");
         if (host_stage) check(cudaFreeHost(host_stage), "free pinned staging");
         check(cudaEventDestroy(packed_ready), "destroy packed event");
     }
