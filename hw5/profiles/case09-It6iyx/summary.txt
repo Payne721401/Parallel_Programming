@@ -1,0 +1,54 @@
+Generating SQLite file /home/ou721401/Parallel_Programming/hw5/nsight-systems-09-It6iyx/timeline.sqlite from /home/ou721401/Parallel_Programming/hw5/nsight-systems-09-It6iyx/timeline.nsys-rep
+Processing [/home/ou721401/Parallel_Programming/hw5/nsight-systems-09-It6iyx/timeline.sqlite] with [/work/HPC_software/LMOD/nvidia/packages/cuda-12.4/nsight-systems-2023.4.4/host-linux-x64/reports/cuda_gpu_kern_sum.py]... 
+
+ ** CUDA GPU Kernel Summary (cuda_gpu_kern_sum):
+
+ Time (%)  Total Time (ns)  Instances    Avg (ns)      Med (ns)     Min (ns)    Max (ns)   StdDev (ns)                                                  Name                                                
+ --------  ---------------  ---------  ------------  ------------  ----------  ----------  -----------  ----------------------------------------------------------------------------------------------------
+     39.7    4,198,669,115     25,225     166,448.7     145,535.0      29,152     603,518     70,473.1  void <unnamed>::small_linear_kernel<(int)4>(const float *, const __nv_bfloat16 *, float *, int, int…
+     38.4    4,057,580,252      2,919   1,390,058.3     325,247.0     318,719  11,501,466  2,292,236.8  <unnamed>::linear_kernel(const float *, const __nv_bfloat16 *, float *, int, int, int, bool)        
+      9.5    1,006,179,425      1,880     535,201.8     685,278.0     348,031     709,404    167,665.9  void <unnamed>::small_linear_kernel<(int)8>(const float *, const __nv_bfloat16 *, float *, int, int…
+      4.4      467,465,650         32  14,608,301.6  14,506,358.5  12,991,387  16,255,509    685,996.0  <unnamed>::attention_kernel(const float *, const int *, const int *, const float *, const float *, …
+      2.6      272,617,808      3,916      69,616.4      70,624.0      49,952      89,503     18,161.9  <unnamed>::gemv_kernel(const float *, const __nv_bfloat16 *, float *, int, int, bool)               
+      1.7      180,315,328         64   2,817,427.0   2,896,265.0   2,120,091   3,344,183    351,604.7  <unnamed>::argmax_kernel(const float *, int *, int)                                                 
+      1.2      128,581,967     14,890       8,635.5       8,576.0       4,992      25,312      1,126.2  <unnamed>::scatter_add_kernel(float *, const int *, const float *, const float *)                   
+      0.6       64,546,406      9,491       6,800.8       7,744.0       3,967      37,728      2,337.1  void <unnamed>::gather_kernel<(int)2>(const float *, const int *, float *)                          
+      0.5       58,024,442     14,890       3,896.9       2,944.0       2,528      91,296      7,403.0  <unnamed>::silu_kernel(const float *, float *, unsigned long)                                       
+      0.5       57,629,065      2,016      28,585.8      33,328.0      18,368      38,016      7,312.3  <unnamed>::decode_partial_kernel(const float *, const float *, const float *, const int *, const in…
+      0.3       33,400,153      4,160       8,028.9       7,552.0       6,976      42,944      3,747.2  <unnamed>::rmsnorm_kernel(const float *, const __nv_bfloat16 *, float *)                            
+      0.2       17,783,935      2,048       8,683.6       8,128.0       7,712      44,511      4,361.8  <unnamed>::router_kernel(const float *, const __nv_bfloat16 *, int *, float *)                      
+      0.1        7,347,812      2,048       3,587.8       2,528.0       2,016      71,040      8,476.2  <unnamed>::rope_kernel(float *, const int *, const float *, const float *)                          
+      0.1        6,998,090      2,016       3,471.3       3,488.0       2,976       4,224        198.0  <unnamed>::decode_merge_kernel(const float *, int, const int *, float *)                            
+      0.0        4,900,115      2,048       2,392.6       2,016.0       1,855      23,136      2,521.5  <unnamed>::store_kv_kernel(const float *, const int *, float *, float *)                            
+      0.0          552,606         64       8,634.5       8,288.5       8,000      29,536      2,658.6  <unnamed>::embed_kernel(const int *, const __nv_bfloat16 *, float *)                                
+      0.0          346,627         64       5,416.0       4,993.0       4,320       8,416      1,065.3  void <unnamed>::gather_kernel<(int)1>(const float *, const int *, float *)                          
+
+Processing [/home/ou721401/Parallel_Programming/hw5/nsight-systems-09-It6iyx/timeline.sqlite] with [/work/HPC_software/LMOD/nvidia/packages/cuda-12.4/nsight-systems-2023.4.4/host-linux-x64/reports/cuda_gpu_mem_time_sum.py]... 
+
+ ** CUDA GPU MemOps Summary (by Time) (cuda_gpu_mem_time_sum):
+
+ Time (%)  Total Time (ns)  Count  Avg (ns)  Med (ns)  Min (ns)  Max (ns)  StdDev (ns)           Operation          
+ --------  ---------------  -----  --------  --------  --------  --------  -----------  ----------------------------
+     69.8       18,175,493  4,080   4,454.8   2,592.0     1,792   312,222     15,849.0  [CUDA memcpy Peer-to-Peer]  
+     20.6        5,373,646  2,140   2,511.0   2,464.0     2,144     4,000        182.2  [CUDA memcpy Device-to-Host]
+      9.5        2,479,035  2,370   1,046.0     736.0       703    22,432        766.4  [CUDA memcpy Host-to-Device]
+
+Processing [/home/ou721401/Parallel_Programming/hw5/nsight-systems-09-It6iyx/timeline.sqlite] with [/work/HPC_software/LMOD/nvidia/packages/cuda-12.4/nsight-systems-2023.4.4/host-linux-x64/reports/cuda_api_sum.py]... 
+
+ ** CUDA API Summary (cuda_api_sum):
+
+ Time (%)  Total Time (ns)  Num Calls   Avg (ns)    Med (ns)   Min (ns)   Max (ns)   StdDev (ns)            Name           
+ --------  ---------------  ---------  -----------  ---------  --------  ----------  -----------  -------------------------
+     96.3    6,680,453,700      4,510  1,481,253.6    7,389.0     3,198  77,448,948  6,152,670.3  cudaMemcpy               
+      3.2      219,743,909     87,771      2,503.6    2,421.0     2,097     653,746      3,006.3  cudaLaunchKernel         
+      0.3       18,385,187      4,080      4,506.2    5,589.0     2,658      15,940      1,624.7  cudaMemcpyPeerAsync      
+      0.1        7,243,809      4,080      1,775.4    1,794.0     1,354      37,882        665.5  cudaStreamWaitEvent      
+      0.1        7,226,234         27    267,638.3  141,923.0     1,443   2,074,395    454,361.5  cudaMalloc               
+      0.1        3,796,783         27    140,621.6  154,701.0     3,562     358,069    103,849.6  cudaFree                 
+      0.0        1,603,417      4,080        393.0      411.0       317       5,430        142.9  cudaEventRecord          
+      0.0           15,615          2      7,807.5    7,807.5       566      15,049     10,241.0  cudaEventCreateWithFlags 
+      0.0           14,670          1     14,670.0   14,670.0    14,670      14,670          0.0  cuProfilerStart          
+      0.0           12,133          1     12,133.0   12,133.0    12,133      12,133          0.0  cudaStreamCreateWithFlags
+      0.0           11,246          2      5,623.0    5,623.0       417      10,829      7,362.4  cudaEventDestroy         
+      0.0           11,207          1     11,207.0   11,207.0    11,207      11,207          0.0  cudaStreamDestroy        
+

@@ -1,0 +1,5 @@
+phase       total_s   gpu0_only   gpu1_only     both_s   neither_s
+prefill      2.3605     0.8754     0.0484     1.4267     0.0100
+decode       4.5851     1.7280     0.3520     2.3529     0.1523
+peer API / correlated memory activity / count / bytes
+cudaMemcpyPeerAsync_v4000 Peer-to-Peer 4080 4037607424

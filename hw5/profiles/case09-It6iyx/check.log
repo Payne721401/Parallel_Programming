@@ -1,0 +1,2 @@
+prompts: 28  passed: 28  max rel: 7.939e-06  max mad: 1.068e-03  token steps checked: 826, matched: 826, prompts failing: 0, router near-tie prompts held to loose_tol: 14
+Pass
