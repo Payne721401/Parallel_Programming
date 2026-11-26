@@ -20,7 +20,10 @@ hw5: main.cu hw5.cu mixtral.hpp
 hw5_prof: main.cu hw5.cu mixtral.hpp
 	$(NVCC) $(NVCCFLAGS) -DHW5_PROF main.cu hw5.cu -o $@
 
+hw5_nsight: main.cu hw5.cu mixtral.hpp
+	$(NVCC) $(NVCCFLAGS) -DHW5_NSIGHT -lineinfo main.cu hw5.cu -ldl -o $@
+
 clean:
-	rm -f hw5 hw5_prof
+	rm -f hw5 hw5_prof hw5_nsight
 
 .PHONY: clean

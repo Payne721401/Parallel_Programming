@@ -6,6 +6,10 @@
 // row per prompt still generating.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#ifdef HW5_NSIGHT
+#include <cuda_profiler_api.h>
+#include <nvtx3/nvToolsExt.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -421,6 +425,9 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
 {
     const int N = int(prompts.size());
     const Device &d0 = devices[0];
+#ifdef HW5_NSIGHT
+    check(cudaProfilerStart(), "start Nsight capture");
+#endif
 #ifdef HW5_PROF
     Prof prof;
     for (const Device &dv : devices) prof.devs.push_back(dv.device);
@@ -477,6 +484,9 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
     // One forward pass over up to CHUNK rows. Returns the next token of every output row (-1 for
     // the others) and, in the prefill, writes their hidden state into hidden_out.
     auto forward = [&](const std::vector<Row> &rows, bool prefill) {
+#ifdef HW5_NSIGHT
+        nvtxRangePushA(prefill ? "prefill" : "decode");
+#endif
         const int R = int(rows.size());
         std::vector<int> token(R), pos(R), rstart(R), slot(R);
         std::vector<int> sel(size_t(R) * TOP_K), routes(sel.size());
@@ -577,7 +587,12 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
             if (rows[r].output) out.push_back(r);
         std::vector<int> next(R, -1);
         const int n = int(out.size());
-        if (n == 0) return next;
+        if (n == 0) {
+#ifdef HW5_NSIGHT
+            nvtxRangePop();
+#endif
+            return next;
+        }
         upload(d_idx, out);
         gather_kernel<1><<<n, 256>>>(x, d_idx, att);   // att holds the output rows from here
         rmsnorm_kernel<<<n, 256>>>(att, d0.final_norm, h);
@@ -591,6 +606,9 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
             for (int o = 0; o < n; o++)
                 check(cudaMemcpy(&hidden_out[size_t(rows[out[o]].prompt) * D], h + size_t(o) * D, D * 4, cudaMemcpyDeviceToHost), "hidden");
         PROF(mark(S_OUT_D2H));
+#ifdef HW5_NSIGHT
+        nvtxRangePop();
+#endif
         return next;
     };
 
@@ -635,6 +653,10 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
         check(cudaSetDevice(devices[i].device), "cudaSetDevice");
         for (float *p : {scratch[i].he, scratch[i].t, scratch[i].u, scratch[i].y}) check(cudaFree(p), "cudaFree");
     }
+#ifdef HW5_NSIGHT
+    check(cudaSetDevice(d0.device), "restore capture device");
+    check(cudaProfilerStop(), "stop Nsight capture");
+#endif
 #ifdef HW5_PROF
     prof.phase = 1;
     prof.mark(S_FREE);
