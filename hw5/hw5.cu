@@ -209,17 +209,23 @@ constexpr int KV_TILE = 32;
 constexpr int PART_WIDTH = HEAD_DIM + 2;
 constexpr int MAX_KV_TILES = (N_CTX + KV_TILE - 1) / KV_TILE;
 static_assert(MAX_KV_TILES <= HEAD_DIM, "merge loads one tile per thread");
-static_assert(N_HEAD * MAX_KV_TILES * PART_WIDTH <= CHUNK * 2 * I, "partials must fit expert scratch");
+constexpr int MAX_SPLIT_ROWS = 64;
+static_assert(MAX_SPLIT_ROWS * N_HEAD * MAX_KV_TILES * PART_WIDTH <= CHUNK * 2 * I,
+              "batched partials must fit expert scratch");
 
 __global__ void decode_partial_kernel(const float *qkv, const float *kc, const float *vc,
-                                      int first, int length, float *partials)
+                                      const int *starts, const int *pos, int single_start,
+                                      int single_length, float *partials)
 {
     __shared__ float scores[KV_TILE];
-    const int head = blockIdx.y, tile = blockIdx.x;
+    const int row = blockIdx.z, head = blockIdx.y, tile = blockIdx.x;
+    const int length = gridDim.z == 1 ? single_length : pos[row] + 1;
+    if (tile * KV_TILE >= length) return;  // this whole block is outside the row's cache
+    const int first = gridDim.z == 1 ? single_start : starts[row];
     const int t = threadIdx.x, lane = t % 32;
     const int offset = tile * KV_TILE, count = min(KV_TILE, length - offset);
     const size_t base = size_t(first + offset) * KV_DIM + (head / (N_HEAD / N_KV)) * HEAD_DIM;
-    const float *q = qkv + head * HEAD_DIM;
+    const float *q = qkv + size_t(row) * QKV_DIM + head * HEAD_DIM;
     for (int j = t / 32; j < count; j += HEAD_DIM / 32) {
         const float *k = kc + base + j * KV_DIM;
         float dot = 0.f;
@@ -228,7 +234,7 @@ __global__ void decode_partial_kernel(const float *qkv, const float *kc, const f
         if (lane == 0) scores[j] = dot * ATTN_SCALE;
     }
     __syncthreads();
-    float *part = partials + (head * gridDim.x + tile) * PART_WIDTH;
+    float *part = partials + ((row * N_HEAD + head) * gridDim.x + tile) * PART_WIDTH;
     if (t < 32) {
         const float score = t < count ? scores[t] : -INFINITY;
         float maximum = score;
@@ -248,11 +254,13 @@ __global__ void decode_partial_kernel(const float *qkv, const float *kc, const f
     part[t] = value;
 }
 
-__global__ void decode_merge_kernel(const float *partials, int tiles, float *att)
+__global__ void decode_merge_kernel(const float *partials, int tile_stride, const int *pos, float *att)
 {
     __shared__ float scale[MAX_KV_TILES];
-    const int head = blockIdx.x, t = threadIdx.x;
-    const float *parts = partials + head * tiles * PART_WIDTH;
+    const int row = blockIdx.y, head = blockIdx.x, t = threadIdx.x;
+    const int tiles = gridDim.y == 1 ? tile_stride : pos[row] / KV_TILE + 1;
+    const int row_head = row * N_HEAD + head;
+    const float *parts = partials + row_head * tile_stride * PART_WIDTH;
     if (t < tiles) scale[t] = parts[t * PART_WIDTH + HEAD_DIM];
     __syncthreads();
     float maximum = -INFINITY;
@@ -266,7 +274,7 @@ __global__ void decode_merge_kernel(const float *partials, int tiles, float *att
         value = fmaf(scale[j], part[t], value);
         mass = fmaf(scale[j], part[HEAD_DIM + 1], mass);
     }
-    att[head * HEAD_DIM + t] = value / mass;
+    att[row_head * HEAD_DIM + t] = value / mass;
 }
 
 // One thread per row: the 8 router logits, the two largest (the lower index on a tie) and their
@@ -478,6 +486,8 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
         upload(d_pos, pos);
         upload(d_start, rstart);
         upload(d_slot, slot);
+        const int tile_stride = !prefill && R <= MAX_SPLIT_ROWS
+            ? (*std::max_element(pos.begin(), pos.end()) / KV_TILE + 1) : 0;
 #ifdef HW5_PROF
         prof.phase = prefill ? 0 : 1;
         prof.passes[prof.phase]++;
@@ -498,12 +508,12 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
             rope_kernel<<<dim3(R, N_HEAD + N_KV), HEAD_DIM / 2>>>(qkv, d_pos, d_cos, d_sin);
             store_kv_kernel<<<R, KV_DIM>>>(qkv, d_slot, k_l, v_l);
             PROF(mark(S_ROPE_KV));
-            if (!prefill && R == 1) {
-                const int length = pos[0] + 1, tiles = blocks(length, KV_TILE);
+            if (tile_stride) {
                 // The expert intermediate is idle until the MoE stage on this same stream.
                 float *parts = scratch[0].t;
-                decode_partial_kernel<<<dim3(tiles, N_HEAD), HEAD_DIM>>>(qkv, k_l, v_l, rstart[0], length, parts);
-                decode_merge_kernel<<<N_HEAD, HEAD_DIM>>>(parts, tiles, att);
+                decode_partial_kernel<<<dim3(tile_stride, N_HEAD, R), HEAD_DIM>>>(
+                    qkv, k_l, v_l, d_start, d_pos, rstart[0], pos[0] + 1, parts);
+                decode_merge_kernel<<<dim3(N_HEAD, R), HEAD_DIM>>>(parts, tile_stride, d_pos, att);
             } else {
                 attention_kernel<<<blocks(size_t(R) * N_HEAD, 128), 128>>>(qkv, d_start, d_slot, k_l, v_l, att, R);
             }
