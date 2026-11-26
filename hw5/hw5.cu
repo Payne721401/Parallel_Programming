@@ -97,68 +97,78 @@ __global__ void linear_kernel(const float *x, const __nv_bfloat16 *W, float *y, 
         }
 }
 
-// Single-row projection: one warp computes one dot product along a contiguous row of W.
-constexpr int GEMV_WARPS = 4;
-__global__ void gemv_kernel(const float *x, const __nv_bfloat16 *W, float *y, int N, int K, bool add)
-{
-    const int out = blockIdx.x * GEMV_WARPS + threadIdx.x / 32;
-    if (out >= N) return;  // uniform within each warp
-    const int lane = threadIdx.x % 32;
-    const __nv_bfloat16 *w = W + size_t(out) * K;
-    float sum = 0.f;
-    for (int k = lane; k < K; k += 32)
-        sum = fmaf(x[k], __bfloat162float(w[k]), sum);
-    for (int offset = 16; offset > 0; offset /= 2)
-        sum += __shfl_down_sync(0xffffffffu, sum, offset);
-    if (lane == 0) y[out] = add ? y[out] + sum : sum;
-}
+// Few rows (decode): a projection reads all of W for little arithmetic, so it is bound by how
+// fast W streams in, as in TensorRT-LLM's batched GEMV. One warp computes one output column for
+// up to R rows: each lane loads 8 bf16 of the column's row of W at once (16 bytes), widens them
+// exactly by shifting the bits into an fp32 (bf16 is fp32's top half), and uses each against the
+// same 8 values of every row's x (two float4 loads), so W is read once for all R rows. The 8 warps
+// of a block share x through L1.
+//
+// Every product and sum is fp32. Each lane sums its 8-wide chunks in increasing k, and the warp
+// adds the 32 lane sums in one fixed tree, the same for every R, so a row's result does not depend
+// on how many rows share the launch.
+constexpr int SKINNY_WARPS = 8, SKINNY_MAX_ROWS = 64;
+static_assert(D % 256 == 0 && Q_DIM % 256 == 0 && I % 256 == 0, "every K is a whole number of 32 lanes x 8");
 
-// Reuse a converted weight across several token rows before loading the next one.
-template <int SMALL_ROWS>
-__global__ void small_linear_kernel(const float *x, const __nv_bfloat16 *W, float *y,
-                                    int M, int N, int K, bool add)
+__device__ __forceinline__ float bf16_lo(unsigned u) { return __uint_as_float(u << 16); }
+__device__ __forceinline__ float bf16_hi(unsigned u) { return __uint_as_float(u & 0xffff0000u); }
+
+template <int R>
+__global__ void __launch_bounds__(SKINNY_WARPS * 32) skinny_kernel(const float *x, const __nv_bfloat16 *W, float *y,
+                                                                   int M, int N, int K, bool add)
 {
-    const int out = blockIdx.x * GEMV_WARPS + threadIdx.x / 32;
-    if (out >= N) return;
-    const int first = blockIdx.y * SMALL_ROWS, lane = threadIdx.x % 32;
-    const __nv_bfloat16 *w = W + size_t(out) * K;
-    const float *inputs[SMALL_ROWS];
-    float sums[SMALL_ROWS] = {};
+    const int out = blockIdx.x * SKINNY_WARPS + threadIdx.x / 32;
+    if (out >= N) return;   // uniform within each warp
+    const int lane = threadIdx.x % 32, first = blockIdx.y * R;
+    const uint4 *w = reinterpret_cast<const uint4 *>(W + size_t(out) * K);
+    const float4 *xr[R];
     #pragma unroll
-    for (int r = 0; r < SMALL_ROWS; r++)
-        inputs[r] = x + size_t(min(first + r, M - 1)) * K;
-    for (int k = lane; k < K; k += 32) {
-        const float weight = __bfloat162float(w[k]);
+    for (int r = 0; r < R; r++) xr[r] = reinterpret_cast<const float4 *>(x + size_t(min(first + r, M - 1)) * K);
+    float sum[R];
+    #pragma unroll
+    for (int r = 0; r < R; r++) sum[r] = 0.f;
+    #pragma unroll 2
+    for (int c = lane; c < K / 8; c += 32) {
+        const uint4 p = __ldg(w + c);
+        const float wf[8] = {bf16_lo(p.x), bf16_hi(p.x), bf16_lo(p.y), bf16_hi(p.y),
+                             bf16_lo(p.z), bf16_hi(p.z), bf16_lo(p.w), bf16_hi(p.w)};
         #pragma unroll
-        for (int r = 0; r < SMALL_ROWS; r++)
-            sums[r] = fmaf(inputs[r][k], weight, sums[r]);
+        for (int r = 0; r < R; r++) {
+            const float4 a = __ldg(xr[r] + 2 * c), b = __ldg(xr[r] + 2 * c + 1);
+            float s = sum[r];
+            s = fmaf(a.x, wf[0], s); s = fmaf(a.y, wf[1], s); s = fmaf(a.z, wf[2], s); s = fmaf(a.w, wf[3], s);
+            s = fmaf(b.x, wf[4], s); s = fmaf(b.y, wf[5], s); s = fmaf(b.z, wf[6], s); s = fmaf(b.w, wf[7], s);
+            sum[r] = s;
+        }
     }
     #pragma unroll
-    for (int r = 0; r < SMALL_ROWS; r++) {
-        if (first + r >= M) break;
-        float sum = sums[r];
-        for (int d = 16; d; d /= 2) sum += __shfl_down_sync(0xffffffffu, sum, d);
-        if (lane == 0) {
+    for (int r = 0; r < R; r++) {
+        float s = sum[r];
+        for (int d = 16; d; d /= 2) s += __shfl_down_sync(0xffffffffu, s, d);
+        if (lane == 0 && first + r < M) {
             float *dst = y + size_t(first + r) * N + out;
-            *dst = add ? *dst + sum : sum;
+            *dst = add ? *dst + s : s;
         }
     }
 }
 
-// Every K here (D, Q_DIM, I) is a multiple of TK.
+template <int R>
+void skinny(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add, cudaStream_t stream)
+{
+    skinny_kernel<R><<<dim3(blocks(N, SKINNY_WARPS), blocks(M, R)), SKINNY_WARPS * 32, 0, stream>>>(x, W, y, M, N, K, add);
+}
+
+// Every K here (D, Q_DIM, I) is a multiple of TK and of 256. x, W and y are the starts of
+// allocations or of whole rows in them, so the 16-byte loads of skinny_kernel are aligned.
 void linear(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add = false, cudaStream_t stream = nullptr)
 {
-    if (M == 1) {
-        gemv_kernel<<<blocks(N, GEMV_WARPS), GEMV_WARPS * 32, 0, stream>>>(x, W, y, N, K, add);
-        return;
-    }
-    if (M <= 16) {
-        const int gx = blocks(N, GEMV_WARPS);
-        if (N == 2 * I && M >= 8) {
-            small_linear_kernel<8><<<dim3(gx, blocks(M, 8)), GEMV_WARPS * 32, 0, stream>>>(x, W, y, M, N, K, add);
-        } else {
-            small_linear_kernel<4><<<dim3(gx, blocks(M, 4)), GEMV_WARPS * 32, 0, stream>>>(x, W, y, M, N, K, add);
-        }
+    if (M <= SKINNY_MAX_ROWS) {   // one launch reads W once per 32 rows at most
+        if (M == 1) skinny<1>(x, W, y, M, N, K, add, stream);
+        else if (M <= 2) skinny<2>(x, W, y, M, N, K, add, stream);
+        else if (M <= 4) skinny<4>(x, W, y, M, N, K, add, stream);
+        else if (M <= 8) skinny<8>(x, W, y, M, N, K, add, stream);
+        else if (M <= 16) skinny<16>(x, W, y, M, N, K, add, stream);
+        else skinny<32>(x, W, y, M, N, K, add, stream);
         return;
     }
     dim3 grid(blocks(N, TN), blocks(M, TM));
@@ -337,15 +347,32 @@ __global__ void silu_kernel(const float *t, float *u, size_t n)
     u[k] = gate / (1.f + expf(-gate)) * t[r * 2 * I + I + j];
 }
 
-// One thread per row: the index of the largest logit, the smallest on a tie.
-__global__ void argmax_kernel(const float *logits, int *next, int rows)
+// One block of 256 per row: the index of the largest logit, the smallest on a tie. Each thread
+// scans a strided slice in increasing v, keeping the first maximum; the block then keeps, of two
+// candidates, the larger value or on equal values the smaller index, which is the same answer.
+constexpr int ARGMAX_THREADS = 256;
+__global__ void argmax_kernel(const float *logits, int *next)
 {
-    const int r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
-    int best = 0;
-    for (int v = 1; v < VOCAB; v++)
-        if (logits[size_t(r) * VOCAB + v] > logits[size_t(r) * VOCAB + best]) best = v;
-    next[r] = best;
+    __shared__ float best_v[ARGMAX_THREADS];
+    __shared__ int best_i[ARGMAX_THREADS];
+    const int r = blockIdx.x, t = threadIdx.x;
+    const float *row = logits + size_t(r) * VOCAB;
+    float bv = row[t];
+    int bi = t;
+    for (int v = t + ARGMAX_THREADS; v < VOCAB; v += ARGMAX_THREADS)
+        if (row[v] > bv) { bv = row[v]; bi = v; }
+    best_v[t] = bv;
+    best_i[t] = bi;
+    __syncthreads();
+    for (int half = ARGMAX_THREADS / 2; half > 0; half /= 2) {
+        if (t < half) {
+            const float ov = best_v[t + half];
+            const int oi = best_i[t + half];
+            if (ov > best_v[t] || (ov == best_v[t] && oi < best_i[t])) { best_v[t] = ov; best_i[t] = oi; }
+        }
+        __syncthreads();
+    }
+    if (t == 0) next[r] = best_i[0];
 }
 
 struct Row {
@@ -689,7 +716,7 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
         rmsnorm_kernel<<<n, 256>>>(att, d0.final_norm, h);
         linear(h, d0.lm_head, logits, n, VOCAB, D);
         PROF(mark(S_LMHEAD, 2.0 * n * VOCAB * D));
-        argmax_kernel<<<blocks(n, 128), 128>>>(logits, d_next, n);
+        argmax_kernel<<<n, ARGMAX_THREADS>>>(logits, d_next);
         std::vector<int> best(n);
         check(cudaMemcpy(best.data(), d_next, n * 4, cudaMemcpyDeviceToHost), "next tokens");
         for (int o = 0; o < n; o++) next[out[o]] = best[o];

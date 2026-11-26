@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 mode=${1:-systems}
 case_id=${2:-09}
 phase=${3:-decode}
-kernel=${4:-small_linear_kernel}
+kernel=${4:-skinny_kernel}
 device=${5:-0}
 if [[ ! $case_id =~ ^(0[1-9]|1[0-2])$ || ! $phase =~ ^(prefill|decode)$ ||
       ! $device =~ ^[01]$ || ! $kernel =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
