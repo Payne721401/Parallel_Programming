@@ -302,18 +302,21 @@ __global__ void router_kernel(const float *h, const __nv_bfloat16 *router_w, int
     gate[r * TOP_K + 1] = w2 / (1.f + w2);
 }
 
-// dst[i] = src[idx[i]], rows of D. Grid: the rows of dst.
+// Indices address either rows directly or the flattened [row][top-k] routing table.
+template <int INDEX_STRIDE = 1>
 __global__ void gather_kernel(const float *src, const int *idx, float *dst)
 {
     const int i = blockIdx.x;
-    for (int c = threadIdx.x; c < D; c += blockDim.x) dst[size_t(i) * D + c] = src[size_t(idx[i]) * D + c];
+    const int row = idx[i] / INDEX_STRIDE;
+    for (int c = threadIdx.x; c < D; c += blockDim.x) dst[size_t(i) * D + c] = src[size_t(row) * D + c];
 }
 
-// x[idx[i]] += g[i] * y[i]. Grid: the rows of y.
-__global__ void scatter_add_kernel(float *x, const int *idx, const float *g, const float *y)
+__global__ void scatter_add_kernel(float *x, const int *routes, const float *gate, const float *y)
 {
     const int i = blockIdx.x;
-    for (int c = threadIdx.x; c < D; c += blockDim.x) x[size_t(idx[i]) * D + c] += g[i] * y[size_t(i) * D + c];
+    const int route = routes[i], row = route / TOP_K;
+    const float weight = gate[route];
+    for (int c = threadIdx.x; c < D; c += blockDim.x) x[size_t(row) * D + c] += weight * y[size_t(i) * D + c];
 }
 
 // u[r][j] = silu(t[r][j]) * t[r][I + j], over n = rows * I values.
@@ -349,7 +352,7 @@ struct Row {
 enum Seg { S_SETUP, S_EMBED, S_QKV, S_ROPE_KV, S_ATTN, S_OPROJ, S_ROUTER, S_MOE_HOST, S_MOE_XFER,
            S_W1, S_SILU, S_W2, S_SCATTER, S_LMHEAD, S_OUT_D2H, S_FREE, N_SEG };
 const char *const SEG_NAME[N_SEG] = {"setup (alloc, rope)", "embed", "attn_norm + qkv", "rope + store_kv",
-                                     "attention", "o_proj", "mlp_norm + router + D2H", "moe host lists + upload",
+                                     "attention", "o_proj", "mlp_norm + router + ids D2H", "moe group + routes H2D",
                                      "moe gather + peer copies", "expert w1", "expert silu", "expert w2",
                                      "expert scatter_add", "final norm + lm_head", "argmax + D2H", "free"};
 struct Prof {
@@ -433,8 +436,8 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
     float *qkv = dalloc<float>(size_t(CHUNK) * QKV_DIM), *att = dalloc<float>(size_t(CHUNK) * Q_DIM);
     float *logits = dalloc<float>(size_t(N) * VOCAB);
     int *d_token = dalloc<int>(CHUNK), *d_pos = dalloc<int>(CHUNK), *d_start = dalloc<int>(CHUNK), *d_slot = dalloc<int>(CHUNK);
-    int *d_sel = dalloc<int>(size_t(CHUNK) * TOP_K), *d_idx = dalloc<int>(CHUNK), *d_next = dalloc<int>(N);
-    float *d_gate = dalloc<float>(size_t(CHUNK) * TOP_K), *d_g = dalloc<float>(CHUNK);
+    int *d_sel = dalloc<int>(size_t(CHUNK) * TOP_K), *d_idx = dalloc<int>(size_t(CHUNK) * TOP_K), *d_next = dalloc<int>(N);
+    float *d_gate = dalloc<float>(size_t(CHUNK) * TOP_K);
 
     std::vector<int> start(N);   // prompt i's position 0 is cache slot start[i]
     size_t slots = 0;
@@ -476,6 +479,7 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
     auto forward = [&](const std::vector<Row> &rows, bool prefill) {
         const int R = int(rows.size());
         std::vector<int> token(R), pos(R), rstart(R), slot(R);
+        std::vector<int> sel(size_t(R) * TOP_K), routes(sel.size());
         for (int r = 0; r < R; r++) {
             token[r] = rows[r].token;
             pos[r] = rows[r].pos;
@@ -521,36 +525,31 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
             linear(att, L.o_w, x, R, D, Q_DIM, true);
             PROF(mark(S_OPROJ, 2.0 * R * D * Q_DIM));
 
-            // The mixture of experts: the router's choices go to the host, which lists each
-            // expert's rows and weights; then each expert runs on its GPU over its rows.
+            // Group flat routing-table indices by expert. Gates stay on GPU 0 for scatter.
             rmsnorm_kernel<<<R, 256>>>(x, L.mlp_norm, h);
             router_kernel<<<blocks(R, 128), 128>>>(h, L.router_w, d_sel, d_gate, R);
-            std::vector<int> sel(size_t(R) * TOP_K);
-            std::vector<float> gate(size_t(R) * TOP_K);
             check(cudaMemcpy(sel.data(), d_sel, sel.size() * 4, cudaMemcpyDeviceToHost), "router");
-            check(cudaMemcpy(gate.data(), d_gate, gate.size() * 4, cudaMemcpyDeviceToHost), "router");
             PROF(mark(S_ROUTER));
+            int offsets[N_EXPERT + 1] = {};
+            for (int e : sel) ++offsets[e + 1];
+            for (int e = 0; e < N_EXPERT; ++e) offsets[e + 1] += offsets[e];
+            int cursor[N_EXPERT];
+            std::copy_n(offsets, N_EXPERT, cursor);
+            for (int j = 0; j < R * TOP_K; ++j) routes[cursor[sel[j]]++] = j;
+            upload(d_idx, routes);
+            PROF(mark(S_MOE_HOST));
             for (int e = 0; e < N_EXPERT; e++) {
-                std::vector<int> idx;
-                std::vector<float> g;
-                for (int j = 0; j < R * TOP_K; j++)
-                    if (sel[j] == e) {
-                        idx.push_back(j / TOP_K);
-                        g.push_back(gate[j]);
-                    }
-                const int n = int(idx.size());
+                const int n = offsets[e + 1] - offsets[e];
                 if (n == 0) continue;
                 const int di = expert_device[e];
                 const Device &dv = devices[di];
                 const Scratch &S0 = scratch[0], &S = scratch[di];
                 const size_t j = size_t(e - dv.first_expert);   // its index on its device
-                upload(d_idx, idx);
-                check(cudaMemcpy(d_g, g.data(), n * 4, cudaMemcpyHostToDevice), "upload");
+                const int *expert_routes = d_idx + offsets[e];
 #ifdef HW5_PROF
                 prof.expert_rows[prof.phase][e] += n;
 #endif
-                PROF(mark(S_MOE_HOST));
-                gather_kernel<<<n, 256>>>(h, d_idx, S0.he);
+                gather_kernel<TOP_K><<<n, 256>>>(h, expert_routes, S0.he);
                 if (di != 0) {
                     check(cudaMemcpyPeer(S.he, dv.device, S0.he, d0.device, size_t(n) * D * 4), "rows to the expert's GPU");
                     check(cudaSetDevice(dv.device), "cudaSetDevice");
@@ -567,7 +566,7 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
                     check(cudaSetDevice(d0.device), "cudaSetDevice");
                     PROF(mark(S_MOE_XFER));
                 }
-                scatter_add_kernel<<<n, 256>>>(x, d_idx, d_g, S0.y);
+                scatter_add_kernel<<<n, 256>>>(x, expert_routes, d_gate, S0.y);
                 PROF(mark(S_SCATTER));
             }
         }
@@ -580,7 +579,7 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
         const int n = int(out.size());
         if (n == 0) return next;
         upload(d_idx, out);
-        gather_kernel<<<n, 256>>>(x, d_idx, att);   // att holds the output rows from here
+        gather_kernel<1><<<n, 256>>>(x, d_idx, att);   // att holds the output rows from here
         rmsnorm_kernel<<<n, 256>>>(att, d0.final_norm, h);
         linear(h, d0.lm_head, logits, n, VOCAB, D);
         PROF(mark(S_LMHEAD, 2.0 * n * VOCAB * D));
@@ -630,7 +629,7 @@ void run(const std::vector<Device> &devices, const std::vector<std::vector<int>>
     check(cudaSetDevice(d0.device), "cudaSetDevice");
     for (void *p : {(void *)x, (void *)h, (void *)qkv, (void *)att, (void *)logits, (void *)d_token, (void *)d_pos,
                     (void *)d_start, (void *)d_slot, (void *)d_sel, (void *)d_idx, (void *)d_next, (void *)d_gate,
-                    (void *)d_g, (void *)kc, (void *)vc, (void *)d_cos, (void *)d_sin})
+                    (void *)kc, (void *)vc, (void *)d_cos, (void *)d_sin})
         check(cudaFree(p), "cudaFree");
     for (size_t i = 0; i < devices.size(); i++) {
         check(cudaSetDevice(devices[i].device), "cudaSetDevice");
