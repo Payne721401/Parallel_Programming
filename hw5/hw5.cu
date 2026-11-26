@@ -106,43 +106,67 @@ __global__ void linear_kernel(const float *x, const __nv_bfloat16 *W, float *y, 
 // are K-contiguous, so both tiles are stored transposed (k-major) in shared memory, as Boehm does for
 // A; W's 8 bf16 per 16-byte load are widened exactly by bit shifts. Each output is one fmaf chain
 // over k in increasing order, the same order as linear_kernel.
-constexpr int GBM = 128, GBN = 128, GBK = 16, GT = 8, GTHREADS = (GBM / GT) * (GBN / GT);
+//
+// Nsight Compute on this kernel (case 03, M = 4096) then showed 28.6 TFLOPS with 87% of the
+// instructions FMAs but only 62% of the issue slots used: occupancy 25% (127 registers), warps
+// waiting on the next tile's global loads (long scoreboard) and on shared memory (short scoreboard,
+// L1/TEX 86% busy). Three changes, none of which moves a single FMA of an output's chain:
+//   - the next tile's global loads go into registers before the current tile is computed and are
+//     stored to shared memory after it (the global-to-register double buffering of SGEMM_CUDA
+//     kernels 11/12 and CUTLASS's SIMT main loop), so their latency hides behind 16 x 64 FMAs;
+//   - a thread's 8 x 8 tile is two 4 x 4 halves 64 apart in each dimension (the CUTLASS SIMT and
+//     SGEMM_CUDA warp-tile layout), so the 16 threads of a half-warp read 16 consecutive float4 of a
+//     row of ws, which is conflict-free, where 8 consecutive columns per thread were 2-way;
+//   - the shared rows are padded by 4 floats, which halves the 4-way bank conflict of the
+//     transposed stores and keeps every float4 aligned;
+// and at most 128 registers, so two blocks keep fitting on an SM with the prefetch registers added.
+constexpr int GBM = 128, GBN = 128, GBK = 16, GT = 8, GH = GT / 2, GTHREADS = (GBM / GT) * (GBN / GT), GPAD = 4;
 static_assert(GTHREADS == 256 && GBM * GBK / 4 == 2 * GTHREADS && GBN * GBK / 8 == GTHREADS, "tile loads per thread");
+static_assert(GBM / 2 == (GBM / GT) * GH && GBN / 2 == (GBN / GT) * GH, "two halves of 16 x 4 rows and columns");
 
 // bf16 is the top half of an fp32: widening a packed pair is exact, two bit operations.
 __device__ __forceinline__ float bf16_lo(unsigned u) { return __uint_as_float(u << 16); }
 __device__ __forceinline__ float bf16_hi(unsigned u) { return __uint_as_float(u & 0xffff0000u); }
-__global__ void __launch_bounds__(GTHREADS) sgemm_kernel(const float *x, const __nv_bfloat16 *W, float *y,
-                                                        int M, int N, int K, bool add)
+__global__ void __launch_bounds__(GTHREADS, 2) sgemm_kernel(const float *x, const __nv_bfloat16 *W, float *y,
+                                                           int M, int N, int K, bool add)
 {
-    __shared__ __align__(16) float xs[GBK][GBM];
-    __shared__ __align__(16) float ws[GBK][GBN];
+    __shared__ __align__(16) float xs[GBK][GBM + GPAD];
+    __shared__ __align__(16) float ws[GBK][GBN + GPAD];
     const int m0 = blockIdx.y * GBM, n0 = blockIdx.x * GBN, t = threadIdx.x;
-    const int tr = t / (GBN / GT), tc = t % (GBN / GT);   // this thread's rows tr*8.., columns tc*8..
+    // This thread's rows tr*4 + i and GBM/2 + tr*4 + i, columns tc*4 + j and GBN/2 + tc*4 + j.
+    const int tr = t / (GBN / GT), tc = t % (GBN / GT);
+    // The tile loads: x rows xr0, xr0 + 64 at column xc; W row wr at column wc.
+    const int xr0 = t / (GBK / 4), xc = t % (GBK / 4) * 4, wr = t / (GBK / 8), wc = t % (GBK / 8) * 8;
+    const float *xp0 = x + size_t(m0 + xr0) * K + xc, *xp1 = x + size_t(m0 + xr0 + GBM / 2) * K + xc;
+    const bool xv0 = m0 + xr0 < M, xv1 = m0 + xr0 + GBM / 2 < M;
+    const __nv_bfloat16 *wp = W + size_t(n0 + wr) * K + wc;
+    float4 xa, xb;
+    uint4 wq;
+    auto fetch = [&](int k0) {
+        xa = xv0 ? *reinterpret_cast<const float4 *>(xp0 + k0) : make_float4(0.f, 0.f, 0.f, 0.f);
+        xb = xv1 ? *reinterpret_cast<const float4 *>(xp1 + k0) : make_float4(0.f, 0.f, 0.f, 0.f);
+        wq = __ldg(reinterpret_cast<const uint4 *>(wp + k0));
+    };
+    auto stash = [&]() {
+        xs[xc][xr0] = xa.x; xs[xc + 1][xr0] = xa.y; xs[xc + 2][xr0] = xa.z; xs[xc + 3][xr0] = xa.w;
+        xs[xc][xr0 + GBM / 2] = xb.x; xs[xc + 1][xr0 + GBM / 2] = xb.y;
+        xs[xc + 2][xr0 + GBM / 2] = xb.z; xs[xc + 3][xr0 + GBM / 2] = xb.w;
+        ws[wc][wr] = bf16_lo(wq.x); ws[wc + 1][wr] = bf16_hi(wq.x); ws[wc + 2][wr] = bf16_lo(wq.y); ws[wc + 3][wr] = bf16_hi(wq.y);
+        ws[wc + 4][wr] = bf16_lo(wq.z); ws[wc + 5][wr] = bf16_hi(wq.z); ws[wc + 6][wr] = bf16_lo(wq.w); ws[wc + 7][wr] = bf16_hi(wq.w);
+    };
     float acc[GT][GT] = {};
+    fetch(0);
+    stash();
+    __syncthreads();
     for (int k0 = 0; k0 < K; k0 += GBK) {
-        // x: 128 rows x 16 floats, 512 float4, two per thread; stored k-major.
-        #pragma unroll
-        for (int i = t; i < GBM * GBK / 4; i += GTHREADS) {
-            const int r = i / (GBK / 4), c = (i % (GBK / 4)) * 4;
-            const float4 v = m0 + r < M ? *reinterpret_cast<const float4 *>(x + size_t(m0 + r) * K + k0 + c)
-                                        : make_float4(0.f, 0.f, 0.f, 0.f);
-            xs[c][r] = v.x; xs[c + 1][r] = v.y; xs[c + 2][r] = v.z; xs[c + 3][r] = v.w;
-        }
-        // W: 128 rows x 16 bf16, 256 loads of 16 bytes, one per thread; stored k-major as fp32.
-        {
-            const int r = t / (GBK / 8), c = (t % (GBK / 8)) * 8;
-            const uint4 p = __ldg(reinterpret_cast<const uint4 *>(W + size_t(n0 + r) * K + k0 + c));
-            ws[c][r] = bf16_lo(p.x); ws[c + 1][r] = bf16_hi(p.x); ws[c + 2][r] = bf16_lo(p.y); ws[c + 3][r] = bf16_hi(p.y);
-            ws[c + 4][r] = bf16_lo(p.z); ws[c + 5][r] = bf16_hi(p.z); ws[c + 6][r] = bf16_lo(p.w); ws[c + 7][r] = bf16_hi(p.w);
-        }
-        __syncthreads();
+        const bool more = k0 + GBK < K;
+        if (more) fetch(k0 + GBK);   // in flight while this tile is computed
         #pragma unroll
         for (int k = 0; k < GBK; k++) {
-            const float4 a0 = *reinterpret_cast<const float4 *>(&xs[k][tr * GT]);
-            const float4 a1 = *reinterpret_cast<const float4 *>(&xs[k][tr * GT + 4]);
-            const float4 b0 = *reinterpret_cast<const float4 *>(&ws[k][tc * GT]);
-            const float4 b1 = *reinterpret_cast<const float4 *>(&ws[k][tc * GT + 4]);
+            const float4 a0 = *reinterpret_cast<const float4 *>(&xs[k][tr * GH]);
+            const float4 a1 = *reinterpret_cast<const float4 *>(&xs[k][GBM / 2 + tr * GH]);
+            const float4 b0 = *reinterpret_cast<const float4 *>(&ws[k][tc * GH]);
+            const float4 b1 = *reinterpret_cast<const float4 *>(&ws[k][GBN / 2 + tc * GH]);
             const float a[GT] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
             const float b[GT] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
             #pragma unroll
@@ -150,15 +174,27 @@ __global__ void __launch_bounds__(GTHREADS) sgemm_kernel(const float *x, const _
                 #pragma unroll
                 for (int j = 0; j < GT; j++) acc[i][j] = fmaf(a[i], b[j], acc[i][j]);
         }
-        __syncthreads();
+        __syncthreads();   // every thread is done reading this tile
+        if (more) {
+            stash();
+            __syncthreads();
+        }
     }
     #pragma unroll
     for (int i = 0; i < GT; i++) {
-        const int m = m0 + tr * GT + i;
-        if (m >= M) break;
-        float *dst = y + size_t(m) * N + n0 + tc * GT;
+        const int m = m0 + (i < GH ? tr * GH + i : GBM / 2 + tr * GH + i - GH);
+        if (m >= M) continue;
+        float *row = y + size_t(m) * N + n0;
         #pragma unroll
-        for (int j = 0; j < GT; j++) dst[j] = add ? dst[j] + acc[i][j] : acc[i][j];
+        for (int h = 0; h < 2; h++) {
+            float4 *dst = reinterpret_cast<float4 *>(row + h * (GBN / 2) + tc * GH);
+            float4 v = make_float4(acc[i][h * GH], acc[i][h * GH + 1], acc[i][h * GH + 2], acc[i][h * GH + 3]);
+            if (add) {
+                const float4 o = *dst;
+                v = make_float4(o.x + v.x, o.y + v.y, o.z + v.z, o.w + v.w);
+            }
+            *dst = v;
+        }
     }
 }
 
