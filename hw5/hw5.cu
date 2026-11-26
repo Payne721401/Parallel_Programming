@@ -109,11 +109,48 @@ __global__ void gemv_kernel(const float *x, const __nv_bfloat16 *W, float *y, in
     if (lane == 0) y[out] = add ? y[out] + sum : sum;
 }
 
+// Share each converted weight across up to four token rows in the same warp.
+constexpr int SMALL_ROWS = 4;
+__global__ void small_linear_kernel(const float *x, const __nv_bfloat16 *W, float *y,
+                                    int M, int N, int K, bool add)
+{
+    const int out = blockIdx.x * GEMV_WARPS + threadIdx.x / 32;
+    if (out >= N) return;
+    const int first = blockIdx.y * SMALL_ROWS, lane = threadIdx.x % 32;
+    const __nv_bfloat16 *w = W + size_t(out) * K;
+    const float *inputs[SMALL_ROWS];
+    float sums[SMALL_ROWS] = {};
+    #pragma unroll
+    for (int r = 0; r < SMALL_ROWS; r++)
+        inputs[r] = x + size_t(min(first + r, M - 1)) * K;
+    for (int k = lane; k < K; k += 32) {
+        const float weight = __bfloat162float(w[k]);
+        #pragma unroll
+        for (int r = 0; r < SMALL_ROWS; r++)
+            sums[r] = fmaf(inputs[r][k], weight, sums[r]);
+    }
+    #pragma unroll
+    for (int r = 0; r < SMALL_ROWS; r++) {
+        if (first + r >= M) break;
+        float sum = sums[r];
+        for (int d = 16; d; d /= 2) sum += __shfl_down_sync(0xffffffffu, sum, d);
+        if (lane == 0) {
+            float *dst = y + size_t(first + r) * N + out;
+            *dst = add ? *dst + sum : sum;
+        }
+    }
+}
+
 // Every K here (D, Q_DIM, I) is a multiple of TK.
 void linear(const float *x, const __nv_bfloat16 *W, float *y, int M, int N, int K, bool add = false)
 {
     if (M == 1) {
         gemv_kernel<<<blocks(N, GEMV_WARPS), GEMV_WARPS * 32>>>(x, W, y, N, K, add);
+        return;
+    }
+    if (M <= 16) {
+        dim3 grid(blocks(N, GEMV_WARPS), blocks(M, SMALL_ROWS));
+        small_linear_kernel<<<grid, GEMV_WARPS * 32>>>(x, W, y, M, N, K, add);
         return;
     }
     dim3 grid(blocks(N, TN), blocks(M, TM));
