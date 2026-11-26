@@ -1,0 +1,27 @@
+srun: job 503135 queued and waiting for resources
+srun: job 503135 has been allocated resources
+==PROF== Connected to process 2343625 (/home/ou721401/Parallel_Programming/hw5/hw5_nsight)
+Devices: 2, experts per device: 4, weights per device: 44.9902 GB, free: 33.4561 GB
+Load time: 27.0031 s (CUDA contexts and weights; not counted)
+[hw5] expert transport: packed direct P2P
+==WARNING== Unable to access the following 6 metrics: ctc__rx_bytes_data_user.sum, ctc__rx_bytes_data_user.sum.pct_of_peak_sustained_elapsed, ctc__rx_bytes_data_user.sum.per_second, ctc__tx_bytes_data_user.sum, ctc__tx_bytes_data_user.sum.pct_of_peak_sustained_elapsed, ctc__tx_bytes_data_user.sum.per_second.
+
+==PROF== Profiling "skinny_kernel": 0%
+==WARNING== Backing up device memory in system memory. Kernel replay might be slow. Consider using "--replay-mode application" to avoid memory save-and-restore.
+....50%....100% - 37 passes
+==PROF== Profiling "skinny_kernel": 0%....50%....100% - 37 passes
+==PROF== Profiling "skinny_kernel": 0%....50%....100% - 37 passes
+==PROF== Profiling "skinny_kernel": 0%....50%....100% - 37 passes
+==PROF== Profiling "skinny_kernel": 0%....50%....100% - 37 passes
+==PROF== Profiling "skinny_kernel": 0%....50%....100% - 37 passes
+==PROF== Profiling "skinny_kernel": 0%....50%....100% - 37 passes
+srun: Job step aborted: Waiting up to 62 seconds for job step to finish.
+slurmstepd-hgpn01: error: *** STEP 503135.0 ON hgpn01 CANCELLED AT 2026-11-26T22:27:26 DUE TO TIME LIMIT ***
+==PROF== Profiling "skinny_kernel": 0%==PROF== Trying to shutdown target application
+
+==ERROR== Failed to profile "skinny_kernel" in process 2343625
+==PROF== Trying to shutdown target application
+==ERROR== The application returned an error code (9).
+==ERROR== An error occurred while trying to profile.
+==PROF== Report: /home/ou721401/Parallel_Programming/hw5/nsight-compute-09-b0q6Ms/kernel.ncu-rep
+srun: error: hgpn01: task 0: Exited with exit code 9
